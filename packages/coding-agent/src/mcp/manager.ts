@@ -6,12 +6,12 @@
  */
 import * as path from "node:path";
 import * as url from "node:url";
-import type { TSchema } from "@oh-my-pi/pi-ai";
+import { isDefinitiveOAuthFailure, type TSchema } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { SourceMeta } from "../capability/types";
 import { resolveConfigValue } from "../config/resolve-config-value";
 import type { CustomTool } from "../extensibility/custom-tools/types";
-import type { AuthStorage } from "../session/auth-storage";
+import { type AuthStorage, REMOTE_REFRESH_SENTINEL } from "../session/auth-storage";
 import {
 	connectToServer,
 	disconnectServer,
@@ -26,12 +26,17 @@ import {
 	subscribeToResources,
 	unsubscribeFromResources,
 } from "./client";
-import { loadAllMCPConfigs, validateServerConfig } from "./config";
-import { refreshMCPOAuthToken } from "./oauth-flow";
+import { type LoadMCPConfigsResult, loadAllMCPConfigs, validateServerConfig } from "./config";
+import {
+	lookupMcpOAuthCredential,
+	type MCPOAuthCredentialLookup,
+	selectMcpOAuthRefreshMaterial,
+} from "./oauth-credentials";
+import { type MCPStoredOAuthCredential, refreshMCPOAuthToken } from "./oauth-flow";
+import type { McpConnectionStatusEvent } from "./startup-events";
 import type { MCPToolDetails } from "./tool-bridge";
 import { DeferredMCPTool, MCPTool } from "./tool-bridge";
 import type { MCPToolCache } from "./tool-cache";
-import { HttpTransport } from "./transports/http";
 import type {
 	MCPGetPromptResult,
 	MCPPrompt,
@@ -42,6 +47,7 @@ import type {
 	MCPServerConfig,
 	MCPServerConnection,
 	MCPToolDefinition,
+	MCPTransport,
 } from "./types";
 import { MCPNotificationMethods } from "./types";
 
@@ -50,6 +56,13 @@ type ToolLoadResult = {
 	serverTools: MCPToolDefinition[];
 };
 
+interface AuthRefreshableMCPTransport extends MCPTransport {
+	onAuthError?: () => Promise<Record<string, string> | null>;
+}
+
+function isAuthRefreshableMCPTransport(transport: MCPTransport): transport is AuthRefreshableMCPTransport {
+	return "onAuthError" in transport;
+}
 type TrackedPromise<T> = {
 	promise: Promise<T>;
 	status: "pending" | "fulfilled" | "rejected";
@@ -58,6 +71,27 @@ type TrackedPromise<T> = {
 };
 
 const STARTUP_TIMEOUT_MS = 250;
+
+/**
+ * Per-server reconnect-storm circuit breaker.
+ *
+ * `transport.onClose` (wired in {@link MCPManager.connectServers} and
+ * {@link MCPManager.#connectAndWireServer}) fires `reconnectServer` on every
+ * clean process exit, so a stdio MCP server that completes the
+ * `initialize` + `tools/list` handshake and then exits will pull the agent
+ * into a fork loop with no rate limit. That pathology shipped in issue #1592
+ * (a `php`-shebang MCP fork-bombing macOS, parented directly to the agent's
+ * `bun` PID via shebang exec).
+ *
+ * We keep the sliding window short — older crashes age out so a single
+ * transient failure stays cheap — but cap the burst tightly enough that the
+ * agent never spawns more than `RECONNECT_BURST_LIMIT * #doReconnect retries`
+ * (≤ 25) processes per stuck server per window. Manual `/mcp reconnect`
+ * resets the window so users can recover after fixing the underlying
+ * misconfiguration.
+ */
+const RECONNECT_BURST_WINDOW_MS = 30_000;
+const RECONNECT_BURST_LIMIT = 5;
 
 function trackPromise<T>(promise: Promise<T>): TrackedPromise<T> {
 	const tracked: TrackedPromise<T> = { promise, status: "pending" };
@@ -122,8 +156,8 @@ export interface MCPDiscoverOptions {
 	filterExa?: boolean;
 	/** Whether to filter out browser MCP servers when builtin browser tool is enabled (default: false) */
 	filterBrowser?: boolean;
-	/** Called when starting to connect to servers */
-	onConnecting?: (serverNames: string[]) => void;
+	/** Called when MCP server connection state changes. */
+	onStatus?: (event: McpConnectionStatusEvent) => void;
 }
 
 /**
@@ -166,6 +200,11 @@ export class MCPManager {
 	#pendingReconnections = new Map<string, Promise<MCPServerConnection | null>>();
 	/** Preserved configs for reconnection after connection loss. */
 	#serverConfigs = new Map<string, MCPServerConfig>();
+	/**
+	 * Timestamps of recent `reconnectServer` invocations per server, used by the
+	 * crash-storm circuit breaker (see {@link RECONNECT_BURST_LIMIT}).
+	 */
+	#reconnectHistory = new Map<string, number[]>();
 	/** Monotonic epoch incremented on disconnectAll to invalidate stale reconnections. */
 	#epoch = 0;
 
@@ -278,12 +317,20 @@ export class MCPManager {
 	 * Returns tools and any connection errors.
 	 */
 	async discoverAndConnect(options?: MCPDiscoverOptions): Promise<MCPLoadResult> {
-		const { configs, exaApiKeys, sources } = await loadAllMCPConfigs(this.cwd, {
-			enableProjectConfig: options?.enableProjectConfig,
-			filterExa: options?.filterExa,
-			filterBrowser: options?.filterBrowser,
-		});
-		const result = await this.connectServers(configs, sources, options?.onConnecting);
+		let loadedConfigs: LoadMCPConfigsResult;
+		try {
+			loadedConfigs = await loadAllMCPConfigs(this.cwd, {
+				enableProjectConfig: options?.enableProjectConfig,
+				filterExa: options?.filterExa,
+				filterBrowser: options?.filterBrowser,
+			});
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			options?.onStatus?.({ type: "failed", serverName: ".mcp.json", error: message });
+			throw error;
+		}
+		const { configs, exaApiKeys, sources } = loadedConfigs;
+		const result = await this.connectServers(configs, sources, options?.onStatus);
 		result.exaApiKeys = exaApiKeys;
 		return result;
 	}
@@ -295,7 +342,7 @@ export class MCPManager {
 	async connectServers(
 		configs: Record<string, MCPServerConfig>,
 		sources: Record<string, SourceMeta>,
-		onConnecting?: (serverNames: string[]) => void,
+		onStatus?: (event: McpConnectionStatusEvent) => void,
 	): Promise<MCPLoadResult> {
 		type ConnectionTask = {
 			name: string;
@@ -309,6 +356,8 @@ export class MCPManager {
 		const allTools: CustomTool<TSchema, MCPToolDetails>[] = [];
 		const reportedErrors = new Set<string>();
 		let allowBackgroundLogging = false;
+		const statusServerNames: string[] = [];
+		const validationFailures: Array<{ name: string; message: string }> = [];
 
 		// Prepare connection tasks
 		const connectionTasks: ConnectionTask[] = [];
@@ -336,10 +385,14 @@ export class MCPManager {
 				continue;
 			}
 
+			statusServerNames.push(name);
+
 			// Validate config
 			const validationErrors = validateServerConfig(name, config);
 			if (validationErrors.length > 0) {
-				errors.set(name, validationErrors.join("; "));
+				const message = validationErrors.join("; ");
+				errors.set(name, message);
+				validationFailures.push({ name, message });
 				reportedErrors.add(name);
 				continue;
 			}
@@ -373,10 +426,16 @@ export class MCPManager {
 						this.#connections.set(name, connection);
 					}
 
-					// Wire auth refresh for HTTP transports so 401s trigger token refresh.
-					if (connection.transport instanceof HttpTransport && config.auth?.type === "oauth") {
+					// Wire auth refresh for HTTP-like transports so 401s trigger token refresh.
+					// Gate on a resolvable managed credential, not on the auth block:
+					// definition-only configs (url-keyed fallback) get Bearer injection
+					// too and need the same mid-session refresh hook.
+					if (
+						isAuthRefreshableMCPTransport(connection.transport) &&
+						lookupMcpOAuthCredential(this.#authStorage, config)
+					) {
 						connection.transport.onAuthError = async () => {
-							const refreshed = await this.#resolveAuthConfig(config, true);
+							const refreshed = await this.#resolveAuthConfig(config, { forceRefresh: true });
 							if (refreshed.type === "http" || refreshed.type === "sse") {
 								return refreshed.headers ?? null;
 							}
@@ -421,20 +480,25 @@ export class MCPManager {
 					this.#onToolsChanged?.(this.#tools);
 					void this.toolCache?.set(name, config, serverTools);
 
+					onStatus?.({ type: "connected", serverName: name });
 					await this.#loadServerResourcesAndPrompts(name, connection);
 				})
 				.catch(error => {
 					if (this.#pendingToolLoads.get(name) !== toolsPromise) return;
 					this.#pendingToolLoads.delete(name);
-					if (!allowBackgroundLogging || reportedErrors.has(name)) return;
 					const message = error instanceof Error ? error.message : String(error);
+					onStatus?.({ type: "failed", serverName: name, error: message });
+					if (!allowBackgroundLogging || reportedErrors.has(name)) return;
 					logger.error("MCP tool load failed", { path: `mcp:${name}`, error: message });
 				});
 		}
 
-		// Notify about servers we're connecting to
-		if (connectionTasks.length > 0 && onConnecting) {
-			onConnecting(connectionTasks.map(task => task.name));
+		// Notify about servers we're connecting to, including configs that fail fast.
+		if (statusServerNames.length > 0 && onStatus) {
+			onStatus({ type: "connecting", serverNames: statusServerNames });
+			for (const { name, message } of validationFailures) {
+				onStatus({ type: "failed", serverName: name, error: message });
+			}
 		}
 
 		if (connectionTasks.length > 0) {
@@ -446,23 +510,24 @@ export class MCPManager {
 			const cachedTools = new Map<string, MCPToolDefinition[]>();
 			const pendingTasks = connectionTasks.filter(task => task.tracked.status === "pending");
 
-			if (pendingTasks.length > 0) {
-				if (this.toolCache) {
-					await Promise.all(
-						pendingTasks.map(async task => {
-							const cached = await this.toolCache?.get(task.name, task.config);
-							if (cached) {
-								cachedTools.set(task.name, cached);
-							}
-						}),
-					);
-				}
-
-				const pendingWithoutCache = pendingTasks.filter(task => !cachedTools.has(task.name));
-				if (pendingWithoutCache.length > 0) {
-					await Promise.allSettled(pendingWithoutCache.map(task => task.tracked.promise));
-				}
+			if (pendingTasks.length > 0 && this.toolCache) {
+				await Promise.all(
+					pendingTasks.map(async task => {
+						const cached = await this.toolCache?.get(task.name, task.config);
+						if (cached) {
+							cachedTools.set(task.name, cached);
+						}
+					}),
+				);
 			}
+
+			// Pending tasks without cached tools used to be awaited synchronously here,
+			// which gated the entire UI on the slowest server's per-request timeout
+			// (issue #2100: a single unresponsive MCP server blocked startup for the
+			// full 30 s `OMP_MCP_TIMEOUT_MS`). Leave them in flight — the background
+			// `void toolsPromise.then(...)` chain above registers their tools and
+			// fires `#onToolsChanged` once the connect finishes, or logs the failure
+			// after `allowBackgroundLogging` flips below.
 
 			for (const task of connectionTasks) {
 				const { name } = task;
@@ -617,6 +682,17 @@ export class MCPManager {
 	}
 
 	/**
+	 * Get the preserved (pre-auth) config for a known server — whether currently
+	 * connected or merely discovered (a connect was attempted but may have failed,
+	 * e.g. an OAuth server that has not been authorized yet). Mirrors the
+	 * reconnect lookup at {@link reconnectServer} so callers like `/mcp reauth`
+	 * can recover a discovered server's config without re-reading config files.
+	 */
+	getServerConfig(name: string): MCPServerConfig | undefined {
+		return this.#connections.get(name)?.config ?? this.#serverConfigs.get(name);
+	}
+
+	/**
 	 * Wait for a connection to complete (or fail).
 	 */
 	async waitForConnection(name: string): Promise<MCPServerConnection> {
@@ -635,9 +711,11 @@ export class MCPManager {
 
 	/**
 	 * Resolve auth and shell-command substitutions in config before connecting.
+	 * Pass `oauth: false` to skip OAuth credential injection (used by reauth's
+	 * unauthenticated probe, which must observe the server's bare 401).
 	 */
-	async prepareConfig(config: MCPServerConfig): Promise<MCPServerConfig> {
-		return this.#resolveAuthConfig(config);
+	async prepareConfig(config: MCPServerConfig, options?: { oauth?: boolean }): Promise<MCPServerConfig> {
+		return this.#resolveAuthConfig(config, options);
 	}
 
 	/**
@@ -666,6 +744,7 @@ export class MCPManager {
 		this.#sources.delete(name);
 		this.#serverConfigs.delete(name);
 		this.#pendingResourceRefresh.delete(name);
+		this.#reconnectHistory.delete(name);
 
 		const connection = this.#connections.get(name);
 
@@ -714,22 +793,78 @@ export class MCPManager {
 		this.#connections.clear();
 		this.#tools = [];
 		this.#subscribedResources.clear();
+		this.#reconnectHistory.clear();
 	}
 
 	/**
 	 * Reconnect to a server after a connection failure.
+	 *
 	 * Tears down the stale connection, re-resolves auth, establishes a new
-	 * connection, reloads tools, and notifies consumers.
-	 * Concurrent calls for the same server share one reconnection attempt.
-	 * Returns the new connection, or null if reconnection failed.
+	 * connection, reloads tools, and notifies consumers. Concurrent calls for
+	 * the same server share one reconnection attempt. Returns the new
+	 * connection, or `null` if reconnection failed or the per-server crash
+	 * burst limit (see {@link RECONNECT_BURST_LIMIT}) is exceeded.
+	 *
+	 * @param options.manual - When `true`, resets the crash-burst window so a
+	 *   user-driven retry (e.g. `/mcp reconnect`) is never blocked by an
+	 *   earlier storm. Defaults to `false`; the transport `onClose` callback
+	 *   and the per-tool-call retry path in `tool-bridge` MUST NOT set it.
 	 */
-	async reconnectServer(name: string): Promise<MCPServerConnection | null> {
+	async reconnectServer(name: string, options?: { manual?: boolean }): Promise<MCPServerConnection | null> {
+		if (options?.manual) {
+			this.#reconnectHistory.delete(name);
+		}
+
 		const pending = this.#pendingReconnections.get(name);
 		if (pending) return pending;
+
+		if (this.#tripReconnectBreaker(name)) {
+			return null;
+		}
 
 		const attempt = this.#doReconnect(name);
 		this.#pendingReconnections.set(name, attempt);
 		return attempt.finally(() => this.#pendingReconnections.delete(name));
+	}
+
+	/**
+	 * Record a reconnect attempt against the per-server crash window and report
+	 * whether the circuit breaker is now open. Sliding window: entries older
+	 * than {@link RECONNECT_BURST_WINDOW_MS} are pruned before the new
+	 * timestamp is appended, so a single transient failure ages out cheaply
+	 * but repeated rapid crashes accumulate until the limit is hit.
+	 */
+	#tripReconnectBreaker(name: string): boolean {
+		const now = Date.now();
+		const previous = this.#reconnectHistory.get(name) ?? [];
+		const recent = previous.filter(ts => now - ts < RECONNECT_BURST_WINDOW_MS);
+		recent.push(now);
+		this.#reconnectHistory.set(name, recent);
+
+		if (recent.length > RECONNECT_BURST_LIMIT) {
+			logger.error("MCP server crashed too many times; suspending automatic reconnects", {
+				path: `mcp:${name}`,
+				crashes: recent.length,
+				windowMs: RECONNECT_BURST_WINDOW_MS,
+			});
+			// Tear down the stale connection so `getConnectionStatus()` no
+			// longer reports it as "connected" and `waitForConnection()` does
+			// not hand a closed transport to callers. Tools stay registered
+			// in `#tools` — the user can recover with `/mcp reconnect <name>`
+			// once they've fixed the underlying misconfiguration. Mirrors the
+			// teardown in `#doReconnect`: detach `onClose` first so the
+			// transport's own `close()` cannot re-arm this path.
+			const stale = this.#connections.get(name);
+			if (stale) {
+				stale.transport.onClose = undefined;
+				void stale.transport.close().catch(() => {});
+				this.#connections.delete(name);
+			}
+			this.#pendingConnections.delete(name);
+			this.#pendingToolLoads.delete(name);
+			return true;
+		}
+		return false;
 	}
 
 	async #doReconnect(name: string): Promise<MCPServerConnection | null> {
@@ -829,10 +964,11 @@ export class MCPManager {
 
 		this.#connections.set(name, connection);
 
-		// Wire auth refresh for HTTP transports, and reconnect for any transport.
-		if (connection.transport instanceof HttpTransport && config.auth?.type === "oauth") {
+		// Wire auth refresh for HTTP-like transports, and reconnect for any transport.
+		// Same gate as connectServers: any resolvable managed credential.
+		if (isAuthRefreshableMCPTransport(connection.transport) && lookupMcpOAuthCredential(this.#authStorage, config)) {
 			connection.transport.onAuthError = async () => {
-				const refreshed = await this.#resolveAuthConfig(config, true);
+				const refreshed = await this.#resolveAuthConfig(config, { forceRefresh: true });
 				if (refreshed.type === "http" || refreshed.type === "sse") {
 					return refreshed.headers ?? null;
 				}
@@ -1074,40 +1210,97 @@ export class MCPManager {
 
 	/**
 	 * Resolve OAuth credentials and shell commands in config.
+	 * `oauth: false` skips credential injection (reauth's unauthenticated probe);
+	 * `forceRefresh` bypasses the expiry buffer (401/403 auth-error hook).
 	 */
-	async #resolveAuthConfig(config: MCPServerConfig, forceRefresh = false): Promise<MCPServerConfig> {
+	async #resolveAuthConfig(
+		config: MCPServerConfig,
+		opts?: { forceRefresh?: boolean; oauth?: boolean },
+	): Promise<MCPServerConfig> {
 		let resolved: MCPServerConfig = { ...config };
 
 		const auth = config.auth;
-		if (auth?.type === "oauth" && auth.credentialId && this.#authStorage) {
-			const credentialId = auth.credentialId;
+		const lookup: MCPOAuthCredentialLookup | undefined =
+			opts?.oauth !== false ? lookupMcpOAuthCredential(this.#authStorage, config) : undefined;
+		if (lookup && this.#authStorage) {
+			const { credentialId } = lookup;
 			try {
-				let credential = this.#authStorage.get(credentialId);
-				if (credential?.type === "oauth") {
-					// Proactive refresh: 5-minute buffer before expiry
-					// Force refresh: on 401/403 auth errors (revoked tokens, clock skew, missing expires)
-					const REFRESH_BUFFER_MS = 5 * 60_000;
-					const shouldRefresh =
-						forceRefresh || (credential.expires && Date.now() >= credential.expires - REFRESH_BUFFER_MS);
-					if (shouldRefresh && credential.refresh && auth.tokenUrl) {
-						try {
-							const refreshed = await refreshMCPOAuthToken(
-								auth.tokenUrl,
-								credential.refresh,
-								auth.clientId,
-								auth.clientSecret,
-							);
-							const refreshedCredential = { type: "oauth" as const, ...refreshed };
-							await this.#authStorage.set(credentialId, refreshedCredential);
-							credential = refreshedCredential;
-						} catch (refreshError) {
+				let credential: MCPStoredOAuthCredential | undefined = lookup.credential;
+				const REFRESH_BUFFER_MS = 5 * 60_000;
+				const refreshResult = await this.#authStorage.refreshStoredOAuthCredential<MCPStoredOAuthCredential>(
+					credentialId,
+					{
+						observedCredential: credential,
+						credentialFromRow: row => row,
+						forceRefresh: opts?.forceRefresh,
+						refreshSkewMs: REFRESH_BUFFER_MS,
+						canRefresh: current => {
+							const material = selectMcpOAuthRefreshMaterial(current, auth);
+							return Boolean(current.refresh && material?.tokenUrl);
+						},
+						refresh: (current, signal) => {
+							if (current.refresh === REMOTE_REFRESH_SENTINEL) {
+								throw new Error("MCP OAuth refresh token is broker-redacted; local refresh is unavailable");
+							}
+							const material = selectMcpOAuthRefreshMaterial(current, auth);
+							const tokenUrl = material?.tokenUrl;
+							if (!current.refresh || !tokenUrl) {
+								throw new Error("MCP OAuth credential is missing refresh material");
+							}
+							const clientId = material?.clientId;
+							const clientSecret = material?.clientSecret;
+							const authorizationUrl =
+								material && "authorizationUrl" in material ? material.authorizationUrl : undefined;
+							const resourceIsFallback =
+								!material?.resource && (config.type === "http" || config.type === "sse") && Boolean(config.url);
+							const resource = material?.resource ?? (resourceIsFallback ? config.url : undefined);
+							return refreshMCPOAuthToken(tokenUrl, current.refresh, clientId, clientSecret, resource, {
+								authorizationUrl,
+								stripSameOriginResource: resourceIsFallback,
+								signal,
+							});
+						},
+						mergeRefreshedCredential: (current, refreshed) => {
+							const material = selectMcpOAuthRefreshMaterial(current, auth);
+							const tokenUrl = material?.tokenUrl;
+							const clientId = material?.clientId;
+							const clientSecret = material?.clientSecret;
+							const authorizationUrl =
+								material && "authorizationUrl" in material ? material.authorizationUrl : undefined;
+							const resourceIsFallback =
+								!material?.resource && (config.type === "http" || config.type === "sse") && Boolean(config.url);
+							const resource = material?.resource ?? (resourceIsFallback ? config.url : undefined);
+							return {
+								...current,
+								...refreshed,
+								tokenUrl,
+								clientId,
+								clientSecret,
+								resource: resourceIsFallback ? undefined : resource,
+								authorizationUrl,
+							};
+						},
+						isDefinitiveFailure: error =>
+							isDefinitiveOAuthFailure(error instanceof Error ? error.message : String(error)),
+						disabledCause: error =>
+							`oauth refresh failed: ${error instanceof Error ? error.message : String(error)}`,
+						keepCredentialOnRefreshFailure: error =>
+							!(error instanceof Error && error.message.includes("broker-redacted")),
+						onRefreshFailure: refreshError => {
+							if (refreshError instanceof Error && refreshError.message.includes("broker-redacted")) return;
 							logger.warn("MCP OAuth refresh failed, using existing token", {
 								credentialId,
 								error: refreshError,
 							});
-						}
-					}
+						},
+					},
+				);
+				if (refreshResult.removed) {
+					logger.warn("MCP OAuth refresh failed definitively; cleared credential", { credentialId });
+				}
+				credential = refreshResult.credential;
 
+				if (credential) {
 					if (resolved.type === "http" || resolved.type === "sse") {
 						resolved = {
 							...resolved,

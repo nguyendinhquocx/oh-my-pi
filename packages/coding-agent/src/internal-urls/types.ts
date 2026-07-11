@@ -1,9 +1,12 @@
 /**
  * Types for the internal URL routing system.
  *
- * Internal URLs (agent://, artifact://, memory://, skill://, rule://, mcp://, omp://, local://) are resolved by tools like read,
+ * Internal URLs (`agent://`, `artifact://`, `history://`, `issue://`, `local://`, `mcp://`, `memory://`, `omp://`, `pr://`, `rule://`, `skill://`, `ssh://`, and `vault://`) are resolved by tools like read,
  * providing access to agent outputs and server resources without exposing filesystem paths.
  */
+
+import type { Skill } from "../extensibility/skills";
+import type { LocalProtocolOptions } from "./local-protocol";
 
 /**
  * Raw resource payload returned by protocol handlers. The `immutable` flag is
@@ -30,6 +33,29 @@ export interface InternalResource {
 	 * resources. Mutable resources (e.g. local://) behave like editable files.
 	 */
 	immutable?: boolean;
+	/**
+	 * True when the resource is a directory listing rather than file content.
+	 * `search` refuses to grep such a resource when it has no `sourcePath` — a
+	 * remote `ssh://` listing has no local path to recurse, so its listing text
+	 * must never be mistaken for the directory's contents.
+	 */
+	isDirectory?: boolean;
+}
+
+/**
+ * A single autocomplete candidate for the host/path portion of a `scheme://`
+ * URL, produced by {@link ProtocolHandler.complete}.
+ */
+export interface UrlCompletion {
+	/**
+	 * The text that follows `scheme://` for this candidate (e.g. `humanizer`,
+	 * `subdir/data.json`, `root`). The caller renders it as `scheme://<value>`.
+	 */
+	value: string;
+	/** Human-facing label for the dropdown. Defaults to {@link value}. */
+	label?: string;
+	/** Optional one-line description shown beside the candidate. */
+	description?: string;
 }
 
 /**
@@ -61,6 +87,36 @@ export interface ResolveContext {
 	settings?: unknown;
 	/** Caller's abort signal. */
 	signal?: AbortSignal;
+	/**
+	 * Calling session's `local://` root mapping. When present, the local-protocol
+	 * handler resolves the URL against THIS session's artifacts dir instead of
+	 * picking the first `main`-kind session from the global `AgentRegistry`.
+	 *
+	 * Required for correctness in multi-session hosts (cmux/ACP, embedded SDK
+	 * consumers) where multiple sessions are registered as `main` and the
+	 * "first one wins" lookup picks the wrong artifacts directory — see
+	 * [#1608](https://github.com/can1357/oh-my-pi/issues/1608).
+	 */
+	localProtocolOptions?: LocalProtocolOptions;
+	/** Calling session's loaded skills. Prefer this over process-global skill state. */
+	skills?: readonly Skill[];
+	/**
+	 * When set, handlers that would otherwise materialize an expensive directory
+	 * listing (e.g. the ssh:// handler draining a full remote `ls`) instead return
+	 * the directory shape (`isDirectory: true`) with empty content. `search`/`find`
+	 * reject directory resources, so they never need the listing.
+	 */
+	skipDirectoryListing?: boolean;
+	/**
+	 * When set, handlers that would otherwise materialize expensive content
+	 * (e.g. reading a multi-MiB artifact into memory just to expose its
+	 * `sourcePath`) may return the resource shape without content. Callers
+	 * that only need `sourcePath` — search/grep, bash URL expansion — pass
+	 * this so a large `artifact://` still resolves to its backing file
+	 * without OOM risk. Handlers that cannot separate path from content
+	 * ignore the flag.
+	 */
+	pathOnly?: boolean;
 }
 
 /**
@@ -73,6 +129,8 @@ export interface WriteContext {
 	cwd?: string;
 	/** Caller's abort signal. */
 	signal?: AbortSignal;
+	/** Calling session's `local://` root mapping — see {@link ResolveContext.localProtocolOptions}. */
+	localProtocolOptions?: LocalProtocolOptions;
 }
 
 /**
@@ -107,4 +165,18 @@ export interface ProtocolHandler {
 	 * surfaces a clear "not writable" error when invoked against them.
 	 */
 	write?(url: InternalUrl, content: string, context?: WriteContext): Promise<void>;
+	/**
+	 * Optional autocomplete hook. Returns candidate completions for the
+	 * host/path portion of a `scheme://` URL while the user composes a prompt.
+	 *
+	 * Implementations **MUST** be fast and local — this runs on every keystroke.
+	 * Schemes backed by network or external CLIs (issue://, pr://, vault://,
+	 * mcp://) omit it. The caller fuzzy-filters the returned set against the
+	 * partially typed `query`, so handlers return their full (bounded) candidate
+	 * list; `query` is provided only so handlers can scope expensive enumeration.
+	 * `context.cwd`/`context.localProtocolOptions` carry the caller's working dir
+	 * and session, for handlers whose candidates are project- or session-scoped
+	 * (e.g. ssh:// hosts from a project `ssh.json`, local:// roots per session).
+	 */
+	complete?(query?: string, context?: ResolveContext): Promise<UrlCompletion[]>;
 }

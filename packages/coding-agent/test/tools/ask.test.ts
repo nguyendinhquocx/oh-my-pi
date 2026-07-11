@@ -1,6 +1,8 @@
 import { beforeAll, describe, expect, it, vi } from "bun:test";
+import { stripVTControlCharacters } from "node:util";
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { ExtensionUISelectItem } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { getThemeByName, initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { AskTool, askToolRenderer } from "@oh-my-pi/pi-coding-agent/tools/ask";
@@ -20,7 +22,7 @@ function createSession(overrides: Partial<ToolSession> = {}): ToolSession {
 function createContext(args: {
 	select: (
 		prompt: string,
-		options: string[],
+		options: ExtensionUISelectItem[],
 		dialogOptions?: {
 			initialIndex?: number;
 			timeout?: number;
@@ -29,6 +31,9 @@ function createContext(args: {
 			onTimeout?: () => void;
 			onLeft?: () => void;
 			onRight?: () => void;
+			selectionMarker?: "radio" | "checkbox";
+			checkedIndices?: readonly number[];
+			markableCount?: number;
 		},
 	) => Promise<string | undefined>;
 	editor?: (
@@ -56,7 +61,11 @@ function createContext(args: {
 }
 
 function stripAnsi(text: string): string {
-	return text.replace(/\x1b\[[0-9;]*m/g, "");
+	return stripVTControlCharacters(text);
+}
+
+function selectItemLabel(option: ExtensionUISelectItem | undefined): string | undefined {
+	return typeof option === "string" ? option : option?.label;
 }
 
 beforeAll(async () => {
@@ -97,8 +106,11 @@ describe("AskTool cancellation", () => {
 		// deliberate indefinitely. The dialog timeout is opt-in via the `ask.timeout` setting.
 		const tool = new AskTool(createSession());
 		const select = vi.fn(
-			async (_prompt: string, options: string[], _dialogOptions?: { initialIndex?: number; timeout?: number }) =>
-				options[0],
+			async (
+				_prompt: string,
+				options: ExtensionUISelectItem[],
+				_dialogOptions?: { initialIndex?: number; timeout?: number },
+			) => (typeof options[0] === "string" ? options[0] : options[0]?.label),
 		);
 		const context = createContext({ select });
 
@@ -163,13 +175,14 @@ describe("AskTool cancellation", () => {
 		const select = vi.fn(
 			async (
 				_prompt: string,
-				options: string[],
+				options: ExtensionUISelectItem[],
 				dialogOptions?: { initialIndex?: number; timeout?: number; onTimeout?: () => void },
 			) => {
 				const timeout = dialogOptions?.timeout ?? 1;
 				await Bun.sleep(timeout + 5);
 				dialogOptions?.onTimeout?.();
-				return options[dialogOptions?.initialIndex ?? 0];
+				const selected = options[dialogOptions?.initialIndex ?? 0];
+				return typeof selected === "string" ? selected : selected?.label;
 			},
 		);
 		const context = createContext({
@@ -204,7 +217,7 @@ describe("AskTool cancellation", () => {
 		expect(select).toHaveBeenCalledTimes(1);
 		expect(select.mock.calls[0]?.[2]?.initialIndex).toBe(1);
 		expect(select.mock.calls[0]?.[2]?.timeout).toBeGreaterThan(0);
-	});
+	}, 30_000);
 
 	it("auto-selects the first option when timeout elapses without a selected option", async () => {
 		const tool = new AskTool(
@@ -246,7 +259,7 @@ describe("AskTool cancellation", () => {
 		expect(result.content[0].text).toContain("User selected: yes");
 		expect(result.details?.selectedOptions).toEqual(["yes"]);
 		expect(abort).not.toHaveBeenCalled();
-	});
+	}, 30_000);
 
 	it("routes custom input through editor with promptStyle after choosing Other", async () => {
 		const tool = new AskTool(
@@ -347,7 +360,7 @@ describe("AskTool cancellation", () => {
 		expect(result.details?.customInput).toBeUndefined();
 		expect(editor).not.toHaveBeenCalled();
 		expect(abort).not.toHaveBeenCalled();
-	});
+	}, 30_000);
 
 	it("aborts multi-question ask when any question is explicitly cancelled", async () => {
 		const tool = new AskTool(createSession());
@@ -386,6 +399,140 @@ describe("AskTool cancellation", () => {
 	});
 });
 
+describe("AskTool option descriptions", () => {
+	it("passes descriptions to the selector while returning selected labels", async () => {
+		const tool = new AskTool(createSession());
+		const select = vi.fn(async (_prompt: string, options: ExtensionUISelectItem[]) => {
+			expect(options[0]).toEqual({
+				label: "Use local credentials",
+				description: "Authenticate with provider keys already configured under ~/.omp.",
+			});
+			expect(options[1]).toEqual({
+				label: "Set up in terminal",
+				description: "Launch the terminal setup flow to add credentials before continuing.",
+			});
+			const selected = options[1];
+			return typeof selected === "string" ? selected : selected?.label;
+		});
+		const context = createContext({ select });
+
+		const result = await tool.execute(
+			"call-option-descriptions",
+			{
+				questions: [
+					{
+						id: "auth",
+						question: "How should authentication continue?",
+						options: [
+							{
+								label: "Use local credentials",
+								description: "Authenticate with provider keys already configured under ~/.omp.",
+							},
+							{
+								label: "Set up in terminal",
+								description: "Launch the terminal setup flow to add credentials before continuing.",
+							},
+						],
+					},
+				],
+			},
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(result.content[0]?.type).toBe("text");
+		if (result.content[0]?.type !== "text") {
+			throw new Error("Expected text result");
+		}
+		expect(result.content[0].text).toContain("User selected: Set up in terminal");
+		expect(result.details?.selectedOptions).toEqual(["Set up in terminal"]);
+		expect(result.content[0].text).not.toContain("Launch the terminal setup flow");
+		expect(result.details?.options).toEqual(["Use local credentials", "Set up in terminal"]);
+	});
+
+	it("renders descriptions under labels in ask call previews", async () => {
+		const theme = await getThemeByName("dark");
+		expect(theme).toBeDefined();
+		const rendered = askToolRenderer.renderCall(
+			{
+				question: "How should authentication continue?",
+				options: [
+					{
+						label: "Use local credentials",
+						description: "Authenticate with provider keys already configured under ~/.omp.",
+					},
+					{
+						label: "Set up in terminal",
+						description: "Launch the terminal setup flow to add credentials before continuing.",
+					},
+				],
+			},
+			{ expanded: true, isPartial: false },
+			theme!,
+		);
+		const renderedLines = stripAnsi(rendered.render(120).join("\n")).split("\n");
+		const labelLine = renderedLines.findIndex(line => line.includes("Use local credentials"));
+		const descriptionLine = renderedLines.findIndex(line =>
+			line.includes("Authenticate with provider keys already configured"),
+		);
+		expect(labelLine).toBeGreaterThanOrEqual(0);
+		expect(descriptionLine).toBeGreaterThan(labelLine);
+	});
+
+	it("forwards descriptions through multi-select and returns bare labels", async () => {
+		const tool = new AskTool(createSession());
+		let step = 0;
+		let firstOptions: ExtensionUISelectItem[] = [];
+		const editor = vi.fn(async () => undefined);
+		const context = createContext({
+			select: async (_prompt, options) => {
+				if (step === 0) {
+					firstOptions = options;
+					step += 1;
+					return selectItemLabel(options.find(o => selectItemLabel(o)?.endsWith("alpha")));
+				}
+				if (step === 1) {
+					step += 1;
+					return selectItemLabel(options.find(o => selectItemLabel(o)?.endsWith("beta")));
+				}
+				return selectItemLabel(options.find(o => selectItemLabel(o)?.includes("Done selecting")));
+			},
+			editor,
+		});
+
+		const result = await tool.execute(
+			"call-multi-desc",
+			{
+				questions: [
+					{
+						id: "multi",
+						question: "Pick answers",
+						options: [
+							{ label: "alpha", description: "First choice detail." },
+							{ label: "beta", description: "Second choice detail." },
+						],
+						multi: true,
+					},
+				],
+			},
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(result.details?.selectedOptions).toEqual(["alpha", "beta"]);
+		expect(result.content[0]?.type).toBe("text");
+		if (result.content[0]?.type !== "text") {
+			throw new Error("Expected text result");
+		}
+		expect(result.content[0].text).toContain("User selected: alpha, beta");
+		expect(result.content[0].text).not.toContain("First choice detail");
+		const alphaOption = firstOptions.find(o => selectItemLabel(o)?.endsWith("alpha"));
+		expect(typeof alphaOption === "object" ? alphaOption.description : undefined).toBe("First choice detail.");
+	});
+});
+
 describe("AskTool custom input", () => {
 	it("routes custom input through editor and preserves raw multiline strings", async () => {
 		const tool = new AskTool(createSession());
@@ -416,11 +563,196 @@ describe("AskTool custom input", () => {
 		expect(editor).toHaveBeenCalledTimes(1);
 		expect(abort).not.toHaveBeenCalled();
 	});
+	it("keeps question context visible while entering Other custom input", async () => {
+		const tool = new AskTool(createSession());
+		const editor = vi.fn(async (_title: string) => "custom");
+		const questions = [
+			{
+				id: "details",
+				question: "Share details",
+				options: [{ label: "yes" }, { label: "no", description: "Skip the optional detail." }],
+			},
+		];
+		const context = createContext({
+			select: async () => "Other (type your own)",
+			editor,
+		});
 
-	it("aborts when editor is cancelled in single-question flow", async () => {
+		await tool.execute("call-editor-context", { questions }, undefined, undefined, context);
+
+		const title = editor.mock.calls[0]?.[0] ?? "";
+		expect(title).toContain("Share details");
+		expect(title).toContain("yes");
+		expect(title).toContain("no");
+		expect(title).toContain("Skip the optional detail.");
+		expect(title).toContain("Other (type your own)");
+		expect(title).toContain("Enter your response:");
+	});
+
+	it("caps Other editor context for long option lists with long descriptions", async () => {
+		const tool = new AskTool(createSession());
+		const editor = vi.fn(async (_title: string) => "custom");
+		const longDescription = "x".repeat(400);
+		const optionCount = 20;
+		const options = Array.from({ length: optionCount }, (_, i) => ({
+			label: `option-${i}`,
+			description: longDescription,
+		}));
+		const questions = [{ id: "pick", question: "Pick one", options }];
+		const context = createContext({
+			select: async () => "Other (type your own)",
+			editor,
+		});
+
+		await tool.execute("call-editor-cap", { questions }, undefined, undefined, context);
+
+		const title = editor.mock.calls[0]?.[0] ?? "";
+		const lineCount = title.split("\n").length;
+		// Cap is 8 option rows + their (single-line) descriptions + chrome; far below
+		// 20 options × (label + multi-line description) the unbounded path would emit.
+		expect(lineCount).toBeLessThanOrEqual(22);
+		expect(title).toContain("Pick one");
+		expect(title).toContain("option-0");
+		expect(title).toContain("Other (type your own)");
+		expect(title).toContain("more option");
+		expect(title).toContain("Enter your response:");
+		// Descriptions are flattened to a single line and truncated.
+		expect(title).not.toContain("x".repeat(400));
+		// Every option-row description must fit on one line.
+		for (const line of title.split("\n")) {
+			expect(line.length).toBeLessThanOrEqual(160);
+		}
+	});
+
+	it("keeps user-checked options visible in capped multi-select context", async () => {
+		const tool = new AskTool(createSession());
+		const editor = vi.fn(async (_title: string) => "custom");
+		const options = Array.from({ length: 20 }, (_, i) => ({ label: `opt-${i}` }));
+		const questions = [{ id: "pick", question: "Multi pick", options, multi: true }];
+		let call = 0;
+		const context = createContext({
+			select: async (_prompt, opts) => {
+				call += 1;
+				if (call === 1) return selectItemLabel(opts.find(o => selectItemLabel(o) === "opt-12"));
+				if (call === 2) return selectItemLabel(opts.find(o => selectItemLabel(o) === "opt-17"));
+				return "Other (type your own)";
+			},
+			editor,
+		});
+
+		await tool.execute("call-editor-cap-multi", { questions }, undefined, undefined, context);
+
+		const title = editor.mock.calls[0]?.[0] ?? "";
+		// Checked options must survive the window so the user sees what they had
+		// already toggled before switching to Other.
+		expect(title).toContain("opt-12");
+		expect(title).toContain("opt-17");
+		expect(title).toContain("Other (type your own)");
+		expect(title).toContain("more option");
+	});
+
+	it("summarizes excess checked options instead of exceeding the context cap", async () => {
+		const tool = new AskTool(createSession());
+		const editor = vi.fn(async (_title: string) => "custom");
+		const options = Array.from({ length: 20 }, (_, i) => ({ label: `checked-${i}` }));
+		const questions = [{ id: "pick", question: "Pick many", options, multi: true }];
+		let call = 0;
+		const context = createContext({
+			select: async (_prompt, opts) => {
+				if (call < 12) {
+					const label = `checked-${call}`;
+					call += 1;
+					return selectItemLabel(opts.find(o => selectItemLabel(o) === label));
+				}
+				return "Other (type your own)";
+			},
+			editor,
+		});
+
+		await tool.execute("call-editor-cap-many-checked", { questions }, undefined, undefined, context);
+
+		const title = editor.mock.calls[0]?.[0] ?? "";
+		const optionRows = title
+			.split("\n")
+			.filter(line => line.includes("checked-") || line.includes("Other (type your own)"));
+		expect(optionRows.length).toBeLessThanOrEqual(8);
+		expect(title).toContain("Other (type your own)");
+		expect(title).toContain("checked");
+		expect(title).toContain("more option");
+		expect(title).toContain("Enter your response:");
+	});
+
+	it("keeps sparse checked gap markers within the Other title budget", async () => {
+		const tool = new AskTool(createSession());
+		const editor = vi.fn(async (_title: string) => "custom");
+		const checkedLabels = [10, 20, 30, 40, 50, 60].map(i => `opt-${i}`);
+		const options = Array.from({ length: 61 }, (_, i) => ({ label: `opt-${i}` }));
+		const questions = [{ id: "pick", question: "Pick sparse", options, multi: true }];
+		let call = 0;
+		const context = createContext({
+			select: async (_prompt, opts) => {
+				const next = checkedLabels[call++];
+				return next ? selectItemLabel(opts.find(o => selectItemLabel(o) === next)) : "Other (type your own)";
+			},
+			editor,
+		});
+
+		await tool.execute("call-editor-cap-sparse-checked", { questions }, undefined, undefined, context);
+
+		const title = editor.mock.calls[0]?.[0] ?? "";
+		expect(title.split("\n").length).toBeLessThanOrEqual(16);
+		expect(title).toContain("Other (type your own)");
+		expect(title).toContain("more option");
+		expect(title).toContain("Enter your response:");
+	});
+
+	it("enforces total title row budget under narrow terminals", async () => {
+		const originalColumns = process.stdout.columns;
+		// Force an 80-wide terminal so long descriptions would wrap to multiple
+		// rendered rows without per-line width truncation + total row budget.
+		Object.defineProperty(process.stdout, "columns", { value: 80, configurable: true });
+		try {
+			const tool = new AskTool(createSession());
+			const editor = vi.fn(async (_title: string) => "custom");
+			const longDescription = "x".repeat(400);
+			const options = Array.from({ length: 8 }, (_, i) => ({
+				label: `option-${i}`,
+				description: longDescription,
+			}));
+			const questions = [{ id: "pick", question: "Pick one", options }];
+			const context = createContext({
+				select: async () => "Other (type your own)",
+				editor,
+			});
+
+			await tool.execute("call-editor-row-budget", { questions }, undefined, undefined, context);
+
+			const title = editor.mock.calls[0]?.[0] ?? "";
+			const lines = title.split("\n");
+			// 16-row hard budget keeps the input row + hint reachable on 80x24.
+			expect(lines.length).toBeLessThanOrEqual(16);
+			// Every emitted line must fit on a single 80-cell row after truncation.
+			for (const line of lines) {
+				expect(stripAnsi(line).length).toBeLessThanOrEqual(80);
+			}
+			expect(title).toContain("Pick one");
+			expect(title).toContain("Other (type your own)");
+			expect(title).toContain("Enter your response:");
+			expect(title).not.toContain("x".repeat(400));
+		} finally {
+			if (originalColumns === undefined) {
+				Object.defineProperty(process.stdout, "columns", { value: undefined, configurable: true });
+			} else {
+				Object.defineProperty(process.stdout, "columns", { value: originalColumns, configurable: true });
+			}
+		}
+	});
+
+	it("returns to the option selector when custom input is dismissed in single-question flow", async () => {
 		const tool = new AskTool(createSession());
 		const abort = vi.fn();
 		const editor = vi.fn(async () => undefined);
+		let selectCalls = 0;
 		const questions = [
 			{
 				id: "details",
@@ -429,22 +761,27 @@ describe("AskTool custom input", () => {
 			},
 		];
 		const context = createContext({
-			select: async () => "Other (type your own)",
+			select: async () => {
+				selectCalls += 1;
+				return selectCalls === 1 ? "Other (type your own)" : "yes";
+			},
 			editor,
 			abort,
 		});
 
-		await expect(
-			tool.execute("call-editor-cancel", { questions }, undefined, undefined, context),
-		).rejects.toBeInstanceOf(ToolAbortError);
+		const result = await tool.execute("call-editor-cancel", { questions }, undefined, undefined, context);
+		expect(result.details?.selectedOptions).toEqual(["yes"]);
+		expect(result.details?.customInput).toBeUndefined();
+		expect(selectCalls).toBe(2);
 		expect(editor).toHaveBeenCalledTimes(1);
-		expect(abort).toHaveBeenCalledTimes(1);
+		expect(abort).not.toHaveBeenCalled();
 	});
 
-	it("continues multi-question flow when editor is dismissed on a fresh question", async () => {
+	it("returns to the option selector when custom input is dismissed in multi-question flow", async () => {
 		const tool = new AskTool(createSession());
 		const abort = vi.fn();
 		const editor = vi.fn(async () => undefined);
+		let detailsVisits = 0;
 		const questions = [
 			{
 				id: "first",
@@ -460,7 +797,10 @@ describe("AskTool custom input", () => {
 		const context = createContext({
 			select: async prompt => {
 				if (prompt.includes("First?")) return "one";
-				if (prompt.includes("Details?")) return "Other (type your own)";
+				if (prompt.includes("Details?")) {
+					detailsVisits += 1;
+					return detailsVisits === 1 ? "Other (type your own)" : "short";
+				}
 				return undefined;
 			},
 			editor,
@@ -469,10 +809,10 @@ describe("AskTool custom input", () => {
 
 		const result = await tool.execute("call-editor-multi-dismiss", { questions }, undefined, undefined, context);
 
-		// Editor dismissed on "Details?" — flow continues with empty answer, not abort
 		expect(result.details?.results?.[0]?.selectedOptions).toEqual(["one"]);
-		expect(result.details?.results?.[1]?.selectedOptions).toEqual([]);
+		expect(result.details?.results?.[1]?.selectedOptions).toEqual(["short"]);
 		expect(result.details?.results?.[1]?.customInput).toBeUndefined();
+		expect(detailsVisits).toBe(2);
 		expect(editor).toHaveBeenCalledTimes(1);
 		expect(abort).not.toHaveBeenCalled();
 	});
@@ -555,9 +895,9 @@ describe("AskTool custom input", () => {
 			select: async (_prompt, options) => {
 				if (step === 0) {
 					step += 1;
-					const alphaOption = options.find(option => option.endsWith("alpha"));
+					const alphaOption = options.find(option => selectItemLabel(option)?.endsWith("alpha"));
 					if (!alphaOption) throw new Error("Missing alpha option");
-					return alphaOption;
+					return selectItemLabel(alphaOption);
 				}
 				return "Other (type your own)";
 			},
@@ -598,7 +938,7 @@ describe("AskTool custom input", () => {
 		expect(renderedText).toContain("custom detail");
 	});
 
-	it("preserves prior multi-select answers when custom editor is dismissed", async () => {
+	it("returns to the option selector when multi-select custom input is dismissed", async () => {
 		const tool = new AskTool(createSession());
 		let step = 0;
 		const editor = vi.fn(async () => undefined);
@@ -606,11 +946,17 @@ describe("AskTool custom input", () => {
 			select: async (_prompt, options) => {
 				if (step === 0) {
 					step += 1;
-					const alphaOption = options.find(option => option.endsWith("alpha"));
+					const alphaOption = options.find(option => selectItemLabel(option)?.endsWith("alpha"));
 					if (!alphaOption) throw new Error("Missing alpha option");
-					return alphaOption;
+					return selectItemLabel(alphaOption);
 				}
-				return "Other (type your own)";
+				if (step === 1) {
+					step += 1;
+					return "Other (type your own)";
+				}
+				const doneOption = options.find(option => selectItemLabel(option)?.includes("Done selecting"));
+				if (!doneOption) throw new Error("Missing done option");
+				return selectItemLabel(doneOption);
 			},
 			editor,
 		});
@@ -639,6 +985,7 @@ describe("AskTool custom input", () => {
 			throw new Error("Expected text result");
 		}
 		expect(result.content[0].text).toContain("User selected: alpha");
+		expect(step).toBe(2);
 		expect(editor).toHaveBeenCalledTimes(1);
 	});
 });
@@ -681,14 +1028,14 @@ describe("AskTool multiline custom input rendering", () => {
 		expect(renderedText).toContain("second line");
 		expect(renderedText).toContain("third line");
 
-		// Count success icons — should be exactly one for the custom input block,
-		// plus one for the question status icon (if present). The key contract is that
-		// continuation lines do NOT get their own success icon.
+		// Count success glyphs — should be exactly one for the custom input block.
+		// The key contract is that continuation lines do NOT get their own glyph.
+		const successGlyph = theme!.symbol("status.success");
 		const successIconCount = (
-			renderedText.match(new RegExp(theme!.status.success.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")) || []
+			renderedText.match(new RegExp(successGlyph.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")) || []
 		).length;
-		// One icon on the status line header + one on the custom input first line = 2 max
-		expect(successIconCount).toBeLessThanOrEqual(2);
+		// One glyph on the custom input first line; header uses the tool.ask icon.
+		expect(successIconCount).toBe(1);
 
 		// Ensure "second line" and "third line" are NOT preceded by a success icon on their own line
 		const lines = renderedText.split("\n");
@@ -696,7 +1043,7 @@ describe("AskTool multiline custom input rendering", () => {
 			const trimmed = line.trim();
 			if (trimmed.includes("second line") || trimmed.includes("third line")) {
 				// These continuation lines must NOT start with a success icon
-				expect(trimmed.startsWith(theme!.status.success)).toBe(false);
+				expect(trimmed.startsWith(successGlyph)).toBe(false);
 			}
 		}
 	});
@@ -757,7 +1104,7 @@ describe("AskTool multi-question navigation", () => {
 
 	it("keeps back unavailable on the first question and supports returning from later questions", async () => {
 		const tool = new AskTool(createSession());
-		const firstQuestionOptions: string[][] = [];
+		const firstQuestionOptions: ExtensionUISelectItem[][] = [];
 		let firstVisits = 0;
 		let secondVisits = 0;
 		const context = createContext({
@@ -882,7 +1229,7 @@ describe("AskTool multi-question navigation", () => {
 		expect(result.details?.results?.[0]?.selectedOptions).toEqual(["one"]);
 		expect(result.details?.results?.[1]?.selectedOptions).toEqual(["beta"]);
 		expect(result.details?.results?.[2]?.selectedOptions).toEqual([]);
-	});
+	}, 30_000);
 	it("preserves custom input when navigating back and forward", async () => {
 		const tool = new AskTool(createSession());
 		const multilineText = "line 1\nline 2";
@@ -976,5 +1323,208 @@ describe("AskTool multi-question navigation", () => {
 		expect(result.details?.results?.[0]?.customInput).toBeUndefined();
 		expect(result.details?.results?.[1]?.selectedOptions).toEqual(["two"]);
 		expect(editor).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("AskTool option markers", () => {
+	it("renders single-choice call options with circular radio markers, not checkboxes", async () => {
+		const theme = await getThemeByName("dark");
+		expect(theme).toBeDefined();
+		const rendered = askToolRenderer.renderCall(
+			{ question: "Pick one", options: [{ label: "Alpha" }, { label: "Beta" }] },
+			{ expanded: true, isPartial: false },
+			theme!,
+		);
+		const text = stripAnsi(rendered.render(120).join("\n"));
+		expect(text).toContain(theme!.radio.unselected);
+		expect(text).not.toContain(theme!.checkbox.unchecked);
+	});
+
+	it("renders multi-select call options with rectangular checkbox markers, not radios", async () => {
+		const theme = await getThemeByName("dark");
+		expect(theme).toBeDefined();
+		const rendered = askToolRenderer.renderCall(
+			{ question: "Pick many", options: [{ label: "Alpha" }, { label: "Beta" }], multi: true },
+			{ expanded: true, isPartial: false },
+			theme!,
+		);
+		const text = stripAnsi(rendered.render(120).join("\n"));
+		expect(text).toContain(theme!.checkbox.unchecked);
+		expect(text).not.toContain(theme!.radio.unselected);
+	});
+
+	it("keeps option rows stable across repeated renders", async () => {
+		const theme = await getThemeByName("dark");
+		expect(theme).toBeDefined();
+		const options = [
+			{ label: "TypeScript" },
+			{ label: "Rust" },
+			{ label: "Python" },
+			{ label: "Go" },
+			{ label: "C" },
+			{ label: "C++" },
+			{ label: "Zig" },
+			{ label: "Java" },
+			{ label: "Swift" },
+			{ label: "Haskell" },
+		];
+		const renderedCall = askToolRenderer.renderCall(
+			{ questions: [{ id: "fav_lang", question: "Which programming language?", options }] },
+			{ expanded: true, isPartial: true },
+			theme!,
+		);
+
+		const firstCall = stripAnsi(renderedCall.render(120).join("\n"));
+		const secondCall = stripAnsi(renderedCall.render(120).join("\n"));
+		expect(secondCall).toBe(firstCall);
+		expect(secondCall.match(/TypeScript/g)?.length).toBe(1);
+		expect(secondCall.match(/Haskell/g)?.length).toBe(1);
+
+		const renderedResult = askToolRenderer.renderResult(
+			{
+				content: [{ type: "text", text: "" }],
+				details: {
+					results: [
+						{
+							id: "fav_lang",
+							question: "Which programming language?",
+							options: options.map(option => option.label),
+							multi: false,
+							selectedOptions: ["Python"],
+						},
+					],
+				},
+			},
+			{ expanded: true, isPartial: false },
+			theme!,
+		);
+		const firstResult = stripAnsi(renderedResult.render(120).join("\n"));
+		const secondResult = stripAnsi(renderedResult.render(120).join("\n"));
+		expect(secondResult).toBe(firstResult);
+		expect(secondResult.match(/TypeScript/g)?.length).toBe(1);
+		expect(secondResult.match(/Haskell/g)?.length).toBe(1);
+	});
+
+	it("keeps single-question option rows stable across repeated renders", async () => {
+		const theme = await getThemeByName("dark");
+		expect(theme).toBeDefined();
+		// The question body comes from the Markdown render cache, which returns
+		// the SAME array on every render of identical text at identical width.
+		// Appending option rows in place would poison that cached entry, so a
+		// second render of the component would duplicate the options.
+		const renderedCall = askToolRenderer.renderCall(
+			{ question: "Which **language** do you prefer?", options: [{ label: "OptionDupCanary" }] },
+			{ expanded: true, isPartial: false },
+			theme!,
+		);
+		const first = stripAnsi(renderedCall.render(120).join("\n"));
+		const second = stripAnsi(renderedCall.render(120).join("\n"));
+		expect(second).toBe(first);
+		expect(second.match(/OptionDupCanary/g)?.length).toBe(1);
+
+		const renderedResult = askToolRenderer.renderResult(
+			{
+				content: [{ type: "text", text: "" }],
+				details: {
+					question: "Which **language** do you prefer?",
+					multi: false,
+					options: ["OptionDupCanary"],
+					selectedOptions: ["OptionDupCanary"],
+				},
+			},
+			{ expanded: true, isPartial: false },
+			theme!,
+		);
+		const firstResult = stripAnsi(renderedResult.render(120).join("\n"));
+		const secondResult = stripAnsi(renderedResult.render(120).join("\n"));
+		expect(secondResult).toBe(firstResult);
+		expect(secondResult.match(/OptionDupCanary/g)?.length).toBe(1);
+	});
+	it("renders single-choice result selection with a filled radio marker", async () => {
+		const theme = await getThemeByName("dark");
+		expect(theme).toBeDefined();
+		const rendered = askToolRenderer.renderResult(
+			{
+				content: [{ type: "text", text: "" }],
+				details: { question: "Pick one", multi: false, selectedOptions: ["Alpha"] },
+			},
+			{ expanded: true, isPartial: false },
+			theme!,
+		);
+		const text = stripAnsi(rendered.render(120).join("\n"));
+		expect(text).toContain(theme!.radio.selected);
+		expect(text).not.toContain(theme!.checkbox.checked);
+	});
+
+	it("renders multi-select result selections with checkbox markers", async () => {
+		const theme = await getThemeByName("dark");
+		expect(theme).toBeDefined();
+		const rendered = askToolRenderer.renderResult(
+			{
+				content: [{ type: "text", text: "" }],
+				details: { question: "Pick many", multi: true, selectedOptions: ["Alpha", "Beta"] },
+			},
+			{ expanded: true, isPartial: false },
+			theme!,
+		);
+		const text = stripAnsi(rendered.render(120).join("\n"));
+		expect(text).toContain(theme!.checkbox.checked);
+		expect(text).not.toContain(theme!.radio.selected);
+	});
+});
+
+describe("askToolRenderer malformed call args", () => {
+	it("renders double-encoded questions string instead of crashing the TUI", async () => {
+		const theme = await getThemeByName("dark");
+		expect(theme).toBeDefined();
+		// Models occasionally JSON-encode the questions array as a string; a bare
+		// string passes a truthy `.length` check but has no `.map` (TUI crash).
+		const doubleEncoded = JSON.stringify([
+			{ id: "q1", question: "Pick one", options: [{ label: "Alpha" }, { label: "Beta" }] },
+		]);
+		const rendered = askToolRenderer.renderCall(
+			{ questions: doubleEncoded } as never,
+			{ expanded: true, isPartial: false },
+			theme!,
+		);
+		const text = stripAnsi(rendered.render(120).join("\n"));
+		expect(text).toContain("[q1]");
+		expect(text).toContain("Pick one");
+		expect(text).toContain("Alpha");
+	});
+
+	it("falls back to the error frame for unparseable questions without throwing", async () => {
+		const theme = await getThemeByName("dark");
+		expect(theme).toBeDefined();
+		for (const questions of ["[{trunc", 42, { 0: { id: "x" } }]) {
+			const rendered = askToolRenderer.renderCall(
+				{ questions } as never,
+				{ expanded: true, isPartial: true },
+				theme!,
+			);
+			const text = stripAnsi(rendered.render(120).join("\n"));
+			expect(text).toContain("No question provided");
+		}
+	});
+
+	it("drops malformed question entries and option items while keeping valid ones", async () => {
+		const theme = await getThemeByName("dark");
+		expect(theme).toBeDefined();
+		const rendered = askToolRenderer.renderCall(
+			{
+				questions: [
+					null,
+					"garbage",
+					{ id: "ok", question: "Real question", options: ["BareString", { label: "Proper" }, { nope: 1 }, 7] },
+				],
+			} as never,
+			{ expanded: true, isPartial: true },
+			theme!,
+		);
+		const text = stripAnsi(rendered.render(120).join("\n"));
+		expect(text).toContain("[ok]");
+		expect(text).toContain("Real question");
+		expect(text).toContain("BareString");
+		expect(text).toContain("Proper");
 	});
 });

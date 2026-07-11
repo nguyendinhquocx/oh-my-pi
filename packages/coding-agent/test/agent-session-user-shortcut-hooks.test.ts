@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import { getBundledModel } from "@oh-my-pi/pi-ai";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as pythonExecutor from "@oh-my-pi/pi-coding-agent/eval/py/executor";
@@ -29,6 +29,7 @@ describe("AgentSession user shortcut hooks", () => {
 		if (session) {
 			await session.dispose();
 		}
+		await pythonExecutor.disposeAllKernelSessions();
 		authStorage?.close();
 		authStorage = undefined;
 		tempDir.removeSync();
@@ -49,7 +50,7 @@ describe("AgentSession user shortcut hooks", () => {
 
 		session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.inMemory(tempDir.path()),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry,
 			extensionRunner,
@@ -176,5 +177,22 @@ describe("AgentSession user shortcut hooks", () => {
 		expect(
 			session.messages.some(message => message.role === "pythonExecution" && message.excludeFromContext === false),
 		).toBe(true);
+	});
+
+	it("shares Python state between eval and user shortcut execution", async () => {
+		createSession();
+		const evalSessionId = session.getEvalSessionId();
+		if (!evalSessionId) throw new Error("Expected eval session ID");
+
+		await pythonExecutor.executePython("shared_value = 123", {
+			cwd: tempDir.path(),
+			sessionId: `python:${evalSessionId}`,
+			kernelMode: "session",
+		});
+
+		const result = await session.executePython("print(shared_value)");
+
+		expect(result.exitCode).toBe(0);
+		expect(result.output.trim()).toBe("123");
 	});
 });

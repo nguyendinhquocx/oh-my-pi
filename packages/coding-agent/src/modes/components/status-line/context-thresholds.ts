@@ -1,3 +1,4 @@
+import { formatNumber } from "@oh-my-pi/pi-utils";
 import type { ThemeColor } from "../../../modes/theme/theme";
 
 export type ContextUsageLevel = "normal" | "warning" | "purple" | "error";
@@ -52,6 +53,23 @@ export function getContextUsageLevel(contextPercent: number, contextWindow: numb
 	}
 
 	return "normal";
+}
+
+/**
+ * Format context usage as `<percent>%/<window>` when the model window is known.
+ * Unknown windows render as `<tokens>/?`, because `0.0%/0` suggests a real
+ * empty context instead of missing provider metadata.
+ */
+export function formatContextUsage(
+	contextPercent: number | null | undefined,
+	contextWindow: number,
+	usedTokens?: number,
+): string {
+	if (!Number.isFinite(contextWindow) || contextWindow <= 0) {
+		return `${formatNumber(usedTokens ?? 0)}/?`;
+	}
+	const pct = contextPercent === null || contextPercent === undefined ? "?" : `${contextPercent.toFixed(1)}%`;
+	return `${pct}/${formatNumber(contextWindow)}`;
 }
 
 export function getContextUsageThemeColor(level: ContextUsageLevel): ThemeColor {

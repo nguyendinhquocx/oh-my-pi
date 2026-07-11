@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { hookFetch } from "@oh-my-pi/pi-utils";
-import { AgentStorage } from "../../src/session/agent-storage";
-import { searchCodex } from "../../src/web/search/providers/codex";
+import type { AuthStorage, FetchImpl } from "@oh-my-pi/pi-ai";
+import type { SearchParams } from "@oh-my-pi/pi-coding-agent/web/search/providers/base";
+import { searchCodex } from "@oh-my-pi/pi-coding-agent/web/search/providers/codex";
 
 type CapturedRequest = {
 	url: string;
@@ -174,34 +174,43 @@ function makePlainUrlPunctuationSseResponse(model: string): string {
 }
 
 describe("searchCodex model selection", () => {
+	const fakeAuthStorage = {
+		async getOAuthAccess() {
+			return {
+				accessToken: "test-access-token",
+				accountId: "acct-test",
+			};
+		},
+		hasOAuth() {
+			return true;
+		},
+	} as unknown as AuthStorage;
 	let capturedRequest: CapturedRequest | null = null;
 
-	function mockCodexFetch(responseModel: string, responseBody?: string): Disposable {
+	function makeSearchParams(query: string, fetch?: FetchImpl): SearchParams {
+		return {
+			query,
+			systemPrompt: "Codex test system prompt",
+			authStorage: fakeAuthStorage,
+			...(fetch ? { fetch } : {}),
+		};
+	}
+
+	function mockCodexFetch(responseModel: string, responseBody?: string): FetchImpl {
 		capturedRequest = null;
-		vi.spyOn(AgentStorage, "open").mockResolvedValue({
-			listAuthCredentials: () => [
-				{
-					id: 1,
-					credential: {
-						type: "oauth",
-						access: "test-access-token",
-						expires: Date.now() + 600_000,
-						accountId: "acct-test",
-					},
-				},
-			],
-		} as unknown as AgentStorage);
-		return hookFetch((url, init) => {
+		return (url, init) => {
 			capturedRequest = {
 				url: typeof url === "string" ? url : url.toString(),
 				headers: init?.headers,
 				body: init?.body ? (JSON.parse(init.body as string) as Record<string, unknown>) : null,
 			};
-			return new Response(responseBody ?? makeSseResponse(responseModel), {
-				status: 200,
-				headers: { "Content-Type": "text/event-stream" },
-			});
-		});
+			return Promise.resolve(
+				new Response(responseBody ?? makeSseResponse(responseModel), {
+					status: 200,
+					headers: { "Content-Type": "text/event-stream" },
+				}),
+			);
+		};
 	}
 
 	afterEach(() => {
@@ -216,44 +225,106 @@ describe("searchCodex model selection", () => {
 
 	it("uses the built-in default model when PI_CODEX_WEB_SEARCH_MODEL is unset", async () => {
 		delete process.env.PI_CODEX_WEB_SEARCH_MODEL;
-		using _hook = mockCodexFetch("gpt-5-codex-mini");
-
-		const result = await searchCodex({ query: "default codex model" });
+		const result = await searchCodex(makeSearchParams("default codex model", mockCodexFetch("gpt-5.5")));
 
 		expect(capturedRequest).not.toBeNull();
 		expect(capturedRequest?.url).toBe("https://chatgpt.com/backend-api/codex/responses");
-		expect(capturedRequest?.body?.model).toBe("gpt-5-codex-mini");
-		expect(result.model).toBe("gpt-5-codex-mini");
+		expect(capturedRequest?.body?.model).toBe("gpt-5.5");
+		expect(result.model).toBe("gpt-5.5");
 		expect(result.sources).toEqual([{ title: "Example Article", url: "https://example.com/article" }]);
 	});
 
 	it("falls back to the default model when PI_CODEX_WEB_SEARCH_MODEL is blank", async () => {
 		process.env.PI_CODEX_WEB_SEARCH_MODEL = "   ";
-		using _hook = mockCodexFetch("gpt-5-codex-mini");
-
-		const result = await searchCodex({ query: "blank codex model" });
+		const result = await searchCodex(makeSearchParams("blank codex model", mockCodexFetch("gpt-5.5")));
 
 		expect(capturedRequest).not.toBeNull();
-		expect(capturedRequest?.body?.model).toBe("gpt-5-codex-mini");
-		expect(result.model).toBe("gpt-5-codex-mini");
+		expect(capturedRequest?.body?.model).toBe("gpt-5.5");
+		expect(result.model).toBe("gpt-5.5");
+	});
+
+	it("retries the next bundled default when Codex rejects a model for ChatGPT accounts", async () => {
+		delete process.env.PI_CODEX_WEB_SEARCH_MODEL;
+		let calls = 0;
+		capturedRequest = null;
+		const fetchMock: FetchImpl = (url, init) => {
+			calls += 1;
+			capturedRequest = {
+				url: typeof url === "string" ? url : url.toString(),
+				headers: init?.headers,
+				body: init?.body ? (JSON.parse(init.body as string) as Record<string, unknown>) : null,
+			};
+
+			const requestedModel = capturedRequest.body?.model;
+			if (calls === 1) {
+				expect(requestedModel).toBe("gpt-5.5");
+				return Promise.resolve(
+					new Response(
+						JSON.stringify({
+							detail: "The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account.",
+						}),
+						{ status: 400, headers: { "Content-Type": "application/json" } },
+					),
+				);
+			}
+
+			expect(requestedModel).toBe("gpt-5.4");
+			return Promise.resolve(
+				new Response(makeSseResponse("gpt-5.4"), {
+					status: 200,
+					headers: { "Content-Type": "text/event-stream" },
+				}),
+			);
+		};
+
+		const result = await searchCodex(makeSearchParams("retry unsupported default", fetchMock));
+
+		expect(calls).toBe(2);
+		expect(result.model).toBe("gpt-5.4");
+		expect(result.sources).toEqual([{ title: "Example Article", url: "https://example.com/article" }]);
 	});
 
 	it("uses PI_CODEX_WEB_SEARCH_MODEL when provided", async () => {
 		process.env.PI_CODEX_WEB_SEARCH_MODEL = "gpt-5.4-mini";
-		using _hook = mockCodexFetch("gpt-5.4-mini");
-
-		const result = await searchCodex({ query: "overridden codex model" });
+		const result = await searchCodex(makeSearchParams("overridden codex model", mockCodexFetch("gpt-5.4-mini")));
 
 		expect(capturedRequest).not.toBeNull();
 		expect(capturedRequest?.body?.model).toBe("gpt-5.4-mini");
 		expect(result.model).toBe("gpt-5.4-mini");
 	});
 
+	it("does not retry default candidates when PI_CODEX_WEB_SEARCH_MODEL is explicitly unsupported", async () => {
+		process.env.PI_CODEX_WEB_SEARCH_MODEL = "gpt-5.5";
+		let calls = 0;
+		capturedRequest = null;
+		const fetchMock: FetchImpl = (url, init) => {
+			calls += 1;
+			capturedRequest = {
+				url: typeof url === "string" ? url : url.toString(),
+				headers: init?.headers,
+				body: init?.body ? (JSON.parse(init.body as string) as Record<string, unknown>) : null,
+			};
+
+			expect(capturedRequest.body?.model).toBe("gpt-5.5");
+			return Promise.resolve(
+				new Response(
+					JSON.stringify({
+						detail: "The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account.",
+					}),
+					{ status: 400, headers: { "Content-Type": "application/json" } },
+				),
+			);
+		};
+
+		await expect(searchCodex(makeSearchParams("explicit unsupported model", fetchMock))).rejects.toThrow("gpt-5.5");
+		expect(calls).toBe(1);
+	});
+
 	it("forces web_search tool choice and extracts markdown link citations when annotations are absent", async () => {
 		process.env.PI_CODEX_WEB_SEARCH_MODEL = "gpt-5.4";
-		using _hook = mockCodexFetch("gpt-5.4", makeMarkdownLinkSseResponse("gpt-5.4"));
-
-		const result = await searchCodex({ query: "markdown citations" });
+		const result = await searchCodex(
+			makeSearchParams("markdown citations", mockCodexFetch("gpt-5.4", makeMarkdownLinkSseResponse("gpt-5.4"))),
+		);
 
 		expect(capturedRequest).not.toBeNull();
 		expect(capturedRequest?.body?.tool_choice).toEqual({ type: "web_search" });
@@ -262,9 +333,9 @@ describe("searchCodex model selection", () => {
 
 	it("extracts plain text URLs when annotations are absent", async () => {
 		process.env.PI_CODEX_WEB_SEARCH_MODEL = "gpt-5.4";
-		using _hook = mockCodexFetch("gpt-5.4", makePlainUrlSseResponse("gpt-5.4"));
-
-		const result = await searchCodex({ query: "plain url citations" });
+		const result = await searchCodex(
+			makeSearchParams("plain url citations", mockCodexFetch("gpt-5.4", makePlainUrlSseResponse("gpt-5.4"))),
+		);
 
 		expect(result.sources).toEqual([
 			{ title: "https://example.com/article", url: "https://example.com/article" },
@@ -274,9 +345,12 @@ describe("searchCodex model selection", () => {
 
 	it("preserves markdown URLs that contain balanced parentheses", async () => {
 		process.env.PI_CODEX_WEB_SEARCH_MODEL = "gpt-5.4";
-		using _hook = mockCodexFetch("gpt-5.4", makeMarkdownParenthesesSseResponse("gpt-5.4"));
-
-		const result = await searchCodex({ query: "markdown parentheses citations" });
+		const result = await searchCodex(
+			makeSearchParams(
+				"markdown parentheses citations",
+				mockCodexFetch("gpt-5.4", makeMarkdownParenthesesSseResponse("gpt-5.4")),
+			),
+		);
 
 		expect(result.sources).toEqual([
 			{ title: "Function", url: "https://en.wikipedia.org/wiki/Function_(mathematics)" },
@@ -285,9 +359,12 @@ describe("searchCodex model selection", () => {
 
 	it("strips trailing prose punctuation from plain text URLs", async () => {
 		process.env.PI_CODEX_WEB_SEARCH_MODEL = "gpt-5.4";
-		using _hook = mockCodexFetch("gpt-5.4", makePlainUrlPunctuationSseResponse("gpt-5.4"));
-
-		const result = await searchCodex({ query: "plain url punctuation" });
+		const result = await searchCodex(
+			makeSearchParams(
+				"plain url punctuation",
+				mockCodexFetch("gpt-5.4", makePlainUrlPunctuationSseResponse("gpt-5.4")),
+			),
+		);
 
 		expect(result.sources).toEqual([
 			{ title: "https://example.com/article", url: "https://example.com/article" },
@@ -300,27 +377,15 @@ describe("searchCodex model selection", () => {
 	});
 
 	it("prefers streamed text when the final item only contains an image placeholder", async () => {
-		vi.spyOn(AgentStorage, "open").mockResolvedValue({
-			listAuthCredentials: () => [
-				{
-					id: 1,
-					credential: {
-						type: "oauth",
-						access: "test-access-token",
-						expires: Date.now() + 600_000,
-						accountId: "acct-test",
-					},
-				},
-			],
-		} as unknown as AgentStorage);
-		using _hook = hookFetch(() => {
-			return new Response(makeImagePlaceholderSseResponse("gpt-5.4-mini"), {
-				status: 200,
-				headers: { "Content-Type": "text/event-stream" },
-			});
-		});
+		const fetchMock: FetchImpl = () =>
+			Promise.resolve(
+				new Response(makeImagePlaceholderSseResponse("gpt-5.4-mini"), {
+					status: 200,
+					headers: { "Content-Type": "text/event-stream" },
+				}),
+			);
 
-		const result = await searchCodex({ query: "responses api store semantics" });
+		const result = await searchCodex(makeSearchParams("responses api store semantics", fetchMock));
 
 		expect(result.answer).toBe("OpenAI Responses API defaults `store` to false unless you opt in.");
 		expect(result.sources).toEqual([
@@ -329,5 +394,69 @@ describe("searchCodex model selection", () => {
 				url: "https://platform.openai.com/docs/api-reference/responses",
 			},
 		]);
+	});
+
+	it("throws to advance the chain when both streamed and final answers are image placeholders without sources", async () => {
+		const sse = [
+			`data: ${JSON.stringify({
+				type: "response.output_text.delta",
+				delta: "[Attached image]",
+			})}`,
+			"",
+			`data: ${JSON.stringify({
+				type: "response.output_item.done",
+				item: {
+					type: "message",
+					content: [{ type: "output_text", text: "See image above.", annotations: [] }],
+				},
+			})}`,
+			"",
+			`data: ${JSON.stringify({
+				type: "response.completed",
+				response: { id: "resp_codex_placeholder_only", model: "gpt-5.5" },
+			})}`,
+			"",
+		].join("\n");
+
+		const fetchMock: FetchImpl = () =>
+			Promise.resolve(new Response(sse, { status: 200, headers: { "Content-Type": "text/event-stream" } }));
+
+		await expect(searchCodex(makeSearchParams("image only", fetchMock))).rejects.toThrow(/image-only response/);
+	});
+
+	it("drops placeholder prose from the answer but keeps annotation sources when both are placeholders", async () => {
+		const sse = [
+			`data: ${JSON.stringify({
+				type: "response.output_text.delta",
+				delta: "(see attached image)",
+			})}`,
+			"",
+			`data: ${JSON.stringify({
+				type: "response.output_item.done",
+				item: {
+					type: "message",
+					content: [
+						{
+							type: "output_text",
+							text: "(See attached image.)",
+							annotations: [{ type: "url_citation", url: "https://example.com/docs", title: "Docs" }],
+						},
+					],
+				},
+			})}`,
+			"",
+			`data: ${JSON.stringify({
+				type: "response.completed",
+				response: { id: "resp_codex_placeholder_with_sources", model: "gpt-5.5" },
+			})}`,
+			"",
+		].join("\n");
+
+		const fetchMock: FetchImpl = () =>
+			Promise.resolve(new Response(sse, { status: 200, headers: { "Content-Type": "text/event-stream" } }));
+
+		const result = await searchCodex(makeSearchParams("image with sources", fetchMock));
+		expect(result.answer).toBeUndefined();
+		expect(result.sources).toEqual([{ title: "Docs", url: "https://example.com/docs" }]);
 	});
 });

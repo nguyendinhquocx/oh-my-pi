@@ -1,23 +1,23 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import { Console } from "node:console";
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as path from "node:path";
-import { pathToFileURL } from "node:url";
+import { Writable } from "node:stream";
 import * as util from "node:util";
 
 import { logger } from "@oh-my-pi/pi-utils";
 
-import { ToolError } from "../../../tools/tool-errors";
 import { createHelpers, type HelperBundle } from "./helpers";
 import { awaitMaybePromise, indirectEval } from "./indirect-eval";
+import { LocalModuleLoader } from "./local-module-loader";
 import { JAVASCRIPT_PRELUDE_SOURCE } from "./prelude";
 import { wrapCode } from "./rewrite-imports";
 import type { JsDisplayOutput, JsStatusEvent } from "./types";
 
 /**
- * Per-run callbacks. Returned by `getHooks()` on each helper/tool/display invocation so
- * the embedding worker can route emissions to the currently active run. Returning `null`
- * makes status/display/tool calls reject with an error — useful for guarding against
- * helpers being invoked outside a run window.
+ * Per-run callbacks. Runtime globals resolve these from AsyncLocalStorage so
+ * overlapping async cells can route output/tool calls back to their own run.
  */
 export interface RuntimeHooks {
 	onText(chunk: string): void;
@@ -25,17 +25,28 @@ export interface RuntimeHooks {
 	callTool(name: string, args: unknown): Promise<unknown>;
 }
 
+export interface RunContext {
+	runId: string;
+	hooks: RuntimeHooks;
+	cwd: string;
+	finalExpressionSet: boolean;
+	finalExpressionValue: unknown;
+}
+
 export interface RuntimeOptions {
 	initialCwd: string;
 	sessionId: string;
-	/** Resolve hooks for the run currently in flight, or `null` if nothing is active. */
-	getHooks(): RuntimeHooks | null;
 	/**
 	 * Extra globals installed alongside `__omp_helpers__` / prelude. Use for stable, lifetime-
 	 * of-the-worker bindings (e.g. browser's `page`, `browser`). Per-run scope should be set
 	 * via `setRunScope()` instead.
 	 */
 	extraGlobals?: Record<string, unknown>;
+	/**
+	 * On-disk roots the helpers substitute for internal-URL schemes (e.g.
+	 * `{ local: "/…/artifacts/local" }`). Stable for the worker's lifetime.
+	 */
+	localRoots?: Record<string, string>;
 }
 
 // Strict base64: characters from the standard alphabet plus optional `=` padding, and a
@@ -43,6 +54,26 @@ export interface RuntimeOptions {
 // accepted — the Anthropic API only honors strict base64 in image sources.
 const BASE64_STRICT_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 const DECIMAL_CSV_RE = /^\d{1,3}(?:,\d{1,3})*$/;
+
+const PRELUDE_GLOBAL_KEYS = [
+	"__omp_js_prelude_loaded__",
+	"console",
+	"print",
+	"display",
+	"tool",
+	"completion",
+	"output",
+	"agent",
+	"parallel",
+	"pipeline",
+	"log",
+	"phase",
+	"budget",
+	"__pool",
+	"read",
+	"write",
+	"env",
+];
 
 function isStrictBase64(s: string): boolean {
 	if (s.length === 0 || s.length % 4 !== 0) return false;
@@ -114,23 +145,43 @@ function describeDataType(data: unknown): string {
  * concern.
  */
 export class JsRuntime {
+	#globalOwner = Symbol("JsRuntime globals");
+	#ownedGlobalKeys = new Set<string>();
+	#disposed = false;
+	#runHookResolver = () => this.#als.getStore()?.hooks;
+
+	#ownGlobal(key: string): void {
+		if (this.#ownedGlobalKeys.has(key)) return;
+		claimGlobalKey(key, this.#globalOwner);
+		this.#ownedGlobalKeys.add(key);
+	}
+
+	#activateGlobals(action: string): void {
+		if (this.#disposed) throw new Error(`Cannot ${action} on a disposed JS runtime`);
+		activateGlobalOwner(this.#globalOwner, this.#ownedGlobalKeys, action);
+	}
+
 	readonly helpers: HelperBundle;
 	#cwd: string;
+	#session: { cwd: string; sessionId: string };
 	readonly sessionId: string;
 	#env: Map<string, string>;
-	#getHooks: () => RuntimeHooks | null;
-	#finalExpressionSet = false;
-	#finalExpressionValue: unknown;
+	#als = new AsyncLocalStorage<RunContext>();
+	#moduleLoader: LocalModuleLoader;
+	#localRoots: Record<string, string>;
 
 	constructor(opts: RuntimeOptions) {
 		this.#cwd = opts.initialCwd;
+		this.#session = { cwd: opts.initialCwd, sessionId: opts.sessionId };
 		this.sessionId = opts.sessionId;
 		this.#env = new Map();
-		this.#getHooks = opts.getHooks;
+		this.#moduleLoader = new LocalModuleLoader(this.sessionId);
+		this.#localRoots = opts.localRoots ?? {};
 		this.helpers = createHelpers({
-			cwd: () => this.#cwd,
+			cwd: () => this.#activeCwd(),
 			env: this.#env,
-			emitStatus: event => this.#getHooks()?.onDisplay({ type: "status", event }),
+			localRoots: () => this.#localRoots,
+			emitStatus: event => this.#activeHooks("emitStatus")?.onDisplay({ type: "status", event }),
 		});
 		this.#install(opts.extraGlobals);
 	}
@@ -140,9 +191,19 @@ export class JsRuntime {
 	}
 
 	setCwd(cwd: string): void {
+		if (this.#disposed) throw new Error("Cannot set cwd on a disposed JS runtime");
+		// Always stamp the runtime and session state: WorkerCore/browser/cmux call
+		// setCwd from init and pre-run paths that may race another same-realm
+		// runtime, and a throw here used to escape the inline-worker microtask
+		// path as a fatal unhandledRejection that killed the whole session.
+		// #session is the same object saved in this owner's global stack entry,
+		// so the new cwd survives deferred activation and is visible to this
+		// runtime's next run; run()/setRunScope still assert exclusive ownership.
 		this.#cwd = cwd;
-		const session = (globalThis as { __omp_session__?: { cwd?: string } }).__omp_session__;
-		if (session) session.cwd = cwd;
+		this.#session.cwd = cwd;
+		if (activeGlobalRunOwner === null || activeGlobalRunOwner === this.#globalOwner) {
+			this.#activateGlobals("set cwd");
+		}
 	}
 
 	/**
@@ -151,32 +212,52 @@ export class JsRuntime {
 	 * cleanup it wants.
 	 */
 	setRunScope(scope: Record<string, unknown>): void {
+		this.#activateGlobals("set run scope");
 		Object.assign(globalThis, scope);
 	}
 
-	async run(code: string, filename?: string): Promise<unknown> {
-		this.#finalExpressionSet = false;
-		this.#finalExpressionValue = undefined;
-		const wrapped = wrapCode(code);
-		const value = indirectEval(wrapped.source, filename);
-		if (wrapped.finalExpressionReturned) {
-			const awaited = await awaitMaybePromise(value);
-			if (this.#finalExpressionSet) {
-				const finalValue = this.#finalExpressionValue;
-				this.#finalExpressionSet = false;
-				this.#finalExpressionValue = undefined;
-				const resolved = await awaitMaybePromise(finalValue);
-				return resolved;
-			}
-			return awaited;
+	async run(
+		code: string,
+		filename: string | undefined,
+		hooks: RuntimeHooks,
+		options: { runId?: string; cwd?: string } = {},
+	): Promise<unknown> {
+		this.#activateGlobals("run code");
+		const leaveRun = enterGlobalRun(this.#globalOwner, "run code");
+		const context: RunContext = {
+			runId: options.runId ?? crypto.randomUUID(),
+			hooks,
+			cwd: options.cwd ?? this.#cwd,
+			finalExpressionSet: false,
+			finalExpressionValue: undefined,
+		};
+		try {
+			return await this.#als.run(context, async () => {
+				const wrapped = await wrapCode(code);
+				const value = indirectEval(wrapped.source, filename);
+				if (wrapped.finalExpressionReturned) {
+					const awaited = await awaitMaybePromise(value);
+					if (context.finalExpressionSet) {
+						const finalValue = context.finalExpressionValue;
+						context.finalExpressionSet = false;
+						context.finalExpressionValue = undefined;
+						return await awaitMaybePromise(finalValue);
+					}
+					return awaited;
+				}
+				return await awaitMaybePromise(value);
+			});
+		} finally {
+			leaveRun();
 		}
-		return await awaitMaybePromise(value);
 	}
 
-	displayValue(value: unknown): void {
+	displayValue(value: unknown, hooks: RuntimeHooks | undefined = this.#als.getStore()?.hooks): void {
 		if (value === undefined) return;
-		const hooks = this.#getHooks();
-		if (!hooks) return;
+		if (!hooks) {
+			logger.warn("js runtime display called outside an active run");
+			return;
+		}
 		if (value && typeof value === "object") {
 			const record = value as Record<string, unknown>;
 			if (record.type === "image" && typeof record.mimeType === "string") {
@@ -207,95 +288,303 @@ export class JsRuntime {
 		hooks.onText(`${String(value)}\n`);
 	}
 
+	#activeCwd(): string {
+		return this.#als.getStore()?.cwd ?? this.#cwd;
+	}
+
+	#activeHooks(action: string): RuntimeHooks | undefined {
+		const hooks = this.#als.getStore()?.hooks;
+		if (!hooks) {
+			logger.warn("js runtime helper called outside an active run", { action });
+		}
+		return hooks;
+	}
+
+	#activeRequire(moduleUrlOrPath?: string): NodeJS.Require {
+		return this.#moduleLoader.requireForFile(moduleUrlOrPath, this.#activeCwd());
+	}
+
+	#moduleFilename(moduleUrlOrPath?: string): string {
+		return this.#moduleLoader.filenameForUrl(moduleUrlOrPath) ?? path.join(this.#activeCwd(), "[eval]");
+	}
+
+	#moduleDirname(moduleUrlOrPath?: string): string {
+		return this.#moduleLoader.dirnameForUrl(moduleUrlOrPath, this.#activeCwd());
+	}
+
+	#buildDynamicRequire(): NodeJS.Require {
+		const dynamicRequire = ((id: string) => this.#activeRequire()(id)) as NodeJS.Require;
+		const resolve = ((id: string, options?: { paths?: string[] }) =>
+			this.#activeRequire().resolve(id, options)) as NodeJS.Require["resolve"] & {
+			paths(request: string): string[] | null;
+		};
+		resolve.paths = request => this.#activeRequire().resolve.paths(request);
+		Object.defineProperties(dynamicRequire, {
+			resolve: { value: resolve, configurable: true },
+			cache: { get: () => this.#activeRequire().cache, configurable: true },
+			extensions: { get: () => this.#activeRequire().extensions, configurable: true },
+			main: { get: () => this.#activeRequire().main, configurable: true },
+		});
+		return dynamicRequire;
+	}
+
 	#install(extraGlobals: Record<string, unknown> | undefined): void {
+		// Constructing a runtime while another same-realm runtime is mid-run would
+		// silently replace the live runtime's globals (Object.assign + prelude eval
+		// below). Fail before any global/stack mutation; WorkerCore reports it as
+		// init-failed instead of corrupting the active run.
+		assertCanUseGlobalOwner(this.#globalOwner, "initialize a JS runtime");
 		const injected: Record<string, unknown> = {
-			__omp_session__: { cwd: this.#cwd, sessionId: this.sessionId },
+			__omp_session__: this.#session,
 			__omp_helpers__: this.helpers,
 			__omp_call_tool__: async (name: string, args: unknown) => {
-				const hooks = this.#getHooks();
-				if (!hooks) throw new ToolError("Tool calls are only valid inside an active run");
+				const hooks = this.#activeHooks("tool");
+				if (!hooks) return undefined;
 				return await hooks.callTool(name, args);
 			},
 			__omp_import__: async (source: string, options?: ImportCallOptions) => {
-				const target = resolveImportSpecifier(this.#cwd, source);
-				// Always invalidate cached module records for user-owned source files so edits
-				// between cells are picked up. Bun ignores query-string busting on `file:` URLs
-				// but honors `delete require.cache[absPath]`; bare specifiers and URL schemes are
-				// left alone to keep package identity stable across cells.
-				if (isLocalPathSpecifier(source) && path.isAbsolute(target)) {
-					delete require.cache[target];
-				}
+				const resolved = await this.#moduleLoader.resolveForRun(this.#activeCwd(), source);
+				if (resolved.mode === "local") return resolved.value;
+				const target = resolved.target;
 				return options !== undefined ? await import(target, options) : await import(target);
 			},
+			__omp_import_from__: async (moduleUrl: string, source: string, options?: ImportCallOptions) => {
+				const resolved = await this.#moduleLoader.resolveForModule(moduleUrl, source, this.#activeCwd());
+				if (resolved.mode === "local") return resolved.value;
+				const target = resolved.target;
+				return options !== undefined ? await import(target, options) : await import(target);
+			},
+			__omp_get_require__: (moduleUrl?: string) => this.#activeRequire(moduleUrl),
+			__omp_get_filename__: (moduleUrl?: string) => this.#moduleFilename(moduleUrl),
+			__omp_get_dirname__: (moduleUrl?: string) => this.#moduleDirname(moduleUrl),
 			__omp_emit_status__: (op: string, data: Record<string, unknown> = {}) => {
 				const event: JsStatusEvent = { op, ...data };
-				this.#getHooks()?.onDisplay({ type: "status", event });
+				this.#activeHooks("emitStatus")?.onDisplay({ type: "status", event });
 			},
 			__omp_log__: (level: string, ...args: unknown[]) => {
 				const prefix = level === "error" ? "[error] " : level === "warn" ? "[warn] " : "";
 				const text = `${prefix}${formatConsoleArgs(args)}`;
-				this.#getHooks()?.onText(text.endsWith("\n") ? text : `${text}\n`);
+				this.#activeHooks("log")?.onText(text.endsWith("\n") ? text : `${text}\n`);
+			},
+			__omp_table__: (...args: unknown[]) => {
+				const hooks = this.#activeHooks("table");
+				if (!hooks) return;
+				let buffer = "";
+				const stream = new Writable({
+					write(chunk, _enc, cb) {
+						buffer += typeof chunk === "string" ? chunk : (chunk as Buffer).toString("utf8");
+						cb();
+					},
+				});
+				const tableConsole = new Console({ stdout: stream, colorMode: false });
+				(tableConsole.table as (...a: unknown[]) => void)(...args);
+				hooks.onText(buffer.endsWith("\n") ? buffer : `${buffer}\n`);
 			},
 			__omp_display__: (value: unknown) => this.displayValue(value),
 			__omp_set_final_expr__: (value: unknown) => {
-				this.#finalExpressionSet = true;
-				this.#finalExpressionValue = value;
+				const context = this.#als.getStore();
+				if (!context) {
+					logger.warn("js runtime final expression set outside an active run");
+					return;
+				}
+				context.finalExpressionSet = true;
+				context.finalExpressionValue = value;
 			},
 			webcrypto: crypto,
 			// `process` is intentionally not overridden — user code gets the host worker's real
 			// `process` object. Subsetting it caused segfaults in workers that share state with
 			// puppeteer/worker_threads internals.
-			require: buildRequire(this.#cwd),
+			require: this.#buildDynamicRequire(),
 			createRequire,
 			fs,
 		};
+
+		const allGlobalKeys = new Set<string>([
+			...Object.keys(injected),
+			...Object.keys(extraGlobals ?? {}),
+			...PRELUDE_GLOBAL_KEYS,
+		]);
+
+		for (const key of allGlobalKeys) {
+			this.#ownGlobal(key);
+		}
+
 		Object.assign(globalThis, injected, extraGlobals ?? {});
 		// Prelude assigns console bridge + short aliases (`read`, `write`, `tool`, `display`, ...)
 		// onto globalThis. Must run after helpers are in place.
 		indirectEval(JAVASCRIPT_PRELUDE_SOURCE);
+		for (const key of allGlobalKeys) recordGlobalValue(key, this.#globalOwner);
+		RUN_HOOK_RESOLVERS.add(this.#runHookResolver);
+		patchStdioOnce();
 	}
+
+	dispose(): void {
+		if (this.#disposed) return;
+		this.#disposed = true;
+		RUN_HOOK_RESOLVERS.delete(this.#runHookResolver);
+		for (const key of this.#ownedGlobalKeys) releaseGlobalKey(key, this.#globalOwner);
+		this.#ownedGlobalKeys.clear();
+	}
+}
+
+interface GlobalSnapshot {
+	exists: boolean;
+	value: unknown;
+}
+
+interface GlobalOwnerEntry {
+	owner: symbol;
+	value: unknown;
+}
+
+interface GlobalStack {
+	base: GlobalSnapshot;
+	entries: GlobalOwnerEntry[];
+}
+
+// Inline fallback and cmux tabs can create multiple JsRuntime instances in one Bun realm.
+// Track reserved helper globals by owner so disposing one runtime restores the next active
+// owner (or the original process global after the last owner), not a stale snapshot.
+const GLOBAL_STACKS = new Map<string, GlobalStack>();
+
+function snapshotGlobal(key: string): GlobalSnapshot {
+	return {
+		exists: key in globalThis,
+		value: (globalThis as Record<string, unknown>)[key],
+	};
+}
+
+function restoreGlobal(key: string, state: GlobalSnapshot): void {
+	if (state.exists) {
+		(globalThis as Record<string, unknown>)[key] = state.value;
+	} else {
+		delete (globalThis as Record<string, unknown>)[key];
+	}
+}
+
+function claimGlobalKey(key: string, owner: symbol): void {
+	let stack = GLOBAL_STACKS.get(key);
+	if (!stack) {
+		stack = { base: snapshotGlobal(key), entries: [] };
+		GLOBAL_STACKS.set(key, stack);
+	}
+	stack.entries.push({ owner, value: (globalThis as Record<string, unknown>)[key] });
+}
+
+function recordGlobalValue(key: string, owner: symbol): void {
+	const stack = GLOBAL_STACKS.get(key);
+	const entry = stack?.entries.findLast(item => item.owner === owner);
+	if (entry) entry.value = (globalThis as Record<string, unknown>)[key];
+}
+
+function releaseGlobalKey(key: string, owner: symbol): void {
+	const stack = GLOBAL_STACKS.get(key);
+	if (!stack) return;
+	const index = stack.entries.findIndex(entry => entry.owner === owner);
+	if (index === -1) return;
+	const wasTop = index === stack.entries.length - 1;
+	stack.entries.splice(index, 1);
+	if (!wasTop) return;
+	const next = stack.entries.at(-1);
+	if (next) {
+		(globalThis as Record<string, unknown>)[key] = next.value;
+		return;
+	}
+	restoreGlobal(key, stack.base);
+	GLOBAL_STACKS.delete(key);
+}
+
+// Plain globalThis cannot safely serve two different runtimes at the same instant:
+// helpers dereference reserved globals on every call. Sequential cmux tab revisits
+// re-activate their owner stack; overlapping cross-runtime runs fail explicitly.
+let activeGlobalRunOwner: symbol | null = null;
+let activeGlobalRunDepth = 0;
+
+function assertCanUseGlobalOwner(owner: symbol, action: string): void {
+	if (activeGlobalRunOwner === null || activeGlobalRunOwner === owner) return;
+	throw new Error(`Cannot ${action} while another same-realm JS runtime is running`);
+}
+
+function activateGlobalOwner(owner: symbol, keys: Iterable<string>, action: string): void {
+	assertCanUseGlobalOwner(owner, action);
+	for (const key of keys) {
+		const stack = GLOBAL_STACKS.get(key);
+		const index = stack?.entries.findIndex(entry => entry.owner === owner) ?? -1;
+		if (!stack || index === -1) throw new Error(`Cannot ${action} on a disposed JS runtime`);
+		const entry = stack.entries[index];
+		stack.entries.splice(index, 1);
+		stack.entries.push(entry);
+		(globalThis as Record<string, unknown>)[key] = entry.value;
+	}
+}
+
+function enterGlobalRun(owner: symbol, action: string): () => void {
+	assertCanUseGlobalOwner(owner, action);
+	activeGlobalRunOwner = owner;
+	activeGlobalRunDepth++;
+	let left = false;
+	return () => {
+		if (left) return;
+		left = true;
+		activeGlobalRunDepth--;
+		if (activeGlobalRunDepth === 0) activeGlobalRunOwner = null;
+	};
+}
+
+/** Resolvers for each live runtime's active-run hooks (one per JsRuntime instance). */
+const RUN_HOOK_RESOLVERS = new Set<() => RuntimeHooks | undefined>();
+
+/** Streams whose `write` the runtime has already wrapped (patch-once guard). */
+const PATCHED_STDIO_STREAMS = new WeakSet<NodeJS.WriteStream>();
+
+/** Hooks for whichever registered runtime currently has an active run, if any. */
+function activeRunHooks(): RuntimeHooks | undefined {
+	for (const resolve of RUN_HOOK_RESOLVERS) {
+		const hooks = resolve();
+		if (hooks) return hooks;
+	}
+	return undefined;
+}
+
+/**
+ * Wrap `process.stdout` / `process.stderr` `write` exactly once per process so
+ * user `process.stdout.write(...)` lands in the active run's text sink. Models
+ * reach for it out of Node habit, but `process` is intentionally the host
+ * worker's real object (see {@link JsRuntime} `#install`), so unrouted writes
+ * escape to the worker's own stdio and never reach the cell — and `write()`
+ * returns a boolean, so a cell ending in `process.stdout.write("x")` captured
+ * `true` while losing the text. Patch only the `write` method (never replace
+ * `process`), preserve exact bytes (no trailing newline), and fall through to
+ * the real stream when no run is active so the worker's own logging is intact.
+ */
+function patchStdioOnce(): void {
+	const streams: NodeJS.WriteStream[] = [process.stdout, process.stderr];
+	for (const stream of streams) {
+		if (!stream || PATCHED_STDIO_STREAMS.has(stream)) continue;
+		PATCHED_STDIO_STREAMS.add(stream);
+		const original = stream.write.bind(stream) as (...args: unknown[]) => boolean;
+		const routed = (chunk: unknown, encoding?: unknown, callback?: unknown): boolean => {
+			const hooks = activeRunHooks();
+			if (!hooks) return original(chunk, encoding, callback);
+			const cb = typeof encoding === "function" ? encoding : callback;
+			const enc = typeof encoding === "string" ? (encoding as BufferEncoding) : undefined;
+			hooks.onText(chunkToString(chunk, enc));
+			if (typeof cb === "function") (cb as (error?: Error | null) => void)();
+			return true;
+		};
+		stream.write = routed as unknown as typeof stream.write;
+	}
+}
+
+/** Coerce a `write()` chunk to text, honoring an explicit encoding for byte chunks. */
+function chunkToString(chunk: unknown, encoding?: BufferEncoding): string {
+	if (typeof chunk === "string") return chunk;
+	if (chunk instanceof Uint8Array) return Buffer.from(chunk).toString(encoding ?? "utf8");
+	return String(chunk);
 }
 
 function formatConsoleArgs(args: unknown[]): string {
 	return args
 		.map(arg => (typeof arg === "string" ? arg : util.inspect(arg, { depth: 6, colors: false, breakLength: 120 })))
 		.join(" ");
-}
-
-function buildRequire(cwd: string): NodeJS.Require {
-	return createRequire(pathToFileURL(path.join(cwd, "[eval]")).href);
-}
-
-/**
- * Resolve an import specifier emitted by `rewriteImports` against the active session
- * cwd. Relative paths (`./`, `../`, `/`) and bare specifiers (`pkg`, `@scope/pkg`) both go
- * through `Bun.resolveSync` rooted at the cwd so user-pasted ESM behaves as if it lived in
- * the project — not next to the worker module. URL-like specifiers (`file://`, `data:`,
- * `node:`, `http:`) are passed through unchanged.
- */
-function resolveImportSpecifier(cwd: string, source: string): string {
-	if (/^[a-z][a-z0-9+.-]*:/i.test(source)) return source;
-	try {
-		return Bun.resolveSync(source, cwd);
-	} catch {
-		return source;
-	}
-}
-
-/**
- * Returns true when the original specifier is a relative or absolute filesystem path
- * (i.e. user-owned source the agent is iterating on). Bare specifiers and URL schemes
- * are excluded — `node:` built-ins cannot be reloaded, and busting bare packages would
- * defeat module identity for every cell while bringing no editing benefit.
- */
-function isLocalPathSpecifier(source: string): boolean {
-	return (
-		source.startsWith("./") ||
-		source.startsWith("../") ||
-		source === "." ||
-		source === ".." ||
-		source.startsWith("/") ||
-		source.startsWith("~/") ||
-		/^[a-zA-Z]:[\\/]/.test(source)
-	);
 }

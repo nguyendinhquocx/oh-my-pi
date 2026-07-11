@@ -34,6 +34,7 @@ export const UNSUPPORTED_SCHEMA_FIELDS: Record<string, true> = {
 	maximum: true,
 	exclusiveMinimum: true,
 	exclusiveMaximum: true,
+	multipleOf: true,
 	pattern: true,
 	format: true,
 };
@@ -152,6 +153,22 @@ export const CLOUD_CODE_ASSIST_TYPE_SPECIFIC_KEYS: Record<string, Record<string,
 	boolean: {},
 	null: {},
 };
+
+/**
+ * Flat set of every type-specific key across all CCA types.
+ * Used to identify sibling keys that need filtering during mixed-type collapse.
+ */
+export const ALL_CCA_TYPE_SPECIFIC_KEYS: Record<string, true> = buildAllCcaTypeSpecificKeys();
+
+function buildAllCcaTypeSpecificKeys(): Record<string, true> {
+	const all: Record<string, true> = {};
+	for (const typeKeys of Object.values(CLOUD_CODE_ASSIST_TYPE_SPECIFIC_KEYS)) {
+		for (const key in typeKeys) {
+			all[key] = true;
+		}
+	}
+	return all;
+}
 
 /**
  * Cloud Code Assist shared schema keys allowed on any type.

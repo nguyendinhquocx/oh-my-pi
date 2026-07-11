@@ -11,6 +11,7 @@ import {
 } from "@oh-my-pi/pi-ai/utils/schema";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createTools, HIDDEN_TOOLS, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { createVibeTools } from "@oh-my-pi/pi-coding-agent/tools/vibe";
 
 interface ToolSchemaEntry {
 	name: string;
@@ -58,6 +59,14 @@ async function collectToolSchemas(): Promise<ToolSchemaEntry[]> {
 		byToolName.set(name, schema);
 	}
 
+	for (const tool of createVibeTools(session)) {
+		const schema = toolWireSchema(tool);
+		if (!asSchemaObject(schema)) {
+			continue;
+		}
+		byToolName.set(tool.name, schema);
+	}
+
 	return [...byToolName.entries()]
 		.sort(([left], [right]) => left.localeCompare(right))
 		.map(([name, schema]) => ({ name, schema }));
@@ -78,9 +87,9 @@ function formatCompatibilityIssues(
 }
 
 describe("builtin tool schemas provider compatibility", () => {
-	it("keeps task and todo_write strict-compatible for OpenAI-style providers", async () => {
+	it("keeps task and todo strict-compatible for OpenAI-style providers", async () => {
 		const toolSchemas = await collectToolSchemas();
-		for (const toolName of ["task", "todo_write"]) {
+		for (const toolName of ["task", "todo"]) {
 			const entry = toolSchemas.find(tool => tool.name === toolName);
 			expect(entry).toBeDefined();
 			if (!entry) {
@@ -127,5 +136,28 @@ describe("builtin tool schemas provider compatibility", () => {
 		}
 
 		expect(failures).toEqual([]);
+	});
+
+	it("preserves the yield result schema for Cloud Code Assist", async () => {
+		const toolSchemas = await collectToolSchemas();
+		const yieldEntry = toolSchemas.find(tool => tool.name === "yield");
+		expect(yieldEntry).toBeDefined();
+		if (!yieldEntry) return;
+
+		const normalized = asSchemaObject(normalizeSchemaForCCA(yieldEntry.schema));
+		const properties = asSchemaObject(normalized?.properties);
+		const typeSchema = asSchemaObject(properties?.type);
+
+		expect(normalized?.type).toBe("object");
+		expect(properties?.result).toBeDefined();
+		expect(typeSchema?.type).toBe("string");
+		expect(typeSchema?.anyOf).toBeUndefined();
+	});
+
+	it("asserts that browser tool schema root has 'type: \"object\"' for Codex and OpenAI Responses compatibility", async () => {
+		const toolSchemas = await collectToolSchemas();
+		const browserEntry = toolSchemas.find(tool => tool.name === "browser");
+		expect(browserEntry).toBeDefined();
+		expect(browserEntry?.schema.type).toBe("object");
 	});
 });

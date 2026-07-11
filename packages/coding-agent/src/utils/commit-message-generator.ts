@@ -6,17 +6,22 @@ import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
 import { completeSimple } from "@oh-my-pi/pi-ai";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
+
 import type { ModelRegistry } from "../config/model-registry";
-import { resolveModelRoleValue } from "../config/model-resolver";
+import { getModelMatchPreferences, resolveModelRoleValue } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import MODEL_PRIO from "../priority.json" with { type: "json" };
 import commitSystemPrompt from "../prompts/system/commit-message-system.md" with { type: "text" };
-import { toReasoningEffort } from "../thinking";
+import { concreteThinkingLevel, toReasoningEffort } from "../thinking";
 
 const COMMIT_SYSTEM_PROMPT = prompt.render(commitSystemPrompt);
 const MAX_DIFF_CHARS = 4000;
-const COMMIT_MAX_TOKENS = 60;
-const REASONING_SAFE_MAX_TOKENS = 1024;
+// Cover the "backend ignores `disableReasoning`" case unconditionally: the
+// static `model.reasoning` catalog flag can't distinguish a thinking model
+// declared `reasoning: false` (e.g. Qwen3 served locally via llama.cpp) from
+// one that never emits thinking. `maxTokens` is a hard cap — non-thinking
+// completions still return in a handful of tokens (issue #4355).
+const COMMIT_MAX_TOKENS = 1024;
 
 /** File patterns that should be excluded from commit message generation diffs. */
 const NOISE_SUFFIXES = [".lock", ".lockb", "-lock.json", "-lock.yaml"];
@@ -50,13 +55,12 @@ function getSmolModelCandidates(
 		candidates.push({ model, thinkingLevel });
 	};
 
-	const matchPreferences = { usageOrder: settings.getStorage()?.getModelUsageOrder() };
+	const matchPreferences = getModelMatchPreferences(settings);
 	const configuredSmol = resolveModelRoleValue(settings.getModelRole("smol"), availableModels, {
 		settings,
 		matchPreferences,
-		modelRegistry: registry,
 	});
-	addCandidate(configuredSmol.model, configuredSmol.thinkingLevel);
+	addCandidate(configuredSmol.model, concreteThinkingLevel(configuredSmol.thinkingLevel));
 
 	for (const pattern of MODEL_PRIO.smol) {
 		const needle = pattern.toLowerCase();
@@ -101,16 +105,18 @@ export async function generateCommitMessage(
 		if (!apiKey) continue;
 
 		try {
-			const maxTokens = candidate.model.reasoning
-				? Math.max(COMMIT_MAX_TOKENS, REASONING_SAFE_MAX_TOKENS)
-				: COMMIT_MAX_TOKENS;
+			const maxTokens = COMMIT_MAX_TOKENS;
 			const response = await completeSimple(
 				candidate.model,
 				{
 					systemPrompt: [COMMIT_SYSTEM_PROMPT],
 					messages: [{ role: "user", content: userMessage, timestamp: Date.now() }],
 				},
-				{ apiKey, maxTokens, reasoning: toReasoningEffort(candidate.thinkingLevel) },
+				{
+					apiKey: registry.resolver(candidate.model, sessionId),
+					maxTokens,
+					reasoning: toReasoningEffort(candidate.thinkingLevel),
+				},
 			);
 
 			if (response.stopReason === "error") {

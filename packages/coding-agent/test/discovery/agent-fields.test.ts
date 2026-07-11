@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Effort } from "@oh-my-pi/pi-ai";
-import { parseAgentFields } from "../../src/discovery/helpers";
+import { parseAgentFields } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 
 describe("parseAgentFields", () => {
 	test("parses blocking from boolean frontmatter", () => {
@@ -64,6 +64,82 @@ describe("parseAgentFields", () => {
 			tools: ["Read", "Search"],
 		});
 
-		expect(fields?.tools).toEqual(["read", "search", "yield"]);
+		expect(fields?.tools).toEqual(["read", "grep", "yield"]);
+	});
+
+	test("maps legacy search and find tool names", () => {
+		const fields = parseAgentFields({
+			name: "reviewer",
+			description: "desc",
+			tools: ["Find", "Glob", "Search", "Grep"],
+		});
+
+		expect(fields?.tools).toEqual(["glob", "grep", "yield"]);
+	});
+
+	test("parses autoloadSkills from array frontmatter", () => {
+		const fields = parseAgentFields({
+			name: "oracle",
+			description: "desc",
+			autoloadSkills: ["user-created-skill-a", "user-created-skill-b"],
+		});
+
+		expect(fields).toBeDefined();
+		expect(fields?.autoloadSkills).toEqual(["user-created-skill-a", "user-created-skill-b"]);
+	});
+
+	test("parses autoloadSkills from CSV string", () => {
+		const fields = parseAgentFields({
+			name: "oracle",
+			description: "desc",
+			autoloadSkills: "user-created-skill-a, user-created-skill-b",
+		});
+
+		expect(fields).toBeDefined();
+		expect(fields?.autoloadSkills).toEqual(["user-created-skill-a", "user-created-skill-b"]);
+	});
+
+	test("returns undefined autoloadSkills when field absent", () => {
+		const fields = parseAgentFields({
+			name: "oracle",
+			description: "desc",
+		});
+
+		expect(fields).toBeDefined();
+		expect(fields?.autoloadSkills).toBeUndefined();
+	});
+
+	test("returns undefined autoloadSkills for empty array", () => {
+		const fields = parseAgentFields({
+			name: "oracle",
+			description: "desc",
+			autoloadSkills: [],
+		});
+
+		expect(fields).toBeDefined();
+		expect(fields?.autoloadSkills).toBeUndefined();
+	});
+
+	test("parses readSummarize from boolean frontmatter", () => {
+		expect(parseAgentFields({ name: "explore", description: "desc", readSummarize: false })?.readSummarize).toBe(
+			false,
+		);
+		expect(parseAgentFields({ name: "explore", description: "desc", readSummarize: true })?.readSummarize).toBe(true);
+	});
+
+	test("parses readSummarize from string frontmatter", () => {
+		expect(parseAgentFields({ name: "explore", description: "desc", readSummarize: "false" })?.readSummarize).toBe(
+			false,
+		);
+	});
+
+	test("ignores invalid readSummarize values", () => {
+		expect(
+			parseAgentFields({ name: "explore", description: "desc", readSummarize: "nope" })?.readSummarize,
+		).toBeUndefined();
+	});
+
+	test("returns undefined readSummarize when field absent", () => {
+		expect(parseAgentFields({ name: "explore", description: "desc" })?.readSummarize).toBeUndefined();
 	});
 });

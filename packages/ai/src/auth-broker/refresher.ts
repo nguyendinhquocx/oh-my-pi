@@ -5,12 +5,13 @@
  * any whose `expires - Date.now() < refreshSkewMs`. Refresh single-flight
  * lives in {@link AuthStorage} so manual and background refreshes share the
  * same upstream attempt.
- * Definitively-failed credentials (invalid_grant / 401 not from network blip)
- * are disabled via {@link AuthStorage.disableCredentialById} so the next
- * snapshot pull surfaces a clean delete on the client.
+ * Definitively-failed credentials (invalid_grant / bare 401, not a network
+ * blip) are torn down inside {@link AuthStorage.refreshCredentialById} via a
+ * compare-and-set disable — only when no peer/login rotated the row first — so
+ * the next snapshot pull surfaces a clean delete on the client.
  */
 import { logger } from "@oh-my-pi/pi-utils";
-import type { AuthStorage } from "../auth-storage";
+import { type AuthStorage, isDefinitiveOAuthFailure } from "../auth-storage";
 import { DEFAULT_REFRESH_INTERVAL_MS, DEFAULT_REFRESH_SKEW_MS } from "./types";
 
 export interface AuthBrokerRefresherOptions {
@@ -21,16 +22,6 @@ export interface AuthBrokerRefresherOptions {
 	refreshIntervalMs?: number;
 	/** Override clock (tests). */
 	now?: () => number;
-}
-
-const INVALID_GRANT_REGEX = /invalid_grant|invalid_token|revoked|unauthorized|expired.*refresh|refresh.*expired/i;
-const TRANSIENT_REGEX = /timeout|network|fetch failed|ECONNREFUSED/i;
-const HTTP_401_403_REGEX = /\b(401|403)\b/;
-
-function isDefinitiveFailure(errorMsg: string): boolean {
-	if (INVALID_GRANT_REGEX.test(errorMsg)) return true;
-	if (HTTP_401_403_REGEX.test(errorMsg) && !TRANSIENT_REGEX.test(errorMsg)) return true;
-	return false;
 }
 
 export interface AuthBrokerRefresherSchedule {
@@ -113,12 +104,11 @@ export class AuthBrokerRefresher {
 			await this.#storage.refreshCredentialById(id);
 		} catch (error) {
 			const errorMsg = String(error);
-			if (isDefinitiveFailure(errorMsg)) {
-				logger.warn("auth-broker refresh failed definitively; disabling credential", {
-					id,
-					error: errorMsg,
-				});
-				this.#storage.disableCredentialById(id, `auth-broker refresh failed: ${errorMsg}`);
+			if (isDefinitiveOAuthFailure(errorMsg)) {
+				// AuthStorage.refreshCredentialById already CAS-disabled the row
+				// (unless a peer/login rotated it first, in which case the live
+				// credential is intentionally kept). Nothing to do here but record it.
+				logger.warn("auth-broker refresh failed definitively", { id, error: errorMsg });
 			} else {
 				logger.debug("auth-broker refresh failed (transient)", { id, error: errorMsg });
 			}

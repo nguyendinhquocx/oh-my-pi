@@ -1,15 +1,15 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { clearCustomApis, getCustomApi } from "../src/api-registry";
+import { clearCustomApis, getCustomApi } from "@oh-my-pi/pi-ai/api-registry";
 import {
 	createMockModel,
 	isMockModel,
 	MOCK_API,
 	type MockHandler,
-	type MockModelHandle,
+	type MockModel,
 	registerMockApi,
 	streamMock,
-} from "../src/providers/mock";
-import type { AssistantMessage, AssistantMessageEvent, Context, ToolCall } from "../src/types";
+} from "@oh-my-pi/pi-ai/providers/mock";
+import type { AssistantMessage, AssistantMessageEvent, Context, ToolCall } from "@oh-my-pi/pi-ai/types";
 
 afterEach(() => {
 	clearCustomApis();
@@ -298,7 +298,7 @@ describe("mock provider — async-iterable response sources", () => {
 
 	test("generator can react to call state via the shared handle", async () => {
 		// Each yield reads `mock.calls` to react to what just happened.
-		let handle!: MockModelHandle;
+		let handle!: MockModel;
 		const gen = async function* () {
 			yield { content: ["turn 0"] };
 			// At this point mock.calls.length === 1.

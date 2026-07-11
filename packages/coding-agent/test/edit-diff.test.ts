@@ -2,14 +2,15 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { formatHashlineHeader, InMemorySnapshotStore, missingSnapshotTagMessage } from "@oh-my-pi/hashline";
 import {
 	adjustIndentation,
 	computeEditDiff,
 	computeHashlineDiff,
 	DEFAULT_FUZZY_THRESHOLD,
 	findMatch,
-	formatLineHash,
 } from "@oh-my-pi/pi-coding-agent/edit";
+import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 describe("findMatch", () => {
 	describe("exact matching", () => {
@@ -227,7 +228,7 @@ describe("computeHashlineDiff", () => {
 
 	afterEach(async () => {
 		if (tempDir) {
-			await fs.rm(tempDir, { recursive: true, force: true });
+			await removeWithRetries(tempDir);
 		}
 	});
 
@@ -236,11 +237,13 @@ describe("computeHashlineDiff", () => {
 		const line = "unchanged content";
 		await Bun.write(sourcePath, `${line}\n`);
 
-		// `≔1<hash>` with the same line as payload is a true no-op: the edit
+		// `SWAP 1.=1:` with the same line in the body is a true no-op: the edit
 		// fires through computeHashlineDiff but produces identical content.
-		const anchor = formatLineHash(1, line);
-		const input = `§${sourcePath}\n≔${anchor}\n${line}\n`;
-		const result = await computeHashlineDiff({ input }, tempDir);
+		const text = `${line}\n`;
+		const snapshotStore = new InMemorySnapshotStore();
+		const tag = snapshotStore.record(sourcePath, text);
+		const input = `${formatHashlineHeader(sourcePath, tag)}\nSWAP 1.=1:\n+${line}\n`;
+		const result = await computeHashlineDiff({ input }, tempDir, snapshotStore);
 		expect("error" in result).toBe(true);
 		if ("error" in result) {
 			expect(result.error).toContain("No changes would be made");
@@ -249,20 +252,79 @@ describe("computeHashlineDiff", () => {
 
 	test("accepts hashline input edits", async () => {
 		const sourcePath = path.join(tempDir, "source.txt");
-		await Bun.write(sourcePath, "first\n");
+		const text = "first\n";
+		await Bun.write(sourcePath, text);
 
-		const result = await computeHashlineDiff({ input: `§${sourcePath}\n»EOF\nsecond` }, tempDir);
+		const snapshotStore = new InMemorySnapshotStore();
+		const tag = snapshotStore.record(sourcePath, text);
+		const result = await computeHashlineDiff(
+			{ input: `${formatHashlineHeader(sourcePath, tag)}\nINS.TAIL:\n+second` },
+			tempDir,
+			snapshotStore,
+		);
 		expect("diff" in result).toBe(true);
 		if ("diff" in result) {
 			expect(result.diff).toContain("second");
 		}
 	});
+
+	test("rejects a tagless head/tail insert in the preview path, matching apply", async () => {
+		const relativePath = "source.txt";
+		await Bun.write(path.join(tempDir, relativePath), "first\n");
+
+		// A tagless `INS.TAIL:` carries no anchored edit, yet the apply path
+		// (Patcher.prepare) rejects it for the missing mandatory tag. The
+		// preview/diff path MUST emit the SAME rejection so a successful preview
+		// never precedes a failing apply.
+		const result = await computeHashlineDiff(
+			{ input: `[${relativePath}]\nINS.TAIL:\n+second` },
+			tempDir,
+			new InMemorySnapshotStore(),
+		);
+		expect("error" in result).toBe(true);
+		if ("error" in result) {
+			expect(result.error).toBe(missingSnapshotTagMessage(relativePath));
+		}
+	});
 	test("returns a handled error when the source path is a local URL", async () => {
-		const result = await computeHashlineDiff({ input: "§local://PLAN.md\n»EOF\n" }, tempDir);
+		const result = await computeHashlineDiff(
+			{ input: "[local://PLAN.md]\nINS.TAIL:\n+x" },
+			tempDir,
+			new InMemorySnapshotStore(),
+		);
 
 		expect("error" in result).toBe(true);
 		if ("error" in result) {
 			expect(result.error).toContain('internal scheme "local://"');
+		}
+	});
+
+	// A 16-bit snapshot tag can collide across two different file states. The
+	// preview mirrors Patcher's apply-time behavior: tag equality with the
+	// live content is trusted as-is — a colliding retained snapshot must not
+	// reject the preview, since a forced re-read would mint the very same tag.
+	test("previews onto live content when the tag matches a colliding retained snapshot", async () => {
+		// Both texts hash to `1D84` (pinned in hashline's collision tests).
+		const SNAPSHOT_TEXT = "line one 263\nline two 4471\n";
+		const LIVE_TEXT = "line one 410\nline two 6970\n";
+		const sourcePath = path.join(tempDir, "source.txt");
+		await Bun.write(sourcePath, LIVE_TEXT);
+
+		const snapshotStore = new InMemorySnapshotStore();
+		// Anchors were minted against SNAPSHOT_TEXT; the live file is the
+		// colliding LIVE_TEXT. The tag still matches live, so the SWAP lands
+		// on live line 2.
+		const tag = snapshotStore.record(sourcePath, SNAPSHOT_TEXT);
+
+		const result = await computeHashlineDiff(
+			{ input: `${formatHashlineHeader(sourcePath, tag)}\nSWAP 2.=2:\n+edited live` },
+			tempDir,
+			snapshotStore,
+		);
+
+		expect("diff" in result).toBe(true);
+		if ("diff" in result) {
+			expect(result.diff).toContain("edited live");
 		}
 	});
 });
@@ -276,7 +338,7 @@ describe("computeEditDiff", () => {
 
 	afterEach(async () => {
 		if (tempDir) {
-			await fs.rm(tempDir, { recursive: true, force: true });
+			await removeWithRetries(tempDir);
 		}
 	});
 

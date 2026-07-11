@@ -5,6 +5,7 @@ import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { FileType, glob } from "@oh-my-pi/pi-natives";
 import {
 	CONFIG_DIR_NAME,
+	getAgentDir,
 	getConfigDirName,
 	getPluginsDir,
 	getProjectDir,
@@ -17,6 +18,7 @@ import { parseRuleConditionAndScope, type Rule, type RuleFrontmatter } from "../
 import type { Skill, SkillFrontmatter } from "../capability/skill";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
 import { parseThinkingLevel } from "../thinking";
+import { normalizeToolNames } from "../tools/builtin-names";
 
 import { buildPluginDirRoot } from "./plugin-dir-roots";
 
@@ -86,6 +88,11 @@ export type SourceId = keyof typeof SOURCE_PATHS;
  * Get user-level path for a source.
  */
 export function getUserPath(ctx: LoadContext, source: SourceId, subpath: string): string | null {
+	// Native user config is profile-scoped via getAgentDir() (the active profile's
+	// agent dir), matching builtin.ts and getMCPConfigPath("user"). External tools
+	// (~/.claude, ~/.gemini, …) are intentionally not profile-scoped, so they keep
+	// resolving against ctx.home below.
+	if (source === "native") return path.join(getAgentDir(), subpath);
 	const paths = SOURCE_PATHS[source];
 	if (!paths.userAgent) return null;
 	return path.join(ctx.home, paths.userAgent, subpath);
@@ -99,6 +106,17 @@ export function getProjectPath(ctx: LoadContext, source: SourceId, subpath: stri
 	if (!paths.projectDir) return null;
 
 	return path.join(ctx.cwd, paths.projectDir, subpath);
+}
+
+/**
+ * Resolve GitHub Copilot CLI's user-global config root. Copilot stores per-user
+ * instructions/prompts/agents/MCP under `~/.copilot`, relocatable via the
+ * `COPILOT_HOME` env var (mirrors Copilot CLI's `--config-dir`). Falls back to
+ * `<home>/.copilot` when the override is unset.
+ */
+export function resolveCopilotHome(home: string): string {
+	const override = process.env.COPILOT_HOME?.trim();
+	return override ? override : path.join(home, ".copilot");
 }
 
 /**
@@ -163,7 +181,7 @@ export function buildRuleFromMarkdown(
 	},
 ): Rule {
 	const { frontmatter, body } = parseFrontmatter(content, { source: filePath });
-	const { condition, scope } = parseRuleConditionAndScope(frontmatter as RuleFrontmatter);
+	const { condition, astCondition, scope } = parseRuleConditionAndScope(frontmatter as RuleFrontmatter);
 
 	let globs: string[] | undefined;
 	if (Array.isArray(frontmatter.globs)) {
@@ -186,6 +204,7 @@ export function buildRuleFromMarkdown(
 		alwaysApply: frontmatter.alwaysApply === true,
 		description: typeof frontmatter.description === "string" ? frontmatter.description : undefined,
 		condition,
+		astCondition,
 		scope,
 		interruptMode,
 		_source: source,
@@ -211,6 +230,8 @@ export interface ParsedAgentFields {
 	model?: string[];
 	output?: unknown;
 	thinkingLevel?: ThinkingLevel;
+	autoloadSkills?: string[];
+	readSummarize?: boolean;
 	blocking?: boolean;
 }
 
@@ -226,7 +247,8 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 		return null;
 	}
 
-	let tools = parseArrayOrCSV(frontmatter.tools)?.map(tool => tool.toLowerCase());
+	let tools = parseArrayOrCSV(frontmatter.tools);
+	if (tools) tools = normalizeToolNames(tools);
 
 	// Subagents with explicit tool lists always need yield
 	if (tools && !tools.includes("yield")) {
@@ -264,7 +286,11 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 	const thinkingLevel = parseThinkingLevel(rawThinkingLevel);
 	const model = parseModelList(frontmatter.model);
 	const blocking = parseBoolean(frontmatter.blocking);
-	return { name, description, tools, spawns, model, output, thinkingLevel, blocking };
+	const readSummarize = parseBoolean(frontmatter.readSummarize);
+	const autoloadSkills = parseArrayOrCSV(frontmatter.autoloadSkills)
+		?.map(s => s.trim())
+		.filter(Boolean);
+	return { name, description, tools, spawns, model, output, thinkingLevel, blocking, autoloadSkills, readSummarize };
 }
 
 async function globIf(
@@ -286,6 +312,15 @@ export interface ScanSkillsFromDirOptions {
 	providerId: string;
 	level: "user" | "project";
 	requireDescription?: boolean;
+	/**
+	 * When true, treat a `SKILL.md` sitting directly under `dir` as a single skill in addition to
+	 * scanning `<dir>/<name>/SKILL.md` children. Matches the Claude plugin manifest convention
+	 * that lets a skill path point at a directory containing `SKILL.md` directly (e.g.
+	 * `"skills": ["./"]`), where the frontmatter `name` determines the invocation name and the
+	 * directory basename is the fallback. Default `false` preserves the strict child-scan
+	 * semantic every non-Claude provider relies on.
+	 */
+	includeSelf?: boolean;
 }
 
 // Stable ordering used for skill lists in prompts: name (case-insensitive), then name, then path.
@@ -342,7 +377,13 @@ export async function scanSkillsFromDir(
 		}
 	};
 
-	const work = [];
+	const work: Promise<void>[] = [];
+	if (options.includeSelf) {
+		const selfSkillPath = path.join(dir, "SKILL.md");
+		if (fs.existsSync(selfSkillPath)) {
+			work.push(loadSkill(selfSkillPath));
+		}
+	}
 	for (const entry of entries) {
 		if (entry.name.startsWith(".")) continue;
 		if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
@@ -484,6 +525,42 @@ interface ExtensionModuleManifest {
 	extensions?: string[];
 }
 
+async function discoverLinkedExtensionModuleFiles(dir: string): Promise<{
+	indexFiles: Array<{ path: string }>;
+	packageJsonFiles: Array<{ path: string }>;
+}> {
+	const entries = await readDirEntries(dir);
+	const indexFiles: Array<{ path: string }> = [];
+	const packageJsonFiles: Array<{ path: string }> = [];
+
+	await Promise.all(
+		entries.map(async entry => {
+			if (entry.name.startsWith(".") || entry.isDirectory()) return;
+
+			const entryPath = path.join(dir, entry.name);
+			const stat = await fs.promises.stat(entryPath).catch(() => null);
+			if (!stat?.isDirectory()) return;
+
+			const [packageJsonContent, indexTsContent, indexJsContent] = await Promise.all([
+				readFile(path.join(entryPath, "package.json")),
+				readFile(path.join(entryPath, "index.ts")),
+				readFile(path.join(entryPath, "index.js")),
+			]);
+
+			if (packageJsonContent !== null) {
+				packageJsonFiles.push({ path: `${entry.name}/package.json` });
+			}
+			if (indexTsContent !== null) {
+				indexFiles.push({ path: `${entry.name}/index.ts` });
+			} else if (indexJsContent !== null) {
+				indexFiles.push({ path: `${entry.name}/index.js` });
+			}
+		}),
+	);
+
+	return { indexFiles, packageJsonFiles };
+}
+
 async function readExtensionModuleManifest(
 	_ctx: LoadContext,
 	packageJsonPath: string,
@@ -513,14 +590,37 @@ async function readExtensionModuleManifest(
 export async function discoverExtensionModulePaths(_ctx: LoadContext, dir: string): Promise<string[]> {
 	const discovered = new Set<string>();
 	// Find all candidate files in parallel using glob
-	const [directFiles, indexFiles, packageJsonFiles] = await Promise.all([
+	const [directFiles, globIndexFiles, globPackageJsonFiles, linkedFiles] = await Promise.all([
 		// 1. Direct *.ts or *.js files
 		globIf(dir, "*.{ts,js}", FileType.File, false),
 		// 2. Subdirectory index files
 		globIf(dir, "*/index.{ts,js}", FileType.File, false),
 		// 3. Subdirectory package.json files
 		globIf(dir, "*/package.json", FileType.File, false),
+		// Native glob does not follow linked extension directories.
+		discoverLinkedExtensionModuleFiles(dir),
 	]);
+	const indexFiles = [...globIndexFiles, ...linkedFiles.indexFiles];
+	const packageJsonFiles = [...globPackageJsonFiles, ...linkedFiles.packageJsonFiles];
+
+	// The native glob walker runs with follow_links=false, so a symlinked extension
+	// directory is yielded as a Symlink entry but never descended into: its inner
+	// index.{ts,js}/package.json are invisible to the `*/...` patterns above.
+	// Detect top-level symlinked directories and synthesize the equivalent subdir
+	// matches so the resolution below treats them like real directories. Symlinked
+	// *files* already match, because the native file-type filter resolves a
+	// symlink's target type for File filters.
+	const topLevelEntries = await readDirEntries(dir);
+	for (const entry of topLevelEntries) {
+		if (!entry.isSymbolicLink()) continue;
+		// readDirEntries follows the symlink: a link to a file/dangling link yields [].
+		const subEntries = await readDirEntries(path.join(dir, entry.name));
+		const hasEntry = (name: string): boolean =>
+			subEntries.some(e => e.name === name && (e.isFile() || e.isSymbolicLink()));
+		if (hasEntry("package.json")) packageJsonFiles.push({ path: `${entry.name}/package.json` });
+		if (hasEntry("index.ts")) indexFiles.push({ path: `${entry.name}/index.ts` });
+		else if (hasEntry("index.js")) indexFiles.push({ path: `${entry.name}/index.js` });
+	}
 
 	// Process direct files
 	for (const match of directFiles) {
@@ -745,6 +845,13 @@ export async function resolveOrDefaultProjectRegistryPath(cwd: string): Promise<
 
 const pluginRootsCache = new Map<string, { roots: ClaudePluginRoot[]; warnings: string[] }>();
 
+const pluginCacheInvalidators = new Set<() => void>();
+
+/** Register a process-global plugin cache invalidator called whenever plugin roots are cleared. */
+export function registerPluginCacheInvalidator(invalidator: () => void): void {
+	pluginCacheInvalidators.add(invalidator);
+}
+
 /**
  * List all installed Claude Code plugin roots from the plugin cache.
  * Reads ~/.claude/plugins/installed_plugins.json and ~/.omp/plugins/installed_plugins.json,
@@ -924,6 +1031,7 @@ export async function listClaudePluginRoots(
  */
 export function clearClaudePluginRootsCache(): void {
 	pluginRootsCache.clear();
+	for (const invalidate of pluginCacheInvalidators) invalidate();
 	preloadedPluginRoots = [...injectedPluginDirRoots];
 	// Re-warm preloaded roots asynchronously so sync LSP config reads stay valid
 	if (lastPreloadHome) {

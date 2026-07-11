@@ -2,47 +2,133 @@ import {
 	Ellipsis,
 	type ExtractSegmentsResult,
 	extractSegments as nativeExtractSegments,
+	setHangulCompatJamoWidthOverride as nativeSetHangulCompatJamoWidthOverride,
 	sliceWithWidth as nativeSliceWithWidth,
 	truncateToWidth as nativeTruncateToWidth,
 	wrapTextWithAnsi as nativeWrapTextWithAnsi,
 	type SliceResult,
 } from "@oh-my-pi/pi-natives";
-import { getDefaultTabWidth, getIndentation } from "@oh-my-pi/pi-utils";
+import { DEFAULT_TAB_WIDTH } from "@oh-my-pi/pi-utils";
 
 export { Ellipsis } from "@oh-my-pi/pi-natives";
 
-export { getDefaultTabWidth, getIndentation } from "@oh-my-pi/pi-utils";
+export { DEFAULT_TAB_WIDTH } from "@oh-my-pi/pi-utils";
+
+export type HangulCompatibilityJamoWidth = "platform" | "unicode" | 1 | 2;
+
+let hangulCompatibilityJamoWidth: HangulCompatibilityJamoWidth = "platform";
+
+// Wire encoding for the native override (see crates/pi-natives text.rs):
+// 0 = platform default, 1 = narrow, 2 = wide, 3 = unicode (no correction).
+function nativeHangulCompatibilityJamoOverride(width: HangulCompatibilityJamoWidth): number {
+	if (width === "unicode") return 3;
+	if (typeof width === "number") return width;
+	return 0;
+}
+
+export function getHangulCompatibilityJamoWidth(): HangulCompatibilityJamoWidth {
+	return hangulCompatibilityJamoWidth;
+}
+
+export function setHangulCompatibilityJamoWidth(width: HangulCompatibilityJamoWidth): boolean {
+	const changed = hangulCompatibilityJamoWidth !== width;
+	hangulCompatibilityJamoWidth = width;
+	nativeSetHangulCompatJamoWidthOverride(nativeHangulCompatibilityJamoOverride(width));
+	return changed;
+}
+
+export function resetHangulCompatibilityJamoWidthForTests(): void {
+	hangulCompatibilityJamoWidth = "platform";
+	nativeSetHangulCompatJamoWidthOverride(0);
+}
+
+export type TextSizingScale = 1 | 2 | 3;
+export type TextSizingVerticalAlign = "top" | "bottom" | "center";
+export type TextSizingHorizontalAlign = "left" | "right" | "center";
+
+export interface TextSizingOptions {
+	scale?: TextSizingScale;
+	widthCells?: number;
+	verticalAlign?: TextSizingVerticalAlign;
+	horizontalAlign?: TextSizingHorizontalAlign;
+}
+
+const OSC66_UNSAFE = /[\x00-\x1f\x7f-\x9f]/u;
+const OSC66_UNSAFE_GLOBAL = /[\x00-\x1f\x7f-\x9f]/gu;
+
+function textSizingVerticalAlignValue(align: TextSizingVerticalAlign | undefined): number | undefined {
+	switch (align) {
+		case "top":
+			return 0;
+		case "bottom":
+			return 1;
+		case "center":
+			return 2;
+		default:
+			return undefined;
+	}
+}
+
+function textSizingHorizontalAlignValue(align: TextSizingHorizontalAlign | undefined): number | undefined {
+	switch (align) {
+		case "left":
+			return 0;
+		case "right":
+			return 1;
+		case "center":
+			return 2;
+		default:
+			return undefined;
+	}
+}
+
+/**
+ * Encode a plain-text span using Kitty's OSC 66 text-sizing protocol. The TUI
+ * emits only safe UTF-8 payloads and ST terminators so its ANSI parser and the
+ * terminal agree on span boundaries.
+ */
+export function encodeTextSized(text: string, options: TextSizingOptions = {}): string {
+	const metadata: string[] = [];
+	if (options.scale !== undefined) metadata.push(`s=${options.scale}`);
+	if (options.widthCells !== undefined && Number.isFinite(options.widthCells)) {
+		metadata.push(`w=${Math.max(0, Math.trunc(options.widthCells))}`);
+	}
+	const verticalAlign = textSizingVerticalAlignValue(options.verticalAlign);
+	if (verticalAlign !== undefined) metadata.push(`v=${verticalAlign}`);
+	const horizontalAlign = textSizingHorizontalAlignValue(options.horizontalAlign);
+	if (horizontalAlign !== undefined) metadata.push(`h=${horizontalAlign}`);
+
+	const safeText = OSC66_UNSAFE.test(text) ? text.replace(OSC66_UNSAFE_GLOBAL, " ") : text;
+	return `\x1b]66;${metadata.join(":")};${safeText}\x1b\\`;
+}
 
 export function sliceWithWidth(line: string, startCol: number, length: number, strict?: boolean | null): SliceResult {
-	return nativeSliceWithWidth(line, startCol, length, strict ?? null, getDefaultTabWidth());
+	return nativeSliceWithWidth(line, startCol, length, strict ?? null, DEFAULT_TAB_WIDTH);
 }
 
 export function truncateToWidth(
 	text: string,
 	maxWidth: number,
-	ellipsisKind?: Ellipsis | null,
+	ellipsisKind?: Ellipsis | null | "",
 	pad?: boolean | null,
 ): string {
-	// Guard nullish napi inputs: napi-rs 3 on the Windows prebuilt rejects
-	// `null` for `Option<u8>` (Ellipsis) / `Option<bool>` (pad) (issue #848),
-	// and `maxWidth` is a required `u32` that throws on `null`/`undefined`
-	// everywhere. Pass concrete defaults that mirror the Rust `unwrap_or`s.
-	const safeWidth = Number.isFinite(maxWidth) ? Math.max(0, Math.trunc(maxWidth)) : 0;
-	let resolvedEllipsis: Ellipsis | null | undefined | string = ellipsisKind;
-	if (typeof resolvedEllipsis === "string") {
-		resolvedEllipsis = resolvedEllipsis === "" ? Ellipsis.Omit : Ellipsis.Unicode;
+	maxWidth = Math.max(0, maxWidth | 0);
+	// Fast path: every UTF-16 unit is at most 3 cells wide, so a string whose
+	// `length * 3` already fits within `safeWidth` cannot need truncation.
+	if (!pad && text.length * 3 <= maxWidth) {
+		return text;
 	}
 	return nativeTruncateToWidth(
 		text,
-		safeWidth,
-		resolvedEllipsis ?? Ellipsis.Unicode,
+		maxWidth,
+		(typeof ellipsisKind === "string" ? Ellipsis.Omit : ellipsisKind) ?? Ellipsis.Unicode,
 		pad ?? false,
-		getDefaultTabWidth(),
+		DEFAULT_TAB_WIDTH,
 	);
 }
 
 export function wrapTextWithAnsi(text: string, width: number): string[] {
-	return nativeWrapTextWithAnsi(text, width, getDefaultTabWidth());
+	return nativeWrapTextWithAnsi(text, width, DEFAULT_TAB_WIDTH);
 }
 
 export function extractSegments(
@@ -52,24 +138,18 @@ export function extractSegments(
 	afterLen: number,
 	strictAfter: boolean,
 ): ExtractSegmentsResult {
-	return nativeExtractSegments(line, beforeEnd, afterStart, afterLen, strictAfter, getDefaultTabWidth());
+	return nativeExtractSegments(line, beforeEnd, afterStart, afterLen, strictAfter, DEFAULT_TAB_WIDTH);
 }
 
 // Pre-allocated space buffer for padding
 const SPACE_BUFFER = " ".repeat(512);
-
-/**
- * Tab width in columns for `file`, using `process.cwd()` as the project root for relative paths.
- */
-export function getIndentationNoescape(file?: string): number {
-	return getIndentation(file, process.cwd());
-}
+const TAB_SPACES = " ".repeat(DEFAULT_TAB_WIDTH);
 
 /*
- * Replace tabs with configured spacing for consistent rendering.
+ * Replace tabs with the fixed display tab width for consistent rendering.
  */
-export function replaceTabs(text: string, file?: string): string {
-	return text.replaceAll("\t", " ".repeat(getIndentation(file)));
+export function replaceTabs(text: string): string {
+	return text.replaceAll("\t", TAB_SPACES);
 }
 
 /**
@@ -91,38 +171,158 @@ export function getSegmenter(): Intl.Segmenter {
 	return segmenter;
 }
 
-export function visibleWidthRaw(str: string): number {
-	if (!str) {
-		return 0;
-	}
+// Kitty OSC 66 text-sizing spans: `\x1b]66;<meta>;<payload>` terminated by BEL
+// or ST. `Bun.stringWidth` strips the whole span (payload included) to zero
+// cells, but the payload is visible and scales by the `s=` factor, so each is
+// added back so width matches the native truncate/slice/wrap helpers.
+const OSC66_SPAN_REGEX = /\x1b\]66;([^;]*);([\s\S]*?)(?:\x07|\x1b\\)/g;
+const OSC66_PREFIX = "\x1b]66;";
+const ESC = "\x1b";
+const TAB = "\t";
+const LONG_WIDTH_FAST_PATH_MIN = 128;
 
-	// Fast path: pure ASCII printable
-	let tabLength = 0;
-	const tabWidth = getDefaultTabWidth();
-	let isPureAscii = true;
-	for (let i = 0; i < str.length; i++) {
-		const code = str.charCodeAt(i);
-		if (code === 9) {
-			tabLength += tabWidth;
-		} else if (code < 0x20 || code > 0x7e) {
-			isPureAscii = false;
-		}
+// Pin Bun.stringWidth semantics to the native width engine and guard against Bun
+// default drift: strip ANSI/OSC (don't count escape bytes) and treat
+// ambiguous-width East Asian chars as narrow (1 cell), matching `unicode-width`'s
+// non-CJK tables that back truncate/slice/wrap. Hoisted so no per-call alloc.
+const STRING_WIDTH_OPTS = { countAnsiEscapeCodes: false, ambiguousIsNarrow: true } as const;
+
+// Hangul Compatibility Jamo (U+3131..=U+318E). `Bun.stringWidth` follows UAX#11
+// and reports these at 2 cells (the U+3164 HANGUL FILLER at 0), but the actual
+// rendered width is decided by the *client* terminal (1 cell on Terminal.app /
+// iTerm2, 2 on Ghostty and most Linux terminals). The width is resolved from
+// the terminal identity and pushed into the native engine through
+// `setHangulCompatibilityJamoWidth`; mirror the same correction here so the TS
+// width stays in parity with the native truncate/slice/wrap model — and so the
+// hardware cursor column lands on the actual glyph during Korean IME input.
+const HANGUL_COMPAT_JAMO_REGEX = /[\u3131-\u318e]/;
+const HANGUL_COMPAT_JAMO_GLOBAL_REGEX = /[\u3131-\u318e]/g;
+const HANGUL_FILLER_CODE_POINT = 0x3164;
+// `Bun.stringWidth` counts every code point in the Compatibility Jamo block as
+// 2 cells (even the U+3164 filler that `unicode-width` treats as zero-width).
+const HANGUL_COMPAT_JAMO_BUN_WIDTH = 2;
+
+// Effective target cell width for Compatibility Jamo, or `null` to follow the
+// Unicode width (no correction). Mirrors `hangul_compat_jamo_target_width` in
+// crates/pi-natives/src/text.rs.
+function hangulCompatibilityJamoTargetWidth(): 1 | 2 | null {
+	switch (hangulCompatibilityJamoWidth) {
+		case 1:
+			return 1;
+		case 2:
+			return 2;
+		case "unicode":
+			return null;
+		default:
+			// "platform": macOS terminals historically render these narrow.
+			return process.platform === "darwin" ? 1 : null;
 	}
-	if (isPureAscii) {
-		return str.length + tabLength;
+}
+
+// Reconcile the `Bun.stringWidth` count for Compatibility Jamo to the native
+// width engine: subtract Bun's per-jamo cell count and add back the effective
+// width — the runtime target when one is active, otherwise the `unicode-width`
+// value. Mirrors `char_width_corrected` / `apply_hangul_compat_jamo_delta` in
+// crates/pi-natives/src/text.rs, including the rule that the zero-width filler
+// (U+3164) is never widened past the narrow correction (a wide terminal still
+// renders it at its Unicode width of 0).
+function correctHangulCompatibilityJamoWidth(width: number, str: string): number {
+	if (!HANGUL_COMPAT_JAMO_REGEX.test(str)) return width;
+	const target = hangulCompatibilityJamoTargetWidth();
+	let corrected = width;
+	HANGUL_COMPAT_JAMO_GLOBAL_REGEX.lastIndex = 0;
+	for (let m = HANGUL_COMPAT_JAMO_GLOBAL_REGEX.exec(str); m !== null; m = HANGUL_COMPAT_JAMO_GLOBAL_REGEX.exec(str)) {
+		const unicodeWidth = m[0].codePointAt(0) === HANGUL_FILLER_CODE_POINT ? 0 : 2;
+		const finalWidth = target === null || (unicodeWidth === 0 && target > 1) ? unicodeWidth : target;
+		corrected += finalWidth - HANGUL_COMPAT_JAMO_BUN_WIDTH;
 	}
-	return Bun.stringWidth(str) + tabLength;
+	return corrected;
 }
 
 /**
- * Calculate the visible width of a string in terminal columns.
+ * Visible width of a string in terminal columns, excluding ANSI/OSC escapes.
+ *
+ * `Bun.stringWidth` does the heavy lifting (UAX#11 width tables + ANSI/OSC
+ * stripping); this adds the two corrections it omits — tabs (expanded to
+ * `tabWidth` cells) and OSC 66 text-sizing payloads (scaled by `s=`).
  */
 export function visibleWidth(str: string): number {
 	if (!str) return 0;
-	return visibleWidthRaw(str);
+
+	// Long non-escape text is faster through Bun's native scanner than through
+	// a JS printable-ASCII prepass. Escape-bearing strings stay on the scanner
+	// below so CSI/OSC-heavy render output can still bail out at the first ESC.
+	if (str.length >= LONG_WIDTH_FAST_PATH_MIN && !str.includes(ESC)) {
+		let width = Bun.stringWidth(str, STRING_WIDTH_OPTS);
+		let tabCount = 0;
+		for (let tabIndex = str.indexOf(TAB); tabIndex !== -1; tabIndex = str.indexOf(TAB, tabIndex + 1)) {
+			tabCount++;
+		}
+		if (tabCount > 0) width += tabCount * DEFAULT_TAB_WIDTH;
+		return correctHangulCompatibilityJamoWidth(width, str);
+	}
+
+	let tabCount = 0;
+	let i = 0;
+	for (; i < str.length; i++) {
+		const code = str.charCodeAt(i);
+		if (code < 0x20 || code > 0x7e) {
+			if (code === 0x09) {
+				tabCount++;
+				continue;
+			}
+			break;
+		}
+	}
+	if (i === str.length) {
+		return tabCount === 0 ? str.length : str.length + tabCount * (DEFAULT_TAB_WIDTH - 1);
+	}
+
+	if (tabCount === 0) {
+		let tabIndex = str.indexOf(TAB, i + 1);
+		if (tabIndex !== -1) {
+			tabCount = 1;
+			for (tabIndex = str.indexOf(TAB, tabIndex + 1); tabIndex !== -1; tabIndex = str.indexOf(TAB, tabIndex + 1)) {
+				tabCount++;
+			}
+		}
+	} else {
+		for (let tabIndex = str.indexOf(TAB, i + 1); tabIndex !== -1; tabIndex = str.indexOf(TAB, tabIndex + 1)) {
+			tabCount++;
+		}
+	}
+
+	// `Bun.stringWidth` is a JSC builtin (no per-call N-API number box, unlike
+	// the native scanner that traps under Bun 1.3.x GC/N-API load). It strips
+	// CSI/OSC to zero cells and shares the native engine's UAX#11 width tables.
+	let width = Bun.stringWidth(str, STRING_WIDTH_OPTS);
+	if (tabCount > 0) width += tabCount * DEFAULT_TAB_WIDTH;
+
+	// OSC 66: add back each stripped span as `scale * (explicit w ?? payload
+	// width)`. Matched rather than replaced to avoid reallocating the string.
+	if (str.includes(OSC66_PREFIX, i)) {
+		OSC66_SPAN_REGEX.lastIndex = 0;
+		for (let m = OSC66_SPAN_REGEX.exec(str); m !== null; m = OSC66_SPAN_REGEX.exec(str)) {
+			let scale = 1;
+			let explicit: number | undefined;
+			for (const part of m[1].split(":")) {
+				// metadata keys are single chars, e.g. `s=2`, `w=5`
+				if (part.indexOf("=") !== 1) continue;
+				const value = Number.parseInt(part.slice(2), 10);
+				if (!Number.isFinite(value)) continue;
+				if (part[0] === "s") {
+					if (value >= 1 && value <= 7) scale = value;
+				} else if (part[0] === "w" && value > 0) {
+					explicit = value;
+				}
+			}
+			width += scale * (explicit ?? Bun.stringWidth(m[2], STRING_WIDTH_OPTS));
+		}
+	}
+
+	return correctHangulCompatibilityJamoWidth(width, str);
 }
 
-const THAI_LAO_AM_REGEX = /[\u0e33\u0eb3]/;
 const THAI_LAO_AM_GLOBAL_REGEX = /[\u0e33\u0eb3]/g;
 
 /**
@@ -132,7 +332,7 @@ const THAI_LAO_AM_GLOBAL_REGEX = /[\u0e33\u0eb3]/g;
  * width but avoid stale-cell artifacts in terminal renderers.
  */
 export function normalizeTerminalOutput(str: string): string {
-	if (!THAI_LAO_AM_REGEX.test(str)) return str;
+	if (str.indexOf("\u0e33") === -1 && str.indexOf("\u0eb3") === -1) return str;
 	return str.replace(THAI_LAO_AM_GLOBAL_REGEX, char => (char === "\u0e33" ? "\u0e4d\u0e32" : "\u0ecd\u0eb2"));
 }
 
@@ -353,4 +553,18 @@ export function applyBackgroundToLine(line: string, width: number, bgFn: (text: 
  */
 export function sliceByColumn(line: string, startCol: number, length: number, strict = false): string {
 	return sliceWithWidth(line, startCol, length, strict).text;
+}
+
+let globalTight = false;
+
+export function setTuiTight(tight: boolean): void {
+	globalTight = tight;
+}
+
+export function isTuiTight(): boolean {
+	return globalTight;
+}
+
+export function getPaddingX(basePadding: number): number {
+	return globalTight ? Math.max(0, basePadding - 1) : basePadding;
 }

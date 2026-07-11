@@ -120,6 +120,57 @@ describe("callWithCopilotModelRetry", () => {
 		expect(calls).toBe(1);
 	});
 
+	it("does not blind-retry a 429 that carries no Retry-After guidance", async () => {
+		let calls = 0;
+		const err = copilotError({ status: 429, message: "rate limited" });
+		await expect(
+			callWithCopilotModelRetry(
+				async () => {
+					calls += 1;
+					throw err;
+				},
+				{ provider: "github-copilot", retryBaseDelayMs: 0 },
+			),
+		).rejects.toBe(err);
+		expect(calls).toBe(1);
+	});
+
+	it("honors Retry-After on a 429 and retries", async () => {
+		let calls = 0;
+		const result = await callWithCopilotModelRetry(
+			async () => {
+				calls += 1;
+				if (calls === 1) {
+					const err = copilotError({ status: 429, message: "rate limited" });
+					(err as unknown as { headers: Record<string, string> }).headers = { "retry-after": "0.01" };
+					throw err;
+				}
+				return "ok" as const;
+			},
+			{ provider: "github-copilot", retryBaseDelayMs: 0 },
+		);
+		expect(result).toBe("ok");
+		expect(calls).toBe(2);
+	});
+
+	it("still retries status-less transport blips with the linear backoff", async () => {
+		let calls = 0;
+		const result = await callWithCopilotModelRetry(
+			async () => {
+				calls += 1;
+				if (calls === 1) {
+					throw new Error(
+						'HTTP2StreamReset fetching "https://api.example.com/x". For more information, pass `verbose: true` in the second argument to fetch()',
+					);
+				}
+				return "ok" as const;
+			},
+			{ provider: "github-copilot", retryBaseDelayMs: 0 },
+		);
+		expect(result).toBe("ok");
+		expect(calls).toBe(2);
+	});
+
 	it("stops retrying when the caller aborts during backoff", async () => {
 		const controller = new AbortController();
 		controller.abort();
@@ -144,6 +195,25 @@ describe("isRetryableError transport failures", () => {
 			isRetryableError(
 				new Error(
 					"The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()",
+				),
+			),
+		).toBe(true);
+	});
+	it("retries Bun HTTP/2 stream reset errors", () => {
+		// Bun's fetch surfaces `@errorName` from its h2 client verbatim in the
+		// message — see oven-sh/bun src/http/h2_client/dispatch.zig (HTTP2StreamReset,
+		// HTTP2RefusedStream) and FetchTasklet.zig's "{s} fetching \"...\"" template.
+		expect(
+			isRetryableError(
+				new Error(
+					'HTTP2StreamReset fetching "https://chatgpt.com/backend-api/codex/responses". For more information, pass `verbose: true` in the second argument to fetch()',
+				),
+			),
+		).toBe(true);
+		expect(
+			isRetryableError(
+				new Error(
+					'HTTP2RefusedStream fetching "https://api.example.com/x". For more information, pass `verbose: true` in the second argument to fetch()',
 				),
 			),
 		).toBe(true);

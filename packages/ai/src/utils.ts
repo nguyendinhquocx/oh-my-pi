@@ -1,34 +1,15 @@
 import { $env } from "@oh-my-pi/pi-utils";
-import type { ResponseInput } from "openai/resources/responses/responses";
+import type { ResponseInput, ResponseInputItem } from "./providers/openai-responses-wire";
 import type { CacheRetention, OpenAIResponsesHistoryPayload, ProviderPayload } from "./types";
 
 type OpenAIResponsesReplayItem = ResponseInput[number];
+const NON_WHITESPACE_RE = /\S/;
 
 export { isRecord } from "@oh-my-pi/pi-utils";
 export function normalizeSystemPrompts(systemPrompt: readonly string[] | string | undefined | null): string[] {
 	if (systemPrompt === undefined || systemPrompt === null) return [];
 	const prompts = Array.isArray(systemPrompt) ? systemPrompt : typeof systemPrompt === "string" ? [systemPrompt] : [];
-	return prompts.map(prompt => prompt.toWellFormed()).filter(prompt => prompt.length > 0);
-}
-
-export function toNumber(value: unknown): number | undefined {
-	if (typeof value === "number" && Number.isFinite(value)) return value;
-	if (typeof value === "string" && value.trim()) {
-		const parsed = Number(value);
-		return Number.isFinite(parsed) ? parsed : undefined;
-	}
-	return undefined;
-}
-
-export function toPositiveNumber(value: unknown, fallback: number): number {
-	if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
-		return fallback;
-	}
-	return value;
-}
-
-export function toBoolean(value: unknown): boolean | undefined {
-	return typeof value === "boolean" ? value : undefined;
+	return prompts.map(prompt => prompt.toWellFormed()).filter(prompt => prompt.trim().length > 0);
 }
 
 export function normalizeToolCallId(id: string): string {
@@ -84,19 +65,140 @@ export function truncateResponseItemId(id: string, prefix: string): string {
 	return `${prefix}_${Bun.hash(id).toString(36)}`;
 }
 
-export function sanitizeOpenAIResponsesHistoryItemsForReplay(items: Array<Record<string, unknown>>): ResponseInput {
+interface OpenAIResponsesReplaySanitizeOptions {
+	supportsImageDetailOriginal?: boolean;
+}
+
+/**
+ * Clamp `detail: "original"` only where Responses input_image parts live —
+ * top-level items and `message.content[]`. Avoids a deep tree walk/clone of
+ * every history node on providers that reject native-resolution images.
+ */
+function clampReplayItemImageDetail(
+	item: Record<string, unknown>,
+	supportsImageDetailOriginal: boolean,
+): Record<string, unknown> {
+	if (supportsImageDetailOriginal) return item;
+
+	if (item.type === "input_image" && item.detail === "original") {
+		return { ...item, detail: "auto" };
+	}
+
+	if (item.type !== "message" || !Array.isArray(item.content)) return item;
+
+	let changed = false;
+	const content = item.content.map(part => {
+		if (!part || typeof part !== "object" || Array.isArray(part)) return part;
+		const record = part as Record<string, unknown>;
+		if (record.type !== "input_image" || record.detail !== "original") return part;
+		changed = true;
+		return { ...record, detail: "auto" };
+	});
+	return changed ? { ...item, content } : item;
+}
+
+export function sanitizeOpenAIResponsesHistoryItemsForReplay(
+	items: Array<Record<string, unknown>>,
+	options: OpenAIResponsesReplaySanitizeOptions = {},
+): ResponseInput {
 	const normalizedCallIds = new Map<string, string>();
+	const supportsImageDetailOriginal = options.supportsImageDetailOriginal !== false;
 	return items.flatMap(item => {
-		const sanitized = sanitizeOpenAIResponsesHistoryItemForReplay(item, normalizedCallIds);
+		const sanitized = sanitizeOpenAIResponsesHistoryItemForReplay(
+			item,
+			normalizedCallIds,
+			supportsImageDetailOriginal,
+		);
 		return sanitized ? [sanitized] : [];
 	});
+}
+
+/**
+ * Sanitize assistant-native Responses history for replay.
+ *
+ * Returns `undefined` for hidden-empty turns that only contain reasoning and an
+ * empty assistant message, allowing callers to rebuild visible transcript
+ * history instead of replaying stale native state.
+ */
+export function sanitizeOpenAIResponsesAssistantHistoryItemsForReplay(
+	items: Array<Record<string, unknown>>,
+	options: OpenAIResponsesReplaySanitizeOptions = {},
+): ResponseInput | undefined {
+	const sanitized = sanitizeOpenAIResponsesHistoryItemsForReplay(items, options);
+	let hasReplayableAssistantOutput = false;
+
+	for (const item of sanitized) {
+		if (item.type === "reasoning") continue;
+		if (item.type !== "message" || item.role !== "assistant") {
+			hasReplayableAssistantOutput = true;
+			break;
+		}
+		if (typeof item.content === "string") {
+			if (NON_WHITESPACE_RE.test(item.content)) {
+				hasReplayableAssistantOutput = true;
+				break;
+			}
+			continue;
+		}
+		for (const part of item.content) {
+			if (part.type === "output_text" && NON_WHITESPACE_RE.test(part.text)) {
+				hasReplayableAssistantOutput = true;
+				break;
+			}
+			if (part.type === "refusal" && NON_WHITESPACE_RE.test(part.refusal)) {
+				hasReplayableAssistantOutput = true;
+				break;
+			}
+		}
+		if (hasReplayableAssistantOutput) break;
+	}
+
+	return hasReplayableAssistantOutput ? sanitized : undefined;
+}
+
+/**
+ * Drop hidden-only fallback assistant replay after a native Responses snapshot is rejected.
+ */
+export function sanitizeOpenAIResponsesAssistantFallbackItemsForReplay(items: ResponseInput): ResponseInput {
+	const sanitized: ResponseInput = [];
+
+	for (const item of items) {
+		if (item.type === "reasoning") continue;
+		if (item.type !== "message" || item.role !== "assistant") {
+			sanitized.push(item);
+			continue;
+		}
+
+		let hasVisibleText = false;
+		if (typeof item.content === "string") {
+			hasVisibleText = NON_WHITESPACE_RE.test(item.content);
+		} else {
+			for (const part of item.content) {
+				if (part.type === "output_text" && NON_WHITESPACE_RE.test(part.text)) {
+					hasVisibleText = true;
+					break;
+				}
+				if (part.type === "refusal" && NON_WHITESPACE_RE.test(part.refusal)) {
+					hasVisibleText = true;
+					break;
+				}
+			}
+		}
+
+		if (hasVisibleText) sanitized.push(item);
+	}
+
+	return sanitized;
 }
 
 function sanitizeOpenAIResponsesHistoryItemForReplay(
 	item: Record<string, unknown>,
 	normalizedCallIds: Map<string, string>,
+	supportsImageDetailOriginal: boolean,
 ): OpenAIResponsesReplayItem | undefined {
 	if (item.type === "item_reference") return undefined;
+	if (item.type === "image_generation_call") return sanitizeOpenAIResponsesImageGenerationCallForReplay(item);
+	if (item.type === "reasoning") return sanitizeOpenAIResponsesReasoningItemForReplay(item);
 
 	// providerPayload stores raw output items; replay strips item ids and keeps only normalized call_id.
 	const { id: _id, ...sanitizedItem } = item;
@@ -104,7 +206,37 @@ function sanitizeOpenAIResponsesHistoryItemForReplay(
 		sanitizedItem.call_id = normalizeReplayedResponsesHistoryCallId(item.call_id, normalizedCallIds);
 	}
 
+	return clampReplayItemImageDetail(
+		sanitizedItem,
+		supportsImageDetailOriginal,
+	) as unknown as OpenAIResponsesReplayItem;
+}
+
+function sanitizeOpenAIResponsesReasoningItemForReplay(item: Record<string, unknown>): OpenAIResponsesReplayItem {
+	const sanitizedItem: Record<string, unknown> = { type: "reasoning" };
+	if (Array.isArray(item.summary)) sanitizedItem.summary = item.summary;
+	if (Array.isArray(item.content)) sanitizedItem.content = item.content;
+	if (typeof item.encrypted_content === "string" || item.encrypted_content === null) {
+		sanitizedItem.encrypted_content = item.encrypted_content;
+	}
+	if (item.status === "in_progress" || item.status === "completed" || item.status === "incomplete") {
+		sanitizedItem.status = item.status;
+	}
 	return sanitizedItem as unknown as OpenAIResponsesReplayItem;
+}
+
+function sanitizeOpenAIResponsesImageGenerationCallForReplay(
+	item: Record<string, unknown>,
+): ResponseInputItem.ImageGenerationCall | undefined {
+	if (typeof item.id !== "string" || item.status !== "completed" || typeof item.result !== "string") {
+		return undefined;
+	}
+	return {
+		id: truncateResponseItemId(item.id, "ig"),
+		type: "image_generation_call",
+		status: "completed",
+		result: item.result,
+	};
 }
 
 function normalizeReplayedResponsesHistoryCallId(value: string, normalizedValues: Map<string, string>): string {
@@ -159,8 +291,4 @@ export function resolveCacheRetention(cacheRetention?: CacheRetention): CacheRet
 	if (cacheRetention) return cacheRetention;
 	if ($env.PI_CACHE_RETENTION === "long") return "long";
 	return "short";
-}
-
-export function isAnthropicOAuthToken(key: string): boolean {
-	return key.includes("sk-ant-oat");
 }

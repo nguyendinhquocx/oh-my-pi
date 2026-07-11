@@ -1,10 +1,11 @@
-import { getEnvApiKey } from "@oh-my-pi/pi-ai";
+import { type FetchImpl, getEnvApiKey } from "@oh-my-pi/pi-ai";
+import type { AgentStorage } from "../session/agent-storage";
 import { findCredential, withHardTimeout } from "./search/providers/utils";
 
 const PARALLEL_API_URL = "https://api.parallel.ai";
-const PARALLEL_SEARCH_URL = `${PARALLEL_API_URL}/v1beta/search`;
+export const PARALLEL_SEARCH_URL = `${PARALLEL_API_URL}/v1beta/search`;
 const PARALLEL_EXTRACT_URL = `${PARALLEL_API_URL}/v1beta/extract`;
-const PARALLEL_BETA_HEADER = "search-extract-2025-10-10";
+export const PARALLEL_BETA_HEADER = "search-extract-2025-10-10";
 
 export interface ParallelUsageItem {
 	name?: string;
@@ -53,6 +54,7 @@ export interface ParallelSearchOptions {
 	mode?: "fast" | "research";
 	maxCharsPerResult?: number;
 	signal?: AbortSignal;
+	fetch?: FetchImpl;
 }
 
 export interface ParallelExtractOptions {
@@ -61,6 +63,7 @@ export interface ParallelExtractOptions {
 	excerpts?: boolean;
 	fullContent?: boolean;
 	signal?: AbortSignal;
+	fetch?: FetchImpl;
 }
 
 export class ParallelApiError extends Error {
@@ -71,22 +74,6 @@ export class ParallelApiError extends Error {
 		this.name = "ParallelApiError";
 		this.statusCode = statusCode;
 	}
-}
-
-export async function findParallelApiKey(): Promise<string | null> {
-	return findCredential(getEnvApiKey("parallel"), "parallel");
-}
-
-export function getParallelExtractContent(document: ParallelExtractDocument): string {
-	const excerptContent = document.excerpts
-		.filter(excerpt => excerpt.trim().length > 0)
-		.join("\n\n")
-		.trim();
-	if (excerptContent.length > 0) {
-		return excerptContent;
-	}
-
-	return document.fullContent?.trim() ?? "";
 }
 
 function isObject(value: unknown): value is object {
@@ -145,7 +132,7 @@ function createParallelApiError(statusCode: number, detail?: string): ParallelAp
 	);
 }
 
-function parseParallelErrorResponse(statusCode: number, responseText: string): ParallelApiError {
+export function parseParallelErrorResponse(statusCode: number, responseText: string): ParallelApiError {
 	const trimmedResponseText = responseText.trim();
 	if (trimmedResponseText.length === 0) {
 		return createParallelApiError(statusCode);
@@ -173,24 +160,6 @@ function getAuthHeaders(apiKey: string): {
 	};
 }
 
-function normalizeSearchMode(mode: ParallelSearchOptions["mode"]): "fast" | "one-shot" {
-	return mode === "research" ? "one-shot" : "fast";
-}
-
-function parseUsageItems(payload: unknown): ParallelUsageItem[] {
-	if (!Array.isArray(payload)) return [];
-
-	const usageItems: ParallelUsageItem[] = [];
-	for (const item of payload) {
-		if (!isObject(item)) continue;
-		usageItems.push({
-			name: getString(item, "name"),
-			count: getNumber(item, "count"),
-		});
-	}
-	return usageItems;
-}
-
 function parseWarnings(payload: unknown): string[] {
 	if (!Array.isArray(payload)) return [];
 
@@ -209,7 +178,24 @@ function parseWarnings(payload: unknown): string[] {
 	return warnings;
 }
 
-function parseSearchPayload(payload: unknown): ParallelSearchResult {
+function parseUsageItems(payload: unknown): ParallelUsageItem[] {
+	if (!Array.isArray(payload)) return [];
+
+	const usageItems: ParallelUsageItem[] = [];
+	for (const item of payload) {
+		if (!isObject(item)) continue;
+		usageItems.push({
+			name: getString(item, "name"),
+			count: getNumber(item, "count"),
+		});
+	}
+	return usageItems;
+}
+
+export function parseParallelSearchPayload(
+	payload: unknown,
+	options?: { parseMetadata?: boolean },
+): ParallelSearchResult {
 	if (!isObject(payload)) {
 		throw new ParallelApiError("Parallel search returned an invalid response payload.");
 	}
@@ -233,12 +219,30 @@ function parseSearchPayload(payload: unknown): ParallelSearchResult {
 		});
 	}
 
+	const parseMetadata = options?.parseMetadata ?? true;
+
 	return {
 		requestId,
 		sources,
-		warnings: parseWarnings(getOwnValue(payload, "warnings")),
-		usage: parseUsageItems(getOwnValue(payload, "usage")),
+		warnings: parseMetadata ? parseWarnings(getOwnValue(payload, "warnings")) : [],
+		usage: parseMetadata ? parseUsageItems(getOwnValue(payload, "usage")) : [],
 	};
+}
+
+export function findParallelApiKey(storage: AgentStorage | null | undefined): string | null {
+	return findCredential(storage, getEnvApiKey("parallel"), "parallel");
+}
+
+export function getParallelExtractContent(document: ParallelExtractDocument): string {
+	const excerptContent = document.excerpts
+		.filter(excerpt => excerpt.trim().length > 0)
+		.join("\n\n")
+		.trim();
+	if (excerptContent.length > 0) {
+		return excerptContent;
+	}
+
+	return document.fullContent?.trim() ?? "";
 }
 
 function parseExtractPayload(payload: unknown): ParallelExtractResult {
@@ -284,22 +288,24 @@ function parseExtractPayload(payload: unknown): ParallelExtractResult {
 export async function searchWithParallel(
 	objective: string,
 	queries: string[],
-	options: ParallelSearchOptions = {},
+	options: ParallelSearchOptions,
+	storage: AgentStorage | null | undefined,
 ): Promise<ParallelSearchResult> {
-	const apiKey = await findParallelApiKey();
+	const apiKey = findParallelApiKey(storage);
 	if (!apiKey) {
 		throw new ParallelApiError(
 			"Parallel credentials not found. Set PARALLEL_API_KEY or login with 'omp /login parallel'.",
 		);
 	}
 
-	const response = await fetch(PARALLEL_SEARCH_URL, {
+	const fetchImpl = options.fetch ?? fetch;
+	const response = await fetchImpl(PARALLEL_SEARCH_URL, {
 		method: "POST",
 		headers: getAuthHeaders(apiKey),
 		body: JSON.stringify({
 			objective,
 			search_queries: queries,
-			mode: normalizeSearchMode(options.mode),
+			mode: options.mode === "research" ? "one-shot" : "fast",
 			excerpts: {
 				max_chars_per_result: options.maxCharsPerResult ?? 10_000,
 			},
@@ -311,21 +317,23 @@ export async function searchWithParallel(
 	}
 
 	const payload: unknown = await response.json();
-	return parseSearchPayload(payload);
+	return parseParallelSearchPayload(payload);
 }
 
 export async function extractWithParallel(
 	urls: string[],
-	options: ParallelExtractOptions = {},
+	options: ParallelExtractOptions,
+	storage: AgentStorage | null | undefined,
 ): Promise<ParallelExtractResult> {
-	const apiKey = await findParallelApiKey();
+	const apiKey = findParallelApiKey(storage);
 	if (!apiKey) {
 		throw new ParallelApiError(
 			"Parallel credentials not found. Set PARALLEL_API_KEY or login with 'omp /login parallel'.",
 		);
 	}
 
-	const response = await fetch(PARALLEL_EXTRACT_URL, {
+	const fetchImpl = options.fetch ?? fetch;
+	const response = await fetchImpl(PARALLEL_EXTRACT_URL, {
 		method: "POST",
 		headers: getAuthHeaders(apiKey),
 		body: JSON.stringify({

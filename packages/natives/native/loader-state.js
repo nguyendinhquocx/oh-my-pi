@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as zlib from "node:zlib";
 import packageJson from "../package.json" with { type: "json" };
 import { embeddedAddon } from "./embedded-addon.js";
 
@@ -32,12 +33,36 @@ import { embeddedAddon } from "./embedded-addon.js";
 
 const SUPPORTED_PLATFORMS = ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64", "win32-x64"];
 
+/**
+ * Streaming startup marker, enabled by `PI_DEBUG_STARTUP`. Local copy of the
+ * pi-utils helper (this loader cannot depend on pi-utils). Synchronous on
+ * purpose: extraction/dlopen hangs must still leave the `:start` marker.
+ * @param {string} text
+ */
+function startupMarker(text) {
+	if (!process.env.PI_DEBUG_STARTUP) return;
+	try {
+		fs.writeSync(2, `[startup] ${text}\n`);
+	} catch {
+		// stderr unavailable; markers are best-effort
+	}
+}
+
 function getNativesDir() {
 	const xdgDataHome = process.env.XDG_DATA_HOME;
 	if (xdgDataHome && fs.existsSync(path.join(xdgDataHome, "omp"))) {
 		return path.join(xdgDataHome, "omp", "natives");
 	}
 	return path.join(os.homedir(), ".omp", "natives");
+}
+
+function resolveLeafPackageDir(platformTag) {
+	try {
+		const require_ = createRequire(import.meta.url);
+		return path.dirname(require_.resolve(`@oh-my-pi/pi-natives-${platformTag}/package.json`));
+	} catch {
+		return null;
+	}
 }
 
 // =========================================================================
@@ -113,6 +138,7 @@ export function shouldStageNodeModulesAddon({ platform, isCompiledBinary, native
  *   isCompiledBinary: boolean;
  *   stageFromNodeModules?: boolean;
  *   nativeDir: string;
+ *   leafPackageDir?: string | null;
  *   execDir: string;
  *   versionedDir: string;
  *   userDataDir: string;
@@ -124,6 +150,7 @@ export function resolveLoaderCandidates({
 	isCompiledBinary,
 	stageFromNodeModules = false,
 	nativeDir,
+	leafPackageDir = null,
 	execDir,
 	versionedDir,
 	userDataDir,
@@ -132,6 +159,7 @@ export function resolveLoaderCandidates({
 		path.join(nativeDir, filename),
 		path.join(execDir, filename),
 	]);
+	const leafCandidates = leafPackageDir ? addonFilenames.map(filename => path.join(leafPackageDir, filename)) : [];
 	const compiledCandidates = addonFilenames.flatMap(filename => [
 		path.join(versionedDir, filename),
 		path.join(userDataDir, filename),
@@ -141,20 +169,77 @@ export function resolveLoaderCandidates({
 	if (isCompiledBinary) {
 		releaseCandidates = [...compiledCandidates, ...baseReleaseCandidates];
 	} else if (stageFromNodeModules) {
-		releaseCandidates = [...stagedCandidates, ...baseReleaseCandidates];
+		releaseCandidates = [...stagedCandidates, ...leafCandidates, ...baseReleaseCandidates];
 	} else {
-		releaseCandidates = baseReleaseCandidates;
+		releaseCandidates = [...leafCandidates, ...baseReleaseCandidates];
 	}
 	return [...new Set(releaseCandidates)];
 }
 
 // =========================================================================
+
+/**
+ * Remove version-pinned native cache directories older than the loaded package.
+ * Best-effort by design: permission errors and concurrent processes must not
+ * abort startup after the native addon has already loaded successfully.
+ *
+ * @param {{ nativesDir: string; currentVersion: string }} input
+ * @returns {string[]}
+ */
+export function cleanupStaleNativeVersions({ nativesDir, currentVersion }) {
+	const removed = [];
+	let entries;
+	try {
+		entries = fs.readdirSync(nativesDir, { withFileTypes: true });
+	} catch {
+		return removed;
+	}
+
+	for (const entry of entries) {
+		if (!entry.isDirectory() || entry.name === currentVersion) continue;
+		const targetPath = path.join(nativesDir, entry.name);
+		try {
+			fs.rmSync(targetPath, { recursive: true, force: true });
+			removed.push(targetPath);
+		} catch {
+			// Stale caches are opportunistic cleanup only.
+		}
+	}
+	return removed;
+}
+
 // Side-effectful loader. Everything below runs only when `loadNative()` is
 // called from `native/index.js` — tests that only import the pure helpers
 // above pay nothing for variant detection, subprocess spawns, or fs probes.
 // =========================================================================
 
+/**
+ * Hidden env key for the resolved x64 variant. Once any context (main thread,
+ * worker, subprocess) finishes variant detection, the result is written here
+ * so every Bun worker and child process spawned afterwards inherits the same
+ * verdict and skips re-detection. See `selectCpuVariant` for the lookup order.
+ */
+const VARIANT_CACHE_ENV_KEY = "__PI_NATIVE_VARIANT_CACHE";
+
+/**
+ * Spawn `command` with `args` and capture stdout. Prefers `Bun.spawnSync`
+ * because Bun's `child_process.spawnSync` shim has been observed to return
+ * non-zero / null in worker threads on macOS even when the same binary works
+ * fine from the parent — the failure mode behind issue #3238, where the worker
+ * silently falls back to the "baseline" variant. Falls back to the Node shim
+ * for non-Bun embeds.
+ */
 function runCommand(command, args) {
+	if (typeof Bun !== "undefined" && typeof Bun.spawnSync === "function") {
+		try {
+			const result = Bun.spawnSync([command, ...args], { stdout: "pipe", stderr: "pipe" });
+			if (result.exitCode === 0) {
+				return result.stdout.toString("utf-8").trim();
+			}
+		} catch {
+			// fall through to childProcess
+		}
+	}
 	try {
 		const result = childProcess.spawnSync(command, args, { encoding: "utf-8" });
 		if (result.error) return null;
@@ -187,12 +272,15 @@ function detectAvx2Support() {
 	}
 
 	if (process.platform === "darwin") {
-		const leaf7 = runCommand("sysctl", ["-n", "machdep.cpu.leaf7_features"]);
-		if (leaf7 && /\bAVX2\b/i.test(leaf7)) {
-			return true;
+		// Try the absolute path before bare `sysctl`: PATH may not include
+		// `/usr/sbin` in worker/embedded spawn contexts (issue #3238).
+		for (const sysctlBin of ["/usr/sbin/sysctl", "sysctl"]) {
+			const leaf7 = runCommand(sysctlBin, ["-n", "machdep.cpu.leaf7_features"]);
+			if (leaf7 && /\bAVX2\b/i.test(leaf7)) return true;
+			const features = runCommand(sysctlBin, ["-n", "machdep.cpu.features"]);
+			if (features && /\bAVX2\b/i.test(features)) return true;
 		}
-		const features = runCommand("sysctl", ["-n", "machdep.cpu.features"]);
-		return Boolean(features && /\bAVX2\b/i.test(features));
+		return false;
 	}
 
 	if (process.platform === "win32") {
@@ -208,10 +296,63 @@ function detectAvx2Support() {
 	return false;
 }
 
+/**
+ * Pure variant-selection helper, exposed for unit tests. Resolution order:
+ *
+ *   1. `override` (user-facing `PI_NATIVE_VARIANT` env var). Always wins.
+ *   2. The private `__PI_NATIVE_VARIANT_CACHE` env var, populated by the first
+ *      context that detected at runtime. Lets child workers / subprocesses
+ *      inherit the main thread's verdict instead of re-spawning `sysctl` etc.
+ *      from a worker context where the spawn may fail (issue #3238).
+ *   3. `detectAvx2()` — the slow path, called at most once per process.
+ *
+ * Non-x64 architectures return `{ variant: null }` and never set the cache.
+ * When detection runs, the result is surfaced as `cacheEnvKey`/`cacheEnvValue`
+ * so the caller can write `process.env` (the pure helper itself stays
+ * side-effect-free, which keeps it easy to test).
+ *
+ * @param {{
+ *   arch: string;
+ *   override: "modern" | "baseline" | null | undefined;
+ *   env: Record<string, string | undefined>;
+ *   detectAvx2: () => boolean;
+ * }} input
+ * @returns {{
+ *   variant: "modern" | "baseline" | null;
+ *   source: "non-x64" | "override" | "cache" | "detect";
+ *   cacheEnvKey?: string;
+ *   cacheEnvValue?: string;
+ * }}
+ */
+export function selectCpuVariant({ arch, override, env, detectAvx2 }) {
+	if (arch !== "x64") return { variant: null, source: "non-x64" };
+	if (override === "modern" || override === "baseline") {
+		return { variant: override, source: "override" };
+	}
+	const cached = env[VARIANT_CACHE_ENV_KEY];
+	if (cached === "modern" || cached === "baseline") {
+		return { variant: cached, source: "cache" };
+	}
+	const variant = detectAvx2() ? "modern" : "baseline";
+	return {
+		variant,
+		source: "detect",
+		cacheEnvKey: VARIANT_CACHE_ENV_KEY,
+		cacheEnvValue: variant,
+	};
+}
+
 function resolveCpuVariant(override) {
-	if (process.arch !== "x64") return null;
-	if (override) return override;
-	return detectAvx2Support() ? "modern" : "baseline";
+	const result = selectCpuVariant({
+		arch: process.arch,
+		override,
+		env: process.env,
+		detectAvx2: detectAvx2Support,
+	});
+	if (result.cacheEnvKey) {
+		process.env[result.cacheEnvKey] = result.cacheEnvValue;
+	}
+	return result.variant;
 }
 
 function selectEmbeddedAddonFile(selectedVariant) {
@@ -228,6 +369,123 @@ function selectEmbeddedAddonFile(selectedVariant) {
 	return embeddedAddon.files.find(file => file.variant === "baseline") || null;
 }
 
+function readTarString(buffer, offset, length) {
+	const end = Math.min(offset + length, buffer.length);
+	let stringEnd = offset;
+	while (stringEnd < end && buffer[stringEnd] !== 0) stringEnd++;
+	return buffer.toString("utf8", offset, stringEnd);
+}
+
+function readTarOctal(buffer, offset, length) {
+	const value = readTarString(buffer, offset, length).trim();
+	if (!value) return 0;
+	const parsed = Number.parseInt(value, 8);
+	if (!Number.isFinite(parsed)) {
+		throw new Error(`Invalid tar octal value: ${value}`);
+	}
+	return parsed;
+}
+
+function isZeroTarBlock(buffer, offset) {
+	for (let index = 0; index < 512; index++) {
+		if (buffer[offset + index] !== 0) return false;
+	}
+	return true;
+}
+
+function getTarEntryName(header) {
+	const name = readTarString(header, 0, 100);
+	const prefix = readTarString(header, 345, 155);
+	return prefix ? `${prefix}/${name}` : name;
+}
+
+function isSafeEmbeddedAddonFilename(filename) {
+	return filename.length > 0 && path.basename(filename) === filename && !filename.includes("/") && !filename.includes("\\");
+}
+
+function isEmbeddedAddonFileCurrent(targetPath, file) {
+	try {
+		const stat = fs.statSync(targetPath);
+		if (!stat.isFile()) return false;
+		return typeof file.size !== "number" || stat.size === file.size;
+	} catch (err) {
+		if (err && err.code === "ENOENT") return false;
+		throw err;
+	}
+}
+
+function writeEmbeddedAddonFile(targetPath, content) {
+	const tempPath = `${targetPath}.tmp.${process.pid}.${Date.now()}`;
+	try {
+		fs.writeFileSync(tempPath, content, { mode: 0o755 });
+		fs.renameSync(tempPath, targetPath);
+	} catch (err) {
+		try {
+			fs.unlinkSync(tempPath);
+		} catch {
+			// Best-effort cleanup only.
+		}
+		throw err;
+	}
+}
+
+export function extractEmbeddedAddonArchive({ archivePath, files, targetDir }) {
+	const pending = new Map();
+	for (const file of files) {
+		if (!isSafeEmbeddedAddonFilename(file.filename)) {
+			throw new Error(`Unsafe embedded addon filename: ${file.filename}`);
+		}
+		const targetPath = path.join(targetDir, file.filename);
+		if (!isEmbeddedAddonFileCurrent(targetPath, file)) {
+			pending.set(file.filename, file);
+		}
+	}
+	if (pending.size === 0) return [];
+
+	const archive = zlib.gunzipSync(fs.readFileSync(archivePath));
+	const writtenPaths = [];
+	let offset = 0;
+
+	while (offset + 512 <= archive.length) {
+		if (isZeroTarBlock(archive, offset)) break;
+		const header = archive.subarray(offset, offset + 512);
+		const filename = getTarEntryName(header);
+		const size = readTarOctal(header, 124, 12);
+		const typeflag = header[156] === 0 ? "0" : String.fromCharCode(header[156]);
+		offset += 512;
+
+		if (offset + size > archive.length) {
+			throw new Error(`Truncated embedded addon archive entry: ${filename}`);
+		}
+
+		if (!isSafeEmbeddedAddonFilename(filename)) {
+			throw new Error(`Unsafe embedded addon archive entry: ${filename}`);
+		}
+		if (typeflag !== "0") {
+			throw new Error(`Unsupported embedded addon archive entry type ${typeflag}: ${filename}`);
+		}
+
+		const file = pending.get(filename);
+		if (file) {
+			if (typeof file.size === "number" && file.size !== size) {
+				throw new Error(`Embedded addon size mismatch for ${filename}: expected ${file.size}, got ${size}`);
+			}
+			const targetPath = path.join(targetDir, filename);
+			writeEmbeddedAddonFile(targetPath, archive.subarray(offset, offset + size));
+			pending.delete(filename);
+			writtenPaths.push(targetPath);
+		}
+
+		offset += Math.ceil(size / 512) * 512;
+	}
+
+	if (pending.size > 0) {
+		throw new Error(`Embedded addon archive missing: ${[...pending.keys()].join(", ")}`);
+	}
+
+	return writtenPaths;
+}
+
 function maybeExtractEmbeddedAddon(ctx, errors) {
 	if (!ctx.isCompiledBinary || !embeddedAddon) return null;
 	if (embeddedAddon.platformTag !== ctx.platformTag || embeddedAddon.version !== ctx.packageVersion) return null;
@@ -236,6 +494,7 @@ function maybeExtractEmbeddedAddon(ctx, errors) {
 	if (!selectedEmbeddedFile) return null;
 	const targetPath = path.join(ctx.versionedDir, selectedEmbeddedFile.filename);
 
+	startupMarker("native:extractEmbeddedAddon:start");
 	try {
 		fs.mkdirSync(ctx.versionedDir, { recursive: true });
 	} catch (err) {
@@ -244,8 +503,31 @@ function maybeExtractEmbeddedAddon(ctx, errors) {
 		return null;
 	}
 
-	if (fs.existsSync(targetPath)) {
+	if (embeddedAddon.archive) {
+		try {
+			extractEmbeddedAddonArchive({
+				archivePath: embeddedAddon.archive.filePath,
+				files: embeddedAddon.files,
+				targetDir: ctx.versionedDir,
+			});
+			if (isEmbeddedAddonFileCurrent(targetPath, selectedEmbeddedFile)) {
+				return targetPath;
+			}
+			errors.push(`embedded addon archive (${embeddedAddon.archive.filename}): missing ${selectedEmbeddedFile.filename}`);
+			return null;
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			errors.push(`embedded addon archive (${embeddedAddon.archive.filename}): ${message}`);
+			return null;
+		}
+	}
+
+	if (isEmbeddedAddonFileCurrent(targetPath, selectedEmbeddedFile)) {
 		return targetPath;
+	}
+	if (!selectedEmbeddedFile.filePath) {
+		errors.push(`embedded addon metadata missing file path for ${selectedEmbeddedFile.filename}`);
+		return null;
 	}
 
 	try {
@@ -260,8 +542,8 @@ function maybeExtractEmbeddedAddon(ctx, errors) {
 }
 
 /**
- * Mirror `nativeDir/<filename>.node` to `versionedDir/<filename>.node` on Windows
- * installs so the running process keeps its OS-level handle on a versioned
+ * Mirror `leafPackageDir ?? nativeDir` addon binaries to
+ * `versionedDir/<filename>.node` on Windows installs so the running process
  * cache path, never on the `node_modules` copy that bun must overwrite on
  * update. No-op on non-Windows, in workspace dev, and for compiled binaries —
  * see `shouldStageNodeModulesAddon` for the gating rules.
@@ -271,7 +553,7 @@ function maybeStageNodeModulesAddon(ctx, errors) {
 
 	let stagedPath = null;
 	for (const filename of ctx.addonFilenames) {
-		const sourcePath = path.join(ctx.nativeDir, filename);
+		const sourcePath = path.join(ctx.leafPackageDir ?? ctx.nativeDir, filename);
 		const targetPath = path.join(ctx.versionedDir, filename);
 
 		if (fs.existsSync(targetPath)) {
@@ -316,6 +598,26 @@ function validateLoadedBindings(ctx, bindings, candidate) {
 	);
 }
 
+/**
+ * Install the addon's bounded Tokio runtime now that `dlopen` has returned and
+ * the dynamic-loader lock is released. The Rust `#[module_init]` deliberately
+ * does NOT build the runtime — spawning worker threads under the loader lock
+ * deadlocks on some hosts — so it exposes `__ompInstallTokioRuntime` for the
+ * loader to call once, before any async native runs. Best-effort: older addons
+ * predating this export simply fall back to napi-rs's default runtime.
+ */
+function installNativeTokioRuntime(bindings) {
+	const install = bindings.__ompInstallTokioRuntime;
+	if (typeof install !== "function") return;
+	try {
+		install();
+		startupMarker("native:tokioRuntime:installed");
+	} catch (err) {
+		startupMarker(`native:tokioRuntime:failed:${err instanceof Error ? err.message : String(err)}`);
+	}
+}
+
+
 function buildHelpMessage(ctx) {
 	if (ctx.isCompiledBinary) {
 		const expectedPaths = ctx.addonFilenames.map(filename => `  ${path.join(ctx.versionedDir, filename)}`).join("\n");
@@ -349,7 +651,8 @@ function initLoaderContext() {
 	const packageVersion = packageJson.version;
 	const nativeDir = path.join(import.meta.dir, "..", "native");
 	const execDir = path.dirname(process.execPath);
-	const versionedDir = path.join(getNativesDir(), packageVersion);
+	const nativesDir = getNativesDir();
+	const versionedDir = path.join(nativesDir, packageVersion);
 	const userDataDir =
 		process.platform === "win32"
 			? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "omp")
@@ -360,6 +663,7 @@ function initLoaderContext() {
 		env: process.env,
 		importMetaUrl: import.meta.url,
 	});
+	const leafPackageDir = isCompiledBinary ? null : resolveLeafPackageDir(platformTag);
 	const stageFromNodeModules = shouldStageNodeModulesAddon({
 		platform: process.platform,
 		isCompiledBinary,
@@ -375,6 +679,7 @@ function initLoaderContext() {
 		isCompiledBinary,
 		stageFromNodeModules,
 		nativeDir,
+		leafPackageDir,
 		execDir,
 		versionedDir,
 		userDataDir,
@@ -395,6 +700,7 @@ function initLoaderContext() {
 		platformTag,
 		packageVersion,
 		nativeDir,
+		leafPackageDir,
 		versionedDir,
 		isCompiledBinary,
 		stageFromNodeModules,
@@ -404,10 +710,12 @@ function initLoaderContext() {
 		candidates,
 		versionSentinelExport,
 		isWorkspaceLoad,
+		nativesDir,
 	};
 }
 
 export function loadNative() {
+	startupMarker("native:loadNative:start");
 	const ctx = initLoaderContext();
 	const require_ = createRequire(import.meta.url);
 
@@ -419,8 +727,12 @@ export function loadNative() {
 
 	for (const candidate of runtimeCandidates) {
 		try {
+			startupMarker(`native:require:${path.basename(candidate)}`);
 			const bindings = require_(candidate);
 			validateLoadedBindings(ctx, bindings, candidate);
+			installNativeTokioRuntime(bindings);
+	        cleanupStaleNativeVersions({ nativesDir: ctx.nativesDir, currentVersion: ctx.packageVersion });
+			startupMarker("native:loadNative:done");
 			return bindings;
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);

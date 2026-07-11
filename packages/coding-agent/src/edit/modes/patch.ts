@@ -9,14 +9,16 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { isEnoent } from "@oh-my-pi/pi-utils";
-import * as z from "zod/v4";
+import { type } from "arktype";
 import {
 	type FileDiagnosticsResult,
 	flushLspWritethroughBatch,
 	type WritethroughCallback,
 	type WritethroughDeferredHandle,
 } from "../../lsp";
+import { FileChangeType, notifyWorkspaceWatchedFiles } from "../../lsp/client";
 import type { ToolSession } from "../../tools";
+import { routeWriteThroughBridge } from "../../tools/acp-bridge";
 import { assertEditableFile } from "../../tools/auto-generated-guard";
 import {
 	invalidateFsScanAfterDelete,
@@ -40,12 +42,14 @@ import {
 	countLeadingWhitespace,
 	detectLineEnding,
 	getLeadingWhitespace,
+	normalizeForFuzzy,
 	normalizeToLF,
 	restoreLineEndings,
 	stripBom,
 } from "../normalize";
 import { readEditFileText, serializeEditFileText } from "../read-file";
 import type { EditToolDetails, LspBatchRequest } from "../renderer";
+import { pruneOversizedEditSnapshots } from "../snapshot-details";
 import {
 	type ContextLineResult,
 	DEFAULT_FUZZY_THRESHOLD,
@@ -93,6 +97,14 @@ export interface ApplyPatchOptions {
 	fuzzyThreshold?: number;
 	allowFuzzy?: boolean;
 	fs?: FileSystem;
+	/**
+	 * Permit `op: "create"` to replace an existing file (full-file overwrite).
+	 * The JSON `patch` edit mode sanctions create-as-overwrite for major
+	 * restructures (see prompts/tools/patch.md); the Codex `apply_patch`
+	 * envelope documents `*** Add File` as strictly non-overwriting and must
+	 * leave this unset.
+	 */
+	allowCreateOverwrite?: boolean;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -452,7 +464,8 @@ function trimCommonContext(oldLines: string[], newLines: string[]): HunkVariant 
 }
 
 function collapseConsecutiveSharedLines(oldLines: string[], newLines: string[]): HunkVariant | undefined {
-	const shared = new Set(oldLines.filter(line => newLines.includes(line)));
+	const newSet = new Set(newLines);
+	const shared = new Set(oldLines.filter(line => newSet.has(line)));
 	const collapse = (lines: string[]): string[] => {
 		const out: string[] = [];
 		let i = 0;
@@ -477,30 +490,31 @@ function collapseConsecutiveSharedLines(oldLines: string[], newLines: string[]):
 }
 
 function collapseRepeatedBlocks(oldLines: string[], newLines: string[]): HunkVariant | undefined {
-	const shared = new Set(oldLines.filter(line => newLines.includes(line)));
+	const newSet = new Set(newLines);
+	const shared = new Set(oldLines.filter(line => newSet.has(line)));
 	const collapse = (lines: string[]): string[] => {
 		const output = [...lines];
 		let changed = false;
 		let i = 0;
 		while (i < output.length) {
 			let collapsed = false;
-			for (let size = Math.floor((output.length - i) / 2); size >= 2; size--) {
-				const first = output.slice(i, i + size);
-				const second = output.slice(i + size, i + size * 2);
-				if (first.length !== second.length || first.length === 0) continue;
-				if (!first.every(line => shared.has(line))) continue;
-				let same = true;
-				for (let idx = 0; idx < size; idx++) {
-					if (first[idx] !== second[idx]) {
-						same = false;
+			// Only blocks whose lines are all shared are collapsible; if the first line
+			// is not shared no size can match, so skip the size search entirely.
+			if (shared.has(output[i])) {
+				for (let size = Math.floor((output.length - i) / 2); size >= 2; size--) {
+					let same = true;
+					for (let idx = 0; idx < size; idx++) {
+						if (output[i + idx] !== output[i + size + idx] || !shared.has(output[i + idx])) {
+							same = false;
+							break;
+						}
+					}
+					if (same) {
+						output.splice(i + size, size);
+						changed = true;
+						collapsed = true;
 						break;
 					}
-				}
-				if (same) {
-					output.splice(i + size, size);
-					changed = true;
-					collapsed = true;
-					break;
 				}
 			}
 			if (!collapsed) {
@@ -1008,6 +1022,41 @@ async function readExistingPatchFile(fileSystem: FileSystem, absolutePath: strin
 }
 
 /**
+ * A prefix/substring strategy matched pattern lines that cover only part of
+ * the corresponding file lines; replacing whole lines would silently drop the
+ * uncovered text the model never saw. Allow the replacement only when every
+ * discarded piece (normalized) survives somewhere in the hunk's new lines.
+ */
+function assertPartialMatchPreservesDiscardedText(
+	path: string,
+	pattern: string[],
+	matchedLines: string[],
+	newLines: string[],
+	matchStartIndex: number,
+): void {
+	let newLinesNorm: string | undefined;
+	for (let j = 0; j < pattern.length; j++) {
+		const lineNorm = normalizeForFuzzy(matchedLines[j]);
+		const patternNorm = normalizeForFuzzy(pattern[j]);
+		if (lineNorm === patternNorm) continue;
+		const at = lineNorm.indexOf(patternNorm);
+		if (at === -1) continue;
+		const discardedParts = [lineNorm.slice(0, at).trim(), lineNorm.slice(at + patternNorm.length).trim()];
+		for (const part of discardedParts) {
+			if (part.length === 0) continue;
+			newLinesNorm ??= newLines.map(normalizeForFuzzy).join("\n");
+			if (!newLinesNorm.includes(part)) {
+				throw new ApplyPatchError(
+					`Refusing partial-line match in ${path} at line ${matchStartIndex + j + 1}: ` +
+						`the file line also contains ${JSON.stringify(part)}, which the replacement would silently drop. ` +
+						`Provide the complete line in the hunk.`,
+				);
+			}
+		}
+	}
+}
+
+/**
  * Compute replacements needed to transform originalLines using the diff hunks.
  */
 function computeReplacements(
@@ -1253,6 +1302,18 @@ function computeReplacements(
 		if (searchResult.strategy === "fuzzy-dominant") {
 			const similarity = Math.round(searchResult.confidence * 100);
 			warnings.push(`Dominant fuzzy match selected in ${path} near line ${found + 1} (${similarity}% similar).`);
+		} else if (
+			searchResult.strategy === "comment-prefix" ||
+			searchResult.strategy === "prefix" ||
+			searchResult.strategy === "substring" ||
+			searchResult.strategy === "fuzzy" ||
+			searchResult.strategy === "character"
+		) {
+			const similarity = Math.round(searchResult.confidence * 100);
+			warnings.push(
+				`Inexact match in ${path} near line ${found + 1}: matched via ${searchResult.strategy} strategy ` +
+					`(${similarity}% similar). Re-read the file if the result is not what you intended.`,
+			);
 		}
 
 		// Reject if match is ambiguous (prefix/substring matching found multiple matches)
@@ -1303,6 +1364,10 @@ function computeReplacements(
 		if (isNoOp) {
 			lineIndex = found + pattern.length;
 			continue;
+		}
+
+		if (searchResult.strategy === "prefix" || searchResult.strategy === "substring") {
+			assertPartialMatchPreservesDiscardedText(path, pattern, actualMatchedLines, newSlice, found);
 		}
 
 		const adjustedNewLines = adjustLinesIndentation(pattern, actualMatchedLines, newSlice);
@@ -1425,6 +1490,7 @@ async function applyNormalizedPatch(input: PatchInput, options: ApplyPatchOption
 		fs = defaultFileSystem,
 		fuzzyThreshold = DEFAULT_FUZZY_THRESHOLD,
 		allowFuzzy = true,
+		allowCreateOverwrite = false,
 	} = options;
 
 	const resolvePath = (p: string): string => resolveToCwd(p, cwd);
@@ -1436,12 +1502,31 @@ async function applyNormalizedPatch(input: PatchInput, options: ApplyPatchOption
 		if (destPath === absolutePath) {
 			throw new ApplyPatchError("rename path is the same as source path");
 		}
+		// The `*** Move to` / rename contract is strictly non-overwriting:
+		// reject before the update path reads or writes anything, so both
+		// source and pre-existing destination remain untouched. Callers who
+		// really need to replace the destination must delete it in an
+		// earlier hunk.
+		if (await fs.exists(destPath)) {
+			throw new ApplyPatchError(`Cannot rename ${input.path} to ${input.rename}: destination already exists.`);
+		}
 	}
 
 	// Handle CREATE operation
 	if (op === "create") {
 		if (!input.diff) {
 			throw new ApplyPatchError("Create operation requires diff (file content)");
+		}
+		// The `*** Add File` contract of the apply_patch envelope is strictly
+		// non-overwriting: reject before mkdir/write so pre-existing content
+		// stays intact and the caller can re-issue as an explicit
+		// `*** Update File` (or a delete+add pair) if overwrite is genuinely
+		// intended. The JSON `patch` mode opts out via `allowCreateOverwrite`,
+		// where `op: "create"` doubles as a sanctioned full-file overwrite.
+		if (!allowCreateOverwrite && (await fs.exists(absolutePath))) {
+			throw new ApplyPatchError(
+				`Cannot create ${input.path}: file already exists. Use *** Update File to modify it in place.`,
+			);
 		}
 		// Strip + prefixes if present (handles diffs formatted as additions)
 		const normalizedContent = normalizeCreateContent(input.diff);
@@ -1548,7 +1633,7 @@ export async function previewPatch(input: PatchInput, options: ApplyPatchOptions
 export async function computePatchDiff(
 	input: PatchInput,
 	cwd: string,
-	options?: { fuzzyThreshold?: number; allowFuzzy?: boolean },
+	options?: { fuzzyThreshold?: number; allowFuzzy?: boolean; allowCreateOverwrite?: boolean },
 ): Promise<
 	| {
 			diff: string;
@@ -1563,6 +1648,7 @@ export async function computePatchDiff(
 			cwd,
 			fuzzyThreshold: options?.fuzzyThreshold,
 			allowFuzzy: options?.allowFuzzy,
+			allowCreateOverwrite: options?.allowCreateOverwrite,
 		});
 		const oldContent = result.change.oldContent ?? "";
 		const newContent = result.change.newContent ?? "";
@@ -1571,29 +1657,28 @@ export async function computePatchDiff(
 		if (!normalizedOld && !normalizedNew) {
 			return { diff: "", firstChangedLine: undefined };
 		}
-		return generateUnifiedDiffString(normalizedOld, normalizedNew);
+		return generateUnifiedDiffString(normalizedOld, normalizedNew, undefined, {
+			path: result.change.newPath ?? result.change.path,
+		});
 	} catch (err) {
 		return { error: err instanceof Error ? err.message : String(err) };
 	}
 }
 
-export const patchEditEntrySchema = z
-	.object({
-		op: z.enum(["create", "delete", "update"]).optional().describe("operation (default update)"),
-		rename: z.string().describe("new path for move").optional(),
-		diff: z.string().describe("diff hunks or full content for create").optional(),
-	})
-	.strict();
+export const patchEditEntrySchema = type({
+	"op?": "'create' | 'delete' | 'update'",
+	"rename?": "string",
+	"diff?": "string",
+});
 
-export const patchEditSchema = z
-	.object({
-		path: z.string().describe("file path"),
-		edits: z.array(patchEditEntrySchema).min(1).describe("patch operations"),
-	})
-	.strict();
+export type PatchEditEntry = typeof patchEditEntrySchema.infer;
 
-export type PatchEditEntry = z.infer<typeof patchEditEntrySchema>;
-export type PatchParams = z.infer<typeof patchEditSchema>;
+export const patchEditSchema = type({
+	path: "string",
+	edits: patchEditEntrySchema.array(),
+});
+
+export type PatchParams = typeof patchEditSchema.infer;
 
 export interface ExecutePatchSingleOptions {
 	session: ToolSession;
@@ -1603,6 +1688,8 @@ export interface ExecutePatchSingleOptions {
 	batchRequest?: LspBatchRequest;
 	allowFuzzy: boolean;
 	fuzzyThreshold: number;
+	/** See {@link ApplyPatchOptions.allowCreateOverwrite}; set by the JSON `patch` mode only. */
+	allowCreateOverwrite?: boolean;
 	writethrough: WritethroughCallback;
 	beginDeferredDiagnosticsForPath: (path: string) => WritethroughDeferredHandle;
 }
@@ -1612,6 +1699,8 @@ class LspFileSystem implements FileSystem {
 	#fileCache: Record<string, Bun.BunFile> = {};
 
 	constructor(
+		private readonly session: ToolSession,
+		private readonly requestedPath: string,
 		private readonly writethrough: WritethroughCallback,
 		private readonly signal?: AbortSignal,
 		private readonly batchRequest?: LspBatchRequest,
@@ -1641,8 +1730,14 @@ class LspFileSystem implements FileSystem {
 	}
 
 	async write(path: string, content: string): Promise<void> {
-		const file = this.#getFile(path);
 		const finalContent = await serializeEditFileText(path, path, content);
+
+		// Route through ACP bridge when available; skips internal artifacts and local:// paths.
+		if (await routeWriteThroughBridge(this.session, this.requestedPath, path, finalContent, this.signal)) {
+			return;
+		}
+
+		const file = this.#getFile(path);
 		const deferredForPath = this.deferredForPath;
 		const result = await this.writethrough(
 			path,
@@ -1659,6 +1754,13 @@ class LspFileSystem implements FileSystem {
 
 	async delete(path: string): Promise<void> {
 		await this.#getFile(path).unlink();
+		if (this.session.enableLsp ?? true) {
+			await notifyWorkspaceWatchedFiles(
+				this.session.cwd,
+				[{ filePath: path, type: FileChangeType.Deleted }],
+				this.signal,
+			);
+		}
 	}
 
 	async mkdir(path: string): Promise<void> {
@@ -1702,6 +1804,7 @@ export async function executePatchSingle(
 		batchRequest,
 		allowFuzzy,
 		fuzzyThreshold,
+		allowCreateOverwrite,
 		writethrough,
 		beginDeferredDiagnosticsForPath,
 	} = options;
@@ -1734,12 +1837,20 @@ export async function executePatchSingle(
 	}
 
 	const input: PatchInput = { path: resolvedPath, op, rename: resolvedRename, diff };
-	const patchFileSystem = new LspFileSystem(writethrough, signal, batchRequest, beginDeferredDiagnosticsForPath);
+	const patchFileSystem = new LspFileSystem(
+		session,
+		path, // original user-provided path for bridge guard (may be local://, vault://, etc.)
+		writethrough,
+		signal,
+		batchRequest,
+		beginDeferredDiagnosticsForPath,
+	);
 	const result = await applyPatch(input, {
 		cwd: session.cwd,
 		fs: patchFileSystem,
 		fuzzyThreshold,
 		allowFuzzy,
+		allowCreateOverwrite,
 	});
 
 	// Post-write verification: only meaningful for in-place updates where the
@@ -1763,7 +1874,7 @@ export async function executePatchSingle(
 			postEditContent.length === preEditContent.length &&
 			postEditContent.every((b, i) => b === preEditContent[i]);
 		if (unchanged) {
-			throw new ToolError(`edit appeared successful but file content did not change on disk: ${resolvedPath}`, {
+			throw new ToolError(`edit appeared successful but file content did not change on disk: ${path}`, {
 				path: resolvedPath,
 			});
 		}
@@ -1782,10 +1893,21 @@ export async function executePatchSingle(
 		diff: "",
 		firstChangedLine: undefined,
 	};
-	if (result.change.type === "update" && result.change.oldContent && result.change.newContent) {
+	if (
+		result.change.type === "update" &&
+		result.change.oldContent !== undefined &&
+		result.change.newContent !== undefined
+	) {
 		const normalizedOld = normalizeToLF(stripBom(result.change.oldContent).text);
 		const normalizedNew = normalizeToLF(stripBom(result.change.newContent).text);
-		diffResult = generateUnifiedDiffString(normalizedOld, normalizedNew);
+		diffResult = generateUnifiedDiffString(normalizedOld, normalizedNew, undefined, {
+			path: result.change.newPath ?? result.change.path,
+		});
+	} else if (result.change.type === "create" && result.change.newContent !== undefined) {
+		// The result is authoritative for rendering, so emit the added-content
+		// diff here rather than relying on the call-phase streaming preview.
+		const normalizedNew = normalizeToLF(stripBom(result.change.newContent).text);
+		diffResult = generateUnifiedDiffString("", normalizedNew, undefined, { path: result.change.path });
 	}
 
 	let resultText: string;
@@ -1816,7 +1938,7 @@ export async function executePatchSingle(
 
 	return {
 		content: [{ type: "text", text: resultText }],
-		details: {
+		details: pruneOversizedEditSnapshots({
 			diff: diffResult.diff,
 			// When the patch moves the file, anchor the diff to the destination
 			// path. ACP `ToolCallContent.diff.path` comes from this field, and
@@ -1827,9 +1949,10 @@ export async function executePatchSingle(
 			diagnostics: mergedDiagnostics,
 			op,
 			move: effectiveRename,
+			sourcePath: result.change.newPath ? resolvedPath : undefined,
 			meta,
 			oldText,
 			newText,
-		},
+		}),
 	};
 }

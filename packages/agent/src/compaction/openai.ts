@@ -1,9 +1,12 @@
 /**
  * Remote compaction utilities.
  *
- * Provider-side conversation summarization endpoints. Two flavors:
+ * Provider-side conversation summarization endpoints. Three flavors:
  *
- * - **OpenAI remote compaction** (`/responses/compact`): preserves encrypted
+ * - **OpenAI remote compaction V2** (Responses streaming): appends a
+ *   `compaction_trigger` input item to the normal stream and stores the returned
+ *   `compaction` item with retained real user messages in `preserveData`.
+ * - **OpenAI remote compaction V1** (`/responses/compact`): preserves encrypted
  *   reasoning across compactions by submitting the full responses-API native
  *   history and storing the returned `compaction` / `compaction_summary`
  *   item in `preserveData` so future turns can replay the encrypted state.
@@ -12,27 +15,62 @@
  *   with `{ summary, shortSummary? }`.
  */
 
+import { ProviderHttpError } from "@oh-my-pi/pi-ai/error";
+import { applyCodexResponsesLiteShape } from "@oh-my-pi/pi-ai/providers/openai-codex/request-transformer";
 import {
-	CODEX_BASE_URL,
-	getCodexAccountId,
-	OPENAI_HEADER_VALUES,
-	OPENAI_HEADERS,
-} from "@oh-my-pi/pi-ai/providers/openai-codex/constants";
-import { parseTextSignature } from "@oh-my-pi/pi-ai/providers/openai-responses-shared";
+	createOpenAICodexCompactionRequestContext,
+	createOpenAICodexCompatibilityMetadata,
+} from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import { parseAzureDeploymentNameMap, parseTextSignature } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { transformMessages } from "@oh-my-pi/pi-ai/providers/transform-messages";
-import type { AssistantMessage, Message, Model } from "@oh-my-pi/pi-ai/types";
+import type {
+	Api,
+	AssistantMessage,
+	CodexCompactionContext,
+	FetchImpl,
+	Message,
+	Model,
+	ProviderSessionState,
+} from "@oh-my-pi/pi-ai/types";
 import {
 	getOpenAIResponsesHistoryItems,
 	getOpenAIResponsesHistoryPayload,
 	normalizeResponsesToolCallId,
 } from "@oh-my-pi/pi-ai/utils";
-import { logger } from "@oh-my-pi/pi-utils";
+import {
+	CODEX_BASE_URL,
+	getCodexAccountId,
+	OPENAI_HEADER_VALUES,
+	OPENAI_HEADERS,
+} from "@oh-my-pi/pi-catalog/wire/codex";
+import { $env, logger, stringifyJson } from "@oh-my-pi/pi-utils";
+
+export * from "./compaction-v2-streaming";
 
 // ============================================================================
 // Public types
 // ============================================================================
 
 export const OPENAI_REMOTE_COMPACTION_PRESERVE_KEY = "openaiRemoteCompaction";
+
+/**
+ * Hard ceiling on remote compaction HTTP requests. Unlike every provider
+ * stream (guarded by first-event/idle watchdogs in pi-ai), these are raw
+ * fetches awaiting one non-streamed JSON body — a connection silently dropped
+ * by a middlebox would otherwise hang the whole compaction pipeline forever
+ * (frozen "Auto context-full maintenance…" spinner, manual /compact queueing
+ * behind it). On timeout the caller falls back to local summarization.
+ */
+export const REMOTE_COMPACTION_TIMEOUT_MS = 180_000;
+
+const DEFAULT_AZURE_API_VERSION = "v1";
+
+/** Race the caller's signal against the request timeout; `timeoutMs <= 0` disables the watchdog. */
+function withRequestTimeout(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal | undefined {
+	if (timeoutMs <= 0) return signal;
+	const timeout = AbortSignal.timeout(timeoutMs);
+	return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
 
 export type OpenAiRemoteCompactionItem = {
 	type: "compaction" | "compaction_summary";
@@ -50,6 +88,11 @@ export interface OpenAiRemoteCompactionRequest {
 	model: string;
 	input: Array<Record<string, unknown>>;
 	instructions: string;
+	reasoning?: {
+		context?: string;
+		[key: string]: unknown;
+	};
+	include?: string[];
 }
 
 export interface OpenAiRemoteCompactionResponse extends OpenAiRemoteCompactionPreserveData {}
@@ -68,12 +111,25 @@ export interface RemoteCompactionResponse {
 // OpenAI provider gating + endpoint resolution
 // ============================================================================
 
+function isOpenAiRemoteCompactionApi(api: Api | undefined): boolean {
+	return api === "openai-responses" || api === "azure-openai-responses" || api === "openai-codex-responses";
+}
+
 export function shouldUseOpenAiRemoteCompaction(model: Model): boolean {
-	return model.provider === "openai" || model.provider === "openai-codex";
+	if (model.remoteCompaction?.enabled === false) return false;
+	if (model.provider === "openai" || model.provider === "openai-codex") return true;
+	if (model.remoteCompaction?.enabled !== true) return false;
+	return isOpenAiRemoteCompactionApi(model.remoteCompaction.api ?? model.api);
 }
 
 function resolveOpenAiCompactEndpoint(model: Model): string {
-	if (model.provider === "openai-codex") {
+	const configuredEndpoint = model.remoteCompaction?.endpoint;
+	const compactionApi = model.remoteCompaction?.api ?? model.api;
+	if (compactionApi === "azure-openai-responses") {
+		return resolveAzureOpenAiCompactEndpoint(model, configuredEndpoint);
+	}
+	if (configuredEndpoint && configuredEndpoint.length > 0) return configuredEndpoint;
+	if (model.provider === "openai-codex" || compactionApi === "openai-codex-responses") {
 		return resolveOpenAiCodexCompactEndpoint(model.baseUrl);
 	}
 
@@ -82,6 +138,41 @@ function resolveOpenAiCompactEndpoint(model: Model): string {
 	const normalizedBase = rawBase.endsWith("/") ? rawBase.slice(0, -1) : rawBase;
 	if (normalizedBase.endsWith("/v1")) return `${normalizedBase}/responses/compact`;
 	return `${normalizedBase}/v1/responses/compact`;
+}
+
+function resolveAzureOpenAiCompactEndpoint(model: Model, configuredEndpoint: string | undefined): string {
+	const endpoint =
+		configuredEndpoint && configuredEndpoint.length > 0
+			? configuredEndpoint
+			: `${resolveAzureOpenAiBaseUrl(model)}/responses/compact`;
+	return appendAzureApiVersion(endpoint);
+}
+
+function resolveAzureOpenAiBaseUrl(model: Model): string {
+	const baseUrl = $env.AZURE_OPENAI_BASE_URL?.trim() || undefined;
+	const resourceName = $env.AZURE_OPENAI_RESOURCE_NAME;
+	const resolvedBaseUrl =
+		baseUrl ?? (resourceName ? `https://${resourceName}.openai.azure.com/openai/v1` : undefined) ?? model.baseUrl;
+	if (!resolvedBaseUrl) {
+		throw new Error(
+			"Azure OpenAI base URL is required. Set AZURE_OPENAI_BASE_URL or AZURE_OPENAI_RESOURCE_NAME, or configure model.baseUrl.",
+		);
+	}
+	return resolvedBaseUrl.replace(/\/+$/, "");
+}
+
+function appendAzureApiVersion(endpoint: string): string {
+	if (/[?&]api-version=/.test(endpoint)) return endpoint;
+	const separator = endpoint.includes("?") ? "&" : "?";
+	return `${endpoint}${separator}api-version=${encodeURIComponent($env.AZURE_OPENAI_API_VERSION || DEFAULT_AZURE_API_VERSION)}`;
+}
+
+function resolveOpenAiCompactModel(model: Model): string {
+	const requestModel = model.remoteCompaction?.model ?? model.requestModelId ?? model.id;
+	const compactionApi = model.remoteCompaction?.api ?? model.api;
+	if (compactionApi !== "azure-openai-responses") return requestModel;
+	const mappedDeployment = parseAzureDeploymentNameMap($env.AZURE_OPENAI_DEPLOYMENT_NAME_MAP).get(requestModel);
+	return mappedDeployment ?? requestModel;
 }
 
 function resolveOpenAiCodexCompactEndpoint(baseUrl: string | undefined): string {
@@ -146,98 +237,33 @@ export function withOpenAiRemoteCompactionPreserveData(
 // Input/output filtering for OpenAI compact endpoint
 // ============================================================================
 
-function estimateOpenAiCompactInputTokens(input: Array<Record<string, unknown>>, instructions: string): number {
-	let chars = instructions.length;
-	for (const item of input) {
-		chars += JSON.stringify(item).length;
-	}
-	return Math.ceil(chars / 4);
-}
-
-function shouldTrimOpenAiCompactInputItem(item: Record<string, unknown>): boolean {
-	return item.type === "function_call_output" || (item.type === "message" && item.role === "developer");
-}
-
-function shouldKeepOpenAiCompactOutputUserMessage(item: Record<string, unknown>): boolean {
-	if (item.role !== "user") return false;
-	const content = item.content;
-	if (!Array.isArray(content) || content.length === 0) return false;
-	const contextualFragmentPatterns = [
-		[/^<system-reminder>[\s\S]*<\/system-reminder>$/i, /<system-reminder>/i],
-		[/^#\s*AGENTS\.md instructions for\b[\s\S]*<\/INSTRUCTIONS>$/i, /# AGENTS.md instructions/],
-		[/^<environment-context>[\s\S]*<\/environment-context>$/i, /<environment-context>/i],
-		[/^<skill>[\s\S]*<\/skill>$/i, /<skill>/i],
-		[/^<user-shell-command>[\s\S]*<\/user-shell-command>$/i, /<user-shell-command>/i],
-		[/^<turn-aborted>[\s\S]*<\/turn-aborted>$/i, /<turn-aborted>/i],
-		[/^<subagent-notification>[\s\S]*<\/subagent-notification>$/i, /<subagent-notification>/i],
-	] as const;
-	return content.every(part => {
-		if (!part || typeof part !== "object") return false;
-		const candidate = part as { type?: unknown; text?: unknown };
-		if (candidate.type === "input_image") return true;
-		if (candidate.type !== "input_text" || typeof candidate.text !== "string") return false;
-		const trimmed = candidate.text.trim();
-		if (trimmed.length === 0) return false;
-		return !contextualFragmentPatterns.some(([strictPattern, markerPattern]) => {
-			return strictPattern.test(trimmed) || markerPattern.test(trimmed);
-		});
-	});
-}
-
 function shouldKeepOpenAiCompactOutputItem(item: Record<string, unknown>): boolean {
 	if (item.type === "compaction" || item.type === "compaction_summary") return true;
 	if (item.type !== "message") return false;
-	if (item.role === "developer") return false;
-	if (item.role === "assistant") return true;
-	return shouldKeepOpenAiCompactOutputUserMessage(item);
+	return item.role === "assistant" || item.role === "user";
 }
 
-function trimOpenAiCompactInput(
-	input: Array<Record<string, unknown>>,
-	contextWindow: number,
-	instructions: string,
-): Array<Record<string, unknown>> {
-	const trimmed = [...input];
-	while (trimmed.length > 0 && estimateOpenAiCompactInputTokens(trimmed, instructions) > contextWindow) {
-		const last = trimmed[trimmed.length - 1];
-		if (last?.type === "function_call_output" || last?.type === "custom_tool_call_output") {
-			const callId = typeof last.call_id === "string" ? last.call_id : undefined;
-			const callType = last.type === "custom_tool_call_output" ? "custom_tool_call" : "function_call";
-			trimmed.pop();
-			if (callId) {
-				const matchingCallIndex = trimmed.findLastIndex(item => item.type === callType && item.call_id === callId);
-				if (matchingCallIndex >= 0) {
-					trimmed.splice(matchingCallIndex, 1);
-				}
-			}
-			continue;
-		}
-		if (!last || !shouldTrimOpenAiCompactInputItem(last)) {
-			break;
-		}
-		trimmed.pop();
-	}
-	return trimmed;
-}
-
-function collectKnownOpenAiCallIds(items: Array<Record<string, unknown>>): Set<string> {
-	const knownCallIds = new Set<string>();
+// Register every tool-call id in `items` (and the subset using the custom-tool
+// wire shape) into the running sets. The history builder maintains both sets
+// incrementally as native history is appended, so this only scans the
+// newly-added items (or, after a full-snapshot replace, the fresh input) rather
+// than re-scanning the whole growing history per message — the latter was
+// O(N²) and blocked the event loop for seconds while compacting large codex
+// contexts (frozen spinner until the next forced render).
+function addOpenAiCallIds(
+	items: Array<Record<string, unknown>>,
+	knownCallIds: Set<string>,
+	customCallIds: Set<string>,
+): void {
 	for (const item of items) {
-		if ((item.type === "function_call" || item.type === "custom_tool_call") && typeof item.call_id === "string") {
+		if (typeof item.call_id !== "string") continue;
+		if (item.type === "function_call") {
 			knownCallIds.add(item.call_id);
-		}
-	}
-	return knownCallIds;
-}
-
-function collectCustomOpenAiCallIds(items: Array<Record<string, unknown>>): Set<string> {
-	const customCallIds = new Set<string>();
-	for (const item of items) {
-		if (item.type === "custom_tool_call" && typeof item.call_id === "string") {
+		} else if (item.type === "custom_tool_call") {
+			knownCallIds.add(item.call_id);
 			customCallIds.add(item.call_id);
 		}
 	}
-	return customCallIds;
 }
 
 // ============================================================================
@@ -265,16 +291,16 @@ export function buildOpenAiNativeHistory(
 	const transformedMessages = transformMessages(messages, model, id => normalizeOpenAiCompactionToolCallId(id));
 
 	let msgIndex = 0;
-	let knownCallIds = collectKnownOpenAiCallIds(input);
-	let customCallIds = collectCustomOpenAiCallIds(input);
+	const knownCallIds = new Set<string>();
+	const customCallIds = new Set<string>();
+	addOpenAiCallIds(input, knownCallIds, customCallIds);
 	for (const message of transformedMessages) {
 		if (message.role === "user" || message.role === "developer") {
 			const providerPayload = (message as { providerPayload?: AssistantMessage["providerPayload"] }).providerPayload;
 			const historyItems = getOpenAIResponsesHistoryItems(providerPayload, model.provider);
 			if (historyItems) {
 				input.push(...historyItems);
-				knownCallIds = collectKnownOpenAiCallIds(input);
-				customCallIds = collectCustomOpenAiCallIds(input);
+				addOpenAiCallIds(historyItems, knownCallIds, customCallIds);
 				msgIndex++;
 				continue;
 			}
@@ -317,11 +343,13 @@ export function buildOpenAiNativeHistory(
 			if (providerPayload) {
 				if (providerPayload.dt) {
 					input.push(...providerPayload.items);
+					addOpenAiCallIds(providerPayload.items, knownCallIds, customCallIds);
 				} else {
 					input.splice(0, input.length, ...providerPayload.items);
+					knownCallIds.clear();
+					customCallIds.clear();
+					addOpenAiCallIds(input, knownCallIds, customCallIds);
 				}
-				knownCallIds = collectKnownOpenAiCallIds(input);
-				customCallIds = collectCustomOpenAiCallIds(input);
 				msgIndex++;
 				continue;
 			}
@@ -391,7 +419,7 @@ export function buildOpenAiNativeHistory(
 						id: itemId,
 						call_id: normalized.callId,
 						name: block.name,
-						arguments: JSON.stringify(block.arguments),
+						arguments: stringifyJson(block.arguments) ?? "null",
 					});
 				}
 			}
@@ -444,41 +472,85 @@ export function buildOpenAiNativeHistory(
 // ============================================================================
 // Endpoint requests
 // ============================================================================
-
 export async function requestOpenAiRemoteCompaction(
 	model: Model,
 	apiKey: string,
 	compactInput: Array<Record<string, unknown>>,
 	instructions: string,
 	signal?: AbortSignal,
+	opts?: {
+		fetch?: FetchImpl;
+		timeoutMs?: number;
+		sessionId?: string;
+		providerSessionState?: Map<string, ProviderSessionState>;
+		codexCompaction?: CodexCompactionContext;
+	},
 ): Promise<OpenAiRemoteCompactionResponse> {
 	const endpoint = resolveOpenAiCompactEndpoint(model);
+	const requestModel = resolveOpenAiCompactModel(model);
 	const request: OpenAiRemoteCompactionRequest = {
-		model: model.id,
-		input: trimOpenAiCompactInput(compactInput, model.contextWindow, instructions),
+		model: requestModel,
+		// Send full history to the endpoint - don't trim locally.
+		// The provider handles compression via the compaction endpoint.
+		// Trimming before sending loses assistant messages and thinking blocks.
+		input: compactInput,
 		instructions,
 	};
-	const headers: Record<string, string> = {
-		"content-type": "application/json",
-		Authorization: `Bearer ${apiKey}`,
-		...(model.headers ?? {}),
-	};
+	const isAzureOpenAiResponses = (model.remoteCompaction?.api ?? model.api) === "azure-openai-responses";
+	const isCodexResponses =
+		model.provider === "openai-codex" || (model.remoteCompaction?.api ?? model.api) === "openai-codex-responses";
+	const headers: Record<string, string> = isAzureOpenAiResponses
+		? {
+				"content-type": "application/json",
+				"api-key": apiKey,
+				...(model.headers ?? {}),
+			}
+		: {
+				"content-type": "application/json",
+				Authorization: `Bearer ${apiKey}`,
+				...(model.headers ?? {}),
+			};
 
 	// Codex endpoints require additional auth headers
-	if (model.provider === "openai-codex") {
+	if (isCodexResponses) {
 		const accountId = getCodexAccountId(apiKey);
 		if (accountId) {
 			headers[OPENAI_HEADERS.ACCOUNT_ID] = accountId;
 		}
 		headers[OPENAI_HEADERS.BETA] = OPENAI_HEADER_VALUES.BETA_RESPONSES;
 		headers[OPENAI_HEADERS.ORIGINATOR] = OPENAI_HEADER_VALUES.ORIGINATOR_CODEX;
+		Object.assign(
+			headers,
+			createOpenAICodexCompatibilityMetadata({
+				sessionId: opts?.sessionId,
+				providerSessionState: opts?.providerSessionState,
+				requestKind: "compaction",
+				compaction: createOpenAICodexCompactionRequestContext({
+					context: opts?.codexCompaction,
+					implementation: "responses_compact",
+				}),
+				includeInstallationHeader: true,
+			}).headers,
+		);
+		// Responses Lite models take the same rewrite on `/responses/compact`:
+		// instructions ride as an input item and the lite marker header is set
+		// (codex-rs routes compaction through `build_responses_request`).
+		if (model.useResponsesLite) {
+			applyCodexResponsesLiteShape(request);
+			headers[OPENAI_HEADERS.RESPONSES_LITE] = "true";
+			request.reasoning = {
+				...request.reasoning,
+				context: "all_turns",
+			};
+			request.include = Array.from(new Set([...(request.include ?? []), "reasoning.encrypted_content"]));
+		}
 	}
 
-	const response = await fetch(endpoint, {
+	const response = await (opts?.fetch ?? fetch)(endpoint, {
 		method: "POST",
 		headers,
-		body: JSON.stringify(request),
-		signal,
+		body: stringifyJson(request),
+		signal: withRequestTimeout(signal, opts?.timeoutMs ?? REMOTE_COMPACTION_TIMEOUT_MS),
 	});
 
 	if (!response.ok) {
@@ -489,7 +561,13 @@ export async function requestOpenAiRemoteCompaction(
 			statusText: response.statusText,
 			errorText,
 		});
-		throw new Error(`Remote compaction failed (${response.status} ${response.statusText})`);
+		throw new ProviderHttpError(
+			`Remote compaction failed (${response.status} ${response.statusText})`,
+			response.status,
+			{
+				headers: response.headers,
+			},
+		);
 	}
 
 	const data = (await response.json()) as { output?: unknown[] } | undefined;
@@ -520,16 +598,56 @@ export async function requestOpenAiRemoteCompaction(
 	return { provider: model.provider, replacementHistory, compactionItem };
 }
 
+/**
+ * Generic remote-compaction POST. Two wire shapes are auto-selected by
+ * endpoint suffix so a single `compaction.remoteEndpoint` setting can point at
+ * either a purpose-built omp summarizer (`{systemPrompt, prompt}` → `{summary}`)
+ * or any OpenAI-compatible chat-completions server (`/chat/completions`,
+ * `/v1/chat/completions`, …) as reported for llama.cpp / vLLM / etc. in
+ * issue #4630: without this, the omp payload was rejected with
+ * HTTP 400 `"'messages' is required"`, compaction silently fell back to
+ * local summarization, and context grew unbounded.
+ *
+ * When `context.model` is provided the chat-completions body is tagged with
+ * that model's wire id (llama.cpp requires the field) and `context.apiKey` is
+ * forwarded as `Authorization: Bearer`. Callers wrap this in `withAuth` so
+ * 401s force-refresh through the standard credential rotation policy.
+ */
 export async function requestRemoteCompaction(
 	endpoint: string,
 	request: RemoteCompactionRequest,
 	signal?: AbortSignal,
+	opts?: { fetch?: FetchImpl; timeoutMs?: number; model?: Model; apiKey?: string },
 ): Promise<RemoteCompactionResponse> {
-	const response = await fetch(endpoint, {
+	let endpointPath = endpoint;
+	try {
+		endpointPath = new URL(endpoint).pathname;
+	} catch {
+		// Keep the raw endpoint for relative/custom fetch implementations.
+	}
+	const isChatCompletions = /\/chat\/completions\/?$/.test(endpointPath);
+	const headers: Record<string, string> = { "content-type": "application/json" };
+	if (isChatCompletions) {
+		if (opts?.apiKey) headers.Authorization = `Bearer ${opts.apiKey}`;
+		if (opts?.model?.headers) Object.assign(headers, opts.model.headers);
+	}
+
+	const body: Record<string, unknown> = isChatCompletions
+		? {
+				model: opts?.model ? resolveOpenAiCompactModel(opts.model) : undefined,
+				messages: [
+					{ role: "system", content: request.systemPrompt },
+					{ role: "user", content: request.prompt },
+				],
+				stream: false,
+			}
+		: { systemPrompt: request.systemPrompt, prompt: request.prompt };
+
+	const response = await (opts?.fetch ?? fetch)(endpoint, {
 		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify(request),
-		signal,
+		headers,
+		body: stringifyJson(body),
+		signal: withRequestTimeout(signal, opts?.timeoutMs ?? REMOTE_COMPACTION_TIMEOUT_MS),
 	});
 
 	if (!response.ok) {
@@ -540,7 +658,38 @@ export async function requestRemoteCompaction(
 			statusText: response.statusText,
 			errorText,
 		});
-		throw new Error(`Remote compaction failed (${response.status} ${response.statusText})`);
+		throw new ProviderHttpError(
+			`Remote compaction failed (${response.status} ${response.statusText})`,
+			response.status,
+			{
+				headers: response.headers,
+			},
+		);
+	}
+
+	if (isChatCompletions) {
+		type ChatCompletionsResponse = {
+			choices?: Array<{
+				message?: {
+					content?: string | Array<{ type?: string; text?: string }> | null;
+				};
+			}>;
+		};
+		const data = (await response.json()) as ChatCompletionsResponse | undefined;
+		const choice = data?.choices?.[0]?.message?.content;
+		let summary: string | undefined;
+		if (typeof choice === "string") {
+			summary = choice;
+		} else if (Array.isArray(choice)) {
+			summary = choice
+				.filter((part): part is { type?: string; text: string } => typeof part?.text === "string")
+				.map(part => part.text)
+				.join("");
+		}
+		if (typeof summary !== "string" || summary.length === 0) {
+			throw new Error("Remote compaction response missing choices[0].message.content");
+		}
+		return { summary };
 	}
 
 	const data = (await response.json()) as RemoteCompactionResponse | undefined;

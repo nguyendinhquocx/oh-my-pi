@@ -12,6 +12,8 @@ to short-circuit the network.
 from __future__ import annotations
 
 import json
+import asyncio
+import time
 import logging
 from collections.abc import Mapping
 from pathlib import Path
@@ -25,6 +27,7 @@ from robomp.github_client import (
     GitHubError,
     IssueInfo,
     IssueSummary,
+    PullRequestFileInfo,
     PullRequestInfo,
     PullRequestReviewInfo,
     ReactionInfo,
@@ -117,6 +120,8 @@ class GitHubProxyClient:
             timeout=self._timeout,
         )
 
+    _TRANSIENT_RETRY_DELAYS = (1.0, 3.0, 10.0)
+
     async def _request(
         self,
         method: str,
@@ -126,30 +131,38 @@ class GitHubProxyClient:
         json_body: Mapping[str, Any] | None = None,
     ) -> Any:
         body_bytes = b"" if json_body is None else json.dumps(json_body).encode("utf-8")
-        async with self._async_client() as client:
-            # Build the request first so httpx canonicalizes the URL once;
-            # we then sign against the encoded query string the wire will
-            # carry. Signing before this point would mean re-implementing
-            # httpx's param encoding, with a high risk of byte-level drift
-            # from the server's `request.url.query`.
-            req = client.build_request(
-                method,
-                path,
-                params=params,
-                content=body_bytes if json_body is not None else None,
-            )
-            target = req.url.path
-            if req.url.query:
-                target = f"{target}?{req.url.query.decode('ascii')}"
-            req.headers.update(_signed_headers(method, target, body_bytes, self._key))
-            if json_body is not None:
-                req.headers["Content-Type"] = "application/json"
-            resp = await client.send(req)
-        if resp.status_code >= 400:
-            raise _decode_error(resp)
-        if resp.status_code == 204 or not resp.content:
-            return None
-        return resp.json()
+        last_exc: Exception | None = None
+        for attempt, delay in enumerate((*self._TRANSIENT_RETRY_DELAYS, None)):
+            try:
+                async with self._async_client() as client:
+                    req = client.build_request(
+                        method,
+                        path,
+                        params=params,
+                        content=body_bytes if json_body is not None else None,
+                    )
+                    target = req.url.path
+                    if req.url.query:
+                        target = f"{target}?{req.url.query.decode('ascii')}"
+                    req.headers.update(_signed_headers(method, target, body_bytes, self._key))
+                    if json_body is not None:
+                        req.headers["Content-Type"] = "application/json"
+                    resp = await client.send(req)
+                if resp.status_code >= 400:
+                    raise _decode_error(resp)
+                if resp.status_code == 204 or not resp.content:
+                    return None
+                return resp.json()
+            except (httpx.ConnectError, httpx.TimeoutException) as exc:
+                last_exc = exc
+                if delay is None:
+                    break
+                log.warning(
+                    "proxy client transient error, retrying",
+                    extra={"method": method, "path": path, "attempt": attempt + 1, "delay": delay, "error": str(exc)},
+                )
+                await asyncio.sleep(delay)
+        raise last_exc  # type: ignore[misc]
 
     # ---- reads ----
     async def get_repo(self, repo: str) -> RepoInfo:
@@ -168,6 +181,14 @@ class GitHubProxyClient:
     async def get_pull_request(self, repo: str, number: int) -> PullRequestInfo:
         data = await self._request("GET", "/gh/v1/pull_request", params={"repo": repo, "number": number})
         return _pr_from(data)
+
+    async def list_pr_files(self, repo: str, pr_number: int) -> list[PullRequestFileInfo]:
+        data = await self._request(
+            "GET",
+            "/gh/v1/pr_files",
+            params={"repo": repo, "pr_number": pr_number},
+        )
+        return [_pr_file_from(item) for item in (data.get("items") if isinstance(data, dict) else None) or []]
 
     async def list_issues(
         self,
@@ -273,6 +294,37 @@ class GitHubProxyClient:
         )
         return tuple(str(lbl) for lbl in (data.get("labels") if isinstance(data, dict) else None) or [])
 
+    async def remove_issue_label(self, repo: str, number: int, label: str) -> None:
+        if not label:
+            return
+        await self._request(
+            "POST",
+            "/gh/v1/remove_issue_label",
+            json_body={"repo": repo, "number": number, "label": label},
+        )
+
+    async def submit_pr_review(
+        self,
+        *,
+        repo: str,
+        pr_number: int,
+        body: str,
+        event: str,
+        comments: list[Mapping[str, Any]],
+    ) -> PullRequestReviewInfo:
+        data = await self._request(
+            "POST",
+            "/gh/v1/submit_pr_review",
+            json_body={
+                "repo": repo,
+                "pr_number": pr_number,
+                "body": body,
+                "event": event,
+                "comments": comments,
+            },
+        )
+        return _pr_review_from(data)
+
     async def add_assignees(self, repo: str, number: int, assignees: list[str]) -> None:
         if not assignees:
             return
@@ -332,18 +384,33 @@ class ProxyGitTransport:
             timeout=self._timeout,
         )
 
+    _TRANSIENT_RETRY_DELAYS = (2.0, 5.0, 15.0)
+
     def _post(self, path: str, body: Mapping[str, Any]) -> Mapping[str, Any]:
         body_bytes = json.dumps(body).encode("utf-8")
-        headers = _signed_headers("POST", path, body_bytes, self._key)
-        headers["Content-Type"] = "application/json"
-        with self._client() as client:
-            resp = client.request("POST", path, content=body_bytes, headers=headers)
-        if resp.status_code >= 400:
-            raise _decode_error(resp)
-        if resp.status_code == 204 or not resp.content:
-            return {}
-        data = resp.json()
-        return data if isinstance(data, dict) else {}
+        last_exc: Exception | None = None
+        for attempt, delay in enumerate((*self._TRANSIENT_RETRY_DELAYS, None)):
+            try:
+                headers = _signed_headers("POST", path, body_bytes, self._key)
+                headers["Content-Type"] = "application/json"
+                with self._client() as client:
+                    resp = client.request("POST", path, content=body_bytes, headers=headers)
+                if resp.status_code >= 400:
+                    raise _decode_error(resp)
+                if resp.status_code == 204 or not resp.content:
+                    return {}
+                data = resp.json()
+                return data if isinstance(data, dict) else {}
+            except (httpx.ConnectError, httpx.TimeoutException) as exc:
+                last_exc = exc
+                if delay is None:
+                    break
+                log.warning(
+                    "proxy transport transient error, retrying",
+                    extra={"path": path, "attempt": attempt + 1, "delay": delay, "error": str(exc)},
+                )
+                time.sleep(delay)
+        raise last_exc  # type: ignore[misc]
 
     def clone_pool(self, *, repo: str, clone_url: str, default_branch: str, target: Path) -> None:
         del target  # remote-resolved on the proxy side from `repo`
@@ -359,6 +426,10 @@ class ProxyGitTransport:
     def fetch_base_ref(self, *, repo: str, pool_dir: Path, ref: str) -> None:
         del pool_dir
         self._post("/gh/v1/git/fetch_ref", {"repo": repo, "ref": ref})
+
+    def fetch_pr_head(self, *, repo: str, pool_dir: Path, pr_number: int) -> None:
+        del pool_dir
+        self._post("/gh/v1/git/fetch_pr_head", {"repo": repo, "pr_number": pr_number})
 
     def push_branch(
         self,
@@ -477,6 +548,17 @@ def _pr_review_from(data: Any) -> PullRequestReviewInfo:
     )
 
 
+def _pr_file_from(data: Any) -> PullRequestFileInfo:
+    if not isinstance(data, dict):
+        raise GitHubError(500, "proxy returned malformed pr_file payload")
+    return PullRequestFileInfo(
+        path=str(data.get("path") or ""),
+        status=str(data.get("status") or ""),
+        additions=int(data.get("additions") or 0),
+        deletions=int(data.get("deletions") or 0),
+    )
+
+
 def _pr_from(data: Any) -> PullRequestInfo:
     if not isinstance(data, dict):
         raise GitHubError(500, "proxy returned malformed pr payload")
@@ -489,6 +571,8 @@ def _pr_from(data: Any) -> PullRequestInfo:
         state=str(data.get("state") or "open"),
         author=str(data.get("author") or ""),
         head_repo=str(data.get("head_repo") or ""),
+        title=str(data.get("title") or ""),
+        body=str(data.get("body") or ""),
     )
 
 

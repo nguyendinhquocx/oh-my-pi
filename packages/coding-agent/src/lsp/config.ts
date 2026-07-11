@@ -1,10 +1,10 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { $which, isRecord, logger } from "@oh-my-pi/pi-utils";
+import { $which, isRecord, logger, pathIsWithin, type WhichOptions } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
 import { getConfigDirPaths } from "../config";
-import { getPreloadedPluginRoots } from "../discovery/helpers";
+import { type ClaudePluginRoot, getPreloadedPluginRoots } from "../discovery/helpers";
 import { BiomeClient } from "./clients/biome-client";
 import { SwiftLintClient } from "./clients/swiftlint-client";
 import DEFAULTS from "./defaults.json" with { type: "json" };
@@ -22,8 +22,13 @@ export interface LspConfig {
 
 const PID_TOKEN = "$PID";
 
+interface RawServerConfig extends Partial<ServerConfig> {
+	extensionToLanguage?: unknown;
+	initializationOptions?: unknown;
+}
+
 interface NormalizedConfig {
-	servers: Record<string, Partial<ServerConfig>>;
+	servers: Record<string, RawServerConfig>;
 	idleTimeoutMs?: number;
 }
 
@@ -42,12 +47,12 @@ function normalizeConfig(value: unknown): NormalizedConfig | null {
 	const rawServers = value.servers;
 
 	if (isRecord(rawServers)) {
-		return { servers: rawServers as Record<string, Partial<ServerConfig>>, idleTimeoutMs };
+		return { servers: rawServers as Record<string, RawServerConfig>, idleTimeoutMs };
 	}
 
 	const servers = Object.fromEntries(Object.entries(value).filter(([key]) => key !== "idleTimeoutMs")) as Record<
 		string,
-		Partial<ServerConfig>
+		RawServerConfig
 	>;
 
 	return { servers, idleTimeoutMs };
@@ -58,11 +63,17 @@ function normalizeStringArray(value: unknown): string[] | null {
 	const items = value.filter((entry): entry is string => typeof entry === "string" && entry.length > 0);
 	return items.length > 0 ? items : null;
 }
+function normalizeExtensionToFileTypes(value: unknown): string[] | null {
+	if (!isRecord(value)) return null;
+	const extensions = Object.keys(value).filter(extension => extension.length > 0);
+	return extensions.length > 0 ? extensions : null;
+}
 
-function normalizeServerConfig(name: string, config: Partial<ServerConfig>): ServerConfig | null {
+function normalizeServerConfig(name: string, config: RawServerConfig): ServerConfig | null {
 	const command = typeof config.command === "string" && config.command.length > 0 ? config.command : null;
-	const fileTypes = normalizeStringArray(config.fileTypes);
-	const rootMarkers = normalizeStringArray(config.rootMarkers);
+	const fileTypes =
+		normalizeStringArray(config.fileTypes) ?? normalizeExtensionToFileTypes(config.extensionToLanguage);
+	const rootMarkers = normalizeStringArray(config.rootMarkers) ?? (config.extensionToLanguage ? ["."] : null);
 
 	if (!command || !fileTypes || !rootMarkers) {
 		logger.warn("Ignoring invalid LSP server config (missing required fields).", { name });
@@ -72,6 +83,11 @@ function normalizeServerConfig(name: string, config: Partial<ServerConfig>): Ser
 	const args = Array.isArray(config.args)
 		? config.args.filter((entry): entry is string => typeof entry === "string")
 		: undefined;
+	const initOptions = isRecord(config.initOptions)
+		? config.initOptions
+		: isRecord(config.initializationOptions)
+			? config.initializationOptions
+			: undefined;
 
 	return {
 		...config,
@@ -79,6 +95,7 @@ function normalizeServerConfig(name: string, config: Partial<ServerConfig>): Ser
 		args,
 		fileTypes,
 		rootMarkers,
+		...(initOptions ? { initOptions } : {}),
 	};
 }
 
@@ -92,7 +109,7 @@ function readConfigFile(filePath: string): NormalizedConfig | null {
 	}
 }
 
-function coerceServerConfigs(servers: Record<string, Partial<ServerConfig>>): Record<string, ServerConfig> {
+function coerceServerConfigs(servers: Record<string, RawServerConfig>): Record<string, ServerConfig> {
 	const result: Record<string, ServerConfig> = {};
 	for (const [name, config] of Object.entries(servers)) {
 		const normalized = normalizeServerConfig(name, config);
@@ -105,7 +122,7 @@ function coerceServerConfigs(servers: Record<string, Partial<ServerConfig>>): Re
 
 function mergeServers(
 	base: Record<string, ServerConfig>,
-	overrides: Record<string, Partial<ServerConfig>>,
+	overrides: Record<string, RawServerConfig>,
 ): Record<string, ServerConfig> {
 	const merged: Record<string, ServerConfig> = { ...base };
 	for (const [name, config] of Object.entries(overrides)) {
@@ -184,6 +201,21 @@ export function hasRootMarkers(cwd: string, markers: string[]): boolean {
 	return false;
 }
 
+/**
+ * Check whether any ancestor directory of a file is an LSP project root.
+ */
+export function hasRootMarkerAncestor(filePath: string, markers: string[]): boolean {
+	if (markers.length === 0) return false;
+
+	let dir = path.dirname(path.resolve(filePath));
+	while (true) {
+		if (hasRootMarkers(dir, markers)) return true;
+		const parent = path.dirname(dir);
+		if (parent === dir) return false;
+		dir = parent;
+	}
+}
+
 // =============================================================================
 // Local Binary Resolution
 // =============================================================================
@@ -192,18 +224,32 @@ export function hasRootMarkers(cwd: string, markers: string[]): boolean {
  * Local bin directories to check before $PATH, ordered by priority.
  * Each entry maps a root marker to the bin directory to check.
  */
+const PYTHON_ROOT_MARKERS = [
+	"pyproject.toml",
+	"requirements.txt",
+	"setup.py",
+	"setup.cfg",
+	"Pipfile",
+	"pyrightconfig.json",
+	"ruff.toml",
+	".ruff.toml",
+];
+
 const LOCAL_BIN_PATHS: Array<{ markers: string[]; binDir: string }> = [
 	// Node.js - check node_modules/.bin/
 	{ markers: ["package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml"], binDir: "node_modules/.bin" },
 	// Python - check virtual environment bin directories
-	{ markers: ["pyproject.toml", "requirements.txt", "setup.py", "Pipfile"], binDir: ".venv/bin" },
-	{ markers: ["pyproject.toml", "requirements.txt", "setup.py", "Pipfile"], binDir: "venv/bin" },
-	{ markers: ["pyproject.toml", "requirements.txt", "setup.py", "Pipfile"], binDir: ".env/bin" },
+	{ markers: PYTHON_ROOT_MARKERS, binDir: ".venv/bin" },
+	{ markers: PYTHON_ROOT_MARKERS, binDir: ".venv/Scripts" },
+	{ markers: PYTHON_ROOT_MARKERS, binDir: "venv/bin" },
+	{ markers: PYTHON_ROOT_MARKERS, binDir: "venv/Scripts" },
+	{ markers: PYTHON_ROOT_MARKERS, binDir: ".env/bin" },
+	{ markers: PYTHON_ROOT_MARKERS, binDir: ".env/Scripts" },
 	// Ruby - check vendor bundle and binstubs
 	{ markers: ["Gemfile", "Gemfile.lock"], binDir: "vendor/bundle/bin" },
 	{ markers: ["Gemfile", "Gemfile.lock"], binDir: "bin" },
 	// Go - check project-local bin
-	{ markers: ["go.mod", "go.sum"], binDir: "bin" },
+	{ markers: ["go.mod", "go.sum", "go.work"], binDir: "bin" },
 ];
 
 const WINDOWS_LOCAL_EXECUTABLE_EXTENSIONS = [".exe", ".cmd", ".bat"] as const;
@@ -221,6 +267,21 @@ function resolveLocalCommand(basePath: string): string | null {
 	return null;
 }
 
+function resolveCommandFromLocalRoot(command: string, cwd: string): string | null {
+	for (const { markers, binDir } of LOCAL_BIN_PATHS) {
+		if (!hasRootMarkers(cwd, markers)) continue;
+		const resolved = resolveLocalCommand(path.join(cwd, binDir, command));
+		if (resolved) return resolved;
+	}
+	return null;
+}
+
+/** Controls project-local and PATH executable lookup. */
+export interface ResolveCommandOptions extends Pick<WhichOptions, "cache" | "PATH"> {
+	/** Ordered project roots checked before PATH; defaults to the command cwd. */
+	localRoots?: readonly string[];
+}
+
 /**
  * Resolve a command to an executable path.
  * Checks project-local bin directories first, then falls back to $PATH.
@@ -229,40 +290,86 @@ function resolveLocalCommand(basePath: string): string | null {
  * @param cwd - Working directory to search from
  * @returns Absolute path to the executable, or null if not found
  */
-export function resolveCommand(command: string, cwd: string): string | null {
-	// Check local bin directories based on project markers
-	for (const { markers, binDir } of LOCAL_BIN_PATHS) {
-		if (hasRootMarkers(cwd, markers)) {
-			const localPath = path.join(cwd, binDir, command);
-			const resolvedLocalPath = resolveLocalCommand(localPath);
-			if (resolvedLocalPath) {
-				return resolvedLocalPath;
-			}
+export function resolveCommand(command: string, cwd: string, options?: ResolveCommandOptions): string | null {
+	if (options?.localRoots) {
+		for (const root of options.localRoots) {
+			const resolved = resolveCommandFromLocalRoot(command, root);
+			if (resolved) return resolved;
 		}
+	} else {
+		const resolved = resolveCommandFromLocalRoot(command, cwd);
+		if (resolved) return resolved;
 	}
 
-	// Fall back to $PATH
-	return $which(command);
+	if (!options) return $which(command);
+	return $which(command, { cache: options.cache, PATH: options.PATH });
+}
+
+interface ConfigSource {
+	read(): NormalizedConfig | null;
+}
+
+function fileConfigSource(filePath: string): ConfigSource {
+	return {
+		read: () => readConfigFile(filePath),
+	};
+}
+
+function readMarketplaceLspConfig(root: ClaudePluginRoot): NormalizedConfig | null {
+	const catalogPaths = [
+		path.resolve(root.path, "..", "..", "marketplace.json"),
+		path.resolve(root.path, "..", "..", ".claude-plugin", "marketplace.json"),
+	];
+
+	for (const catalogPath of catalogPaths) {
+		try {
+			const catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8")) as unknown;
+			if (!isRecord(catalog) || !Array.isArray(catalog.plugins)) continue;
+
+			for (const plugin of catalog.plugins) {
+				if (!isRecord(plugin) || plugin.name !== root.plugin) continue;
+
+				const lspServers = plugin.lspServers;
+				if (typeof lspServers === "string") {
+					const configPath = path.resolve(root.path, lspServers);
+					if (!pathIsWithin(root.path, configPath)) return null;
+					return readConfigFile(configPath);
+				}
+				if (isRecord(lspServers)) {
+					return normalizeConfig({ servers: lspServers });
+				}
+				return null;
+			}
+		} catch {}
+	}
+
+	return null;
+}
+
+function marketplaceConfigSource(root: ClaudePluginRoot): ConfigSource {
+	return {
+		read: () => readMarketplaceLspConfig(root),
+	};
 }
 
 /**
- * Configuration file search paths (in priority order).
+ * Configuration sources in priority order.
  * Supports both visible and hidden variants at each config location.
  */
-function getConfigPaths(cwd: string): string[] {
+function getConfigSources(cwd: string): ConfigSource[] {
 	const filenames = ["lsp.json", ".lsp.json", "lsp.yaml", ".lsp.yaml", "lsp.yml", ".lsp.yml"];
-	const paths: string[] = [];
+	const sources: ConfigSource[] = [];
 
 	// Project root files (highest priority)
 	for (const filename of filenames) {
-		paths.push(path.join(cwd, filename));
+		sources.push(fileConfigSource(path.join(cwd, filename)));
 	}
 
 	// Project config directories (.omp/, .pi/, .claude/)
 	const projectDirs = getConfigDirPaths("", { user: false, project: true, cwd });
 	for (const dir of projectDirs) {
 		for (const filename of filenames) {
-			paths.push(path.join(dir, filename));
+			sources.push(fileConfigSource(path.join(dir, filename)));
 		}
 	}
 
@@ -270,7 +377,7 @@ function getConfigPaths(cwd: string): string[] {
 	const userDirs = getConfigDirPaths("", { user: true, project: false });
 	for (const dir of userDirs) {
 		for (const filename of filenames) {
-			paths.push(path.join(dir, filename));
+			sources.push(fileConfigSource(path.join(dir, filename)));
 		}
 	}
 
@@ -278,16 +385,17 @@ function getConfigPaths(cwd: string): string[] {
 	const pluginRoots = getPreloadedPluginRoots();
 	for (const root of pluginRoots) {
 		for (const filename of filenames) {
-			paths.push(path.join(root.path, filename));
+			sources.push(fileConfigSource(path.join(root.path, filename)));
 		}
+		sources.push(marketplaceConfigSource(root));
 	}
 
 	// User home root files (lowest priority fallback)
 	for (const filename of filenames) {
-		paths.push(path.join(os.homedir(), filename));
+		sources.push(fileConfigSource(path.join(os.homedir(), filename)));
 	}
 
-	return paths;
+	return sources;
 }
 
 /**
@@ -324,12 +432,12 @@ function getConfigPaths(cwd: string): string[] {
 export function loadConfig(cwd: string): LspConfig {
 	let mergedServers = coerceServerConfigs(DEFAULTS);
 
-	const configPaths = getConfigPaths(cwd).reverse();
+	const configSources = getConfigSources(cwd).reverse();
 	let hasOverrides = false;
 
 	let idleTimeoutMs: number | undefined;
-	for (const configPath of configPaths) {
-		const parsed = readConfigFile(configPath);
+	for (const source of configSources) {
+		const parsed = source.read();
 		if (!parsed) continue;
 		const hasServerOverrides = Object.keys(parsed.servers).length > 0;
 		if (hasServerOverrides) {
@@ -385,13 +493,23 @@ export function loadConfig(cwd: string): LspConfig {
  */
 export function getServersForFile(config: LspConfig, filePath: string): Array<[string, ServerConfig]> {
 	const ext = path.extname(filePath).toLowerCase();
+	const extNoDot = ext.startsWith(".") ? ext.slice(1) : ext;
 	const fileName = path.basename(filePath).toLowerCase();
 	const matches: Array<[string, ServerConfig]> = [];
 
 	for (const [name, serverConfig] of Object.entries(config.servers)) {
 		const supportsFile = serverConfig.fileTypes.some(fileType => {
+			// Accept both `.ts` and `ts` forms in user config / fixtures so a
+			// missing dot in `fileTypes` doesn't silently exclude the server
+			// from extension-based routing (e.g. rename_file's relevance filter).
 			const normalized = fileType.toLowerCase();
-			return normalized === ext || normalized === fileName;
+			const normalizedNoDot = normalized.startsWith(".") ? normalized.slice(1) : normalized;
+			return (
+				normalized === ext ||
+				normalized === fileName ||
+				normalizedNoDot === extNoDot ||
+				normalizedNoDot === fileName
+			);
 		});
 
 		if (supportsFile) {

@@ -8,7 +8,8 @@ import type {
 } from "@agentclientprotocol/sdk";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { resolveToCwd } from "../../tools/path-utils";
-import type { TodoStatus } from "../../tools/todo-write";
+import type { TodoStatus } from "../../tools/todo";
+import { canonicalizeMessage } from "../../utils/thinking-display";
 
 interface MessageProgress {
 	textEmitted: boolean;
@@ -19,6 +20,7 @@ interface AcpEventMapperOptions {
 	getMessageId?: (message: unknown) => string | undefined;
 	getMessageProgress?: (message: unknown) => MessageProgress | undefined;
 	getToolArgs?: (toolCallId: string) => unknown;
+	resolveImageData?: (data: string, mimeType: string | undefined) => string;
 	/**
 	 * Session cwd. Tool call locations sent to ACP clients must be absolute
 	 * (the editor host needs them to open or focus files). When provided,
@@ -67,6 +69,16 @@ interface NewPathContainer {
 
 interface CommandContainer {
 	command?: unknown;
+}
+
+interface EvalCellContainer {
+	cells?: unknown;
+}
+
+interface EvalCellLike {
+	language?: unknown;
+	title?: unknown;
+	code?: unknown;
 }
 
 interface PatternContainer {
@@ -132,13 +144,13 @@ export function mapToolKind(toolName: string): ToolKind {
 		case "exec":
 		case "eval":
 			return "execute";
-		case "search":
-		case "find":
+		case "grep":
+		case "glob":
 		case "ast_grep":
 			return "search";
 		case "web_search":
 			return "fetch";
-		case "todo_write":
+		case "todo":
 			return "think";
 		default:
 			return "other";
@@ -168,7 +180,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 		case "tool_execution_update": {
 			const content = mergeToolUpdateContent(
 				buildToolStartContent(event.toolName, event.args),
-				extractToolCallContent(event.partialResult),
+				extractToolCallContent(event.partialResult, options),
 			);
 			const update: SessionUpdate = {
 				sessionUpdate: "tool_call_update",
@@ -186,7 +198,10 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 			return [toSessionNotification(sessionId, update)];
 		}
 		case "tool_execution_end": {
-			const resultContent = [...extractDiffToolCallContent(event.result), ...extractToolCallContent(event.result)];
+			const resultContent = [
+				...extractDiffToolCallContent(event.result),
+				...extractToolCallContent(event.result, options),
+			];
 			const content = mergeToolUpdateContent(
 				buildToolStartContent(event.toolName, getToolExecutionEndArgs(event, options)),
 				resultContent,
@@ -205,7 +220,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 				update.locations = locations;
 			}
 			const notifications = [toSessionNotification(sessionId, update)];
-			const planUpdate = mapTodoWriteResultToPlanUpdate(event);
+			const planUpdate = mapTodoResultToPlanUpdate(event);
 			if (planUpdate) {
 				notifications.push(toSessionNotification(sessionId, planUpdate));
 			}
@@ -246,13 +261,16 @@ function mapAssistantMessageUpdate(
 				progress.textEmitted = true;
 			}
 			break;
-		case "thinking_delta":
+		case "thinking_delta": {
+			const block = event.assistantMessageEvent.partial?.content?.[event.assistantMessageEvent.contentIndex];
+			if (block?.type === "thinking" && !canonicalizeMessage(block.thinking)) return [];
 			sessionUpdate = "agent_thought_chunk";
 			text = event.assistantMessageEvent.delta;
 			if (text.length > 0 && progress) {
 				progress.thoughtEmitted = true;
 			}
 			break;
+		}
 		case "done":
 			if (progress?.textEmitted) {
 				return [];
@@ -266,6 +284,11 @@ function mapAssistantMessageUpdate(
 		case "error":
 			sessionUpdate = "agent_message_chunk";
 			text = event.assistantMessageEvent.error.errorMessage ?? "Unknown error";
+			// The surfaced error is the message's visible text: keeps the
+			// message_end / agent_end fallbacks from emitting again.
+			if (text.length > 0 && progress) {
+				progress.textEmitted = true;
+			}
 			break;
 		default:
 			return [];
@@ -326,13 +349,13 @@ function mapTodoStatus(status: TodoStatus): "pending" | "in_progress" | "complet
 	return todoStatusMap[status];
 }
 
-function mapTodoWriteResultToPlanUpdate(
+function mapTodoResultToPlanUpdate(
 	event: Extract<AgentSessionEvent, { type: "tool_execution_end" }>,
 ): SessionUpdate | undefined {
-	if (event.toolName !== "todo_write" || event.isError) {
+	if (event.toolName !== "todo" || event.isError) {
 		return undefined;
 	}
-	const phases = extractTodoWritePhases(event.result);
+	const phases = extractTodoPhases(event.result);
 	if (!Array.isArray(phases)) {
 		return undefined;
 	}
@@ -346,7 +369,7 @@ function mapTodoWriteResultToPlanUpdate(
 	};
 }
 
-function extractTodoWritePhases(result: unknown): unknown {
+function extractTodoPhases(result: unknown): unknown {
 	if (typeof result !== "object" || result === null || !("details" in result)) {
 		return undefined;
 	}
@@ -435,11 +458,48 @@ function getToolExecutionEndArgs(
 }
 
 function buildToolStartContent(toolName: string, args: unknown): ToolCallContent[] {
-	if (!isCommandToolName(toolName)) {
-		return [];
+	const text = buildToolStartText(toolName, args);
+	return text ? [textToolCallContent(text)] : [];
+}
+
+function buildToolStartText(toolName: string, args: unknown): string | undefined {
+	if (isCommandToolName(toolName)) {
+		const command = extractStringProperty<CommandContainer>(args, "command");
+		return command ? limitText(`$ ${command}`) : undefined;
 	}
-	const command = extractStringProperty<CommandContainer>(args, "command");
-	return command ? [textToolCallContent(`$ ${command}`)] : [];
+	if (toolName === "eval") {
+		return buildEvalStartText(args);
+	}
+	return undefined;
+}
+
+function buildEvalStartText(args: unknown): string | undefined {
+	if (typeof args !== "object" || args === null || Array.isArray(args)) {
+		return undefined;
+	}
+	const container = args as EvalCellContainer & EvalCellLike;
+	const cells = Array.isArray(container.cells)
+		? container.cells
+		: typeof container.code === "string"
+			? [container]
+			: [];
+	if (cells.length === 0) {
+		return undefined;
+	}
+	const lines: string[] = [];
+	for (const cell of cells) {
+		if (typeof cell !== "object" || cell === null || Array.isArray(cell)) {
+			continue;
+		}
+		const language = extractStringProperty<EvalCellLike>(cell, "language") ?? "?";
+		const title = extractStringProperty<EvalCellLike>(cell, "title");
+		const code = extractStringProperty<EvalCellLike>(cell, "code");
+		if (!code) {
+			continue;
+		}
+		lines.push(title ? `[${language}] ${title}` : `[${language}]`, code);
+	}
+	return lines.length > 0 ? limitText(lines.join("\n")) : undefined;
 }
 
 function mergeToolUpdateContent(startContent: ToolCallContent[], resultContent: ToolCallContent[]): ToolCallContent[] {
@@ -465,6 +525,14 @@ function isCommandToolName(toolName: string): boolean {
 }
 
 function buildToolTitle(toolName: string, args: unknown, intent: string | undefined): string {
+	if (isCommandToolName(toolName)) {
+		const commandText = buildToolStartText(toolName, args);
+		if (commandText) return commandText;
+	}
+	if (toolName === "eval") {
+		const evalText = buildEvalStartText(args);
+		if (evalText) return evalText;
+	}
 	const trimmedIntent = intent?.trim();
 	if (trimmedIntent) {
 		return trimmedIntent;
@@ -582,13 +650,15 @@ function terminalToolCallContent(terminalId: string): ToolCallContent {
 	return { type: "terminal", terminalId };
 }
 
-function extractToolCallContent(value: unknown): ToolCallContent[] {
-	const richContent = extractStructuredToolCallContent(value);
+function extractToolCallContent(value: unknown, options: AcpEventMapperOptions): ToolCallContent[] {
+	const richContent = extractStructuredToolCallContent(value, options);
+	const detailsImageContent = extractDetailsImageToolCallContent(value, options, richContent);
+	const combinedContent = [...richContent, ...detailsImageContent];
 	const terminalId = extractTerminalId(value);
 	const content =
-		terminalId && !hasTerminalContent(richContent, terminalId)
-			? [...richContent, terminalToolCallContent(terminalId)]
-			: richContent;
+		terminalId && !hasTerminalContent(combinedContent, terminalId)
+			? [...combinedContent, terminalToolCallContent(terminalId)]
+			: combinedContent;
 	const fallbackText = extractReadableText(value);
 	if (!fallbackText) {
 		return content;
@@ -599,7 +669,7 @@ function extractToolCallContent(value: unknown): ToolCallContent[] {
 	return [...content, textToolCallContent(fallbackText)];
 }
 
-function extractStructuredToolCallContent(value: unknown): ToolCallContent[] {
+function extractStructuredToolCallContent(value: unknown, options: AcpEventMapperOptions): ToolCallContent[] {
 	const blocks = getContentBlocks(value);
 	if (!blocks) {
 		return [];
@@ -607,7 +677,7 @@ function extractStructuredToolCallContent(value: unknown): ToolCallContent[] {
 
 	const content: ToolCallContent[] = [];
 	for (const block of blocks) {
-		const toolCallContent = toToolCallContent(block);
+		const toolCallContent = toToolCallContent(block, options);
 		if (toolCallContent) {
 			content.push(toolCallContent);
 		}
@@ -626,7 +696,7 @@ function getContentBlocks(value: unknown): unknown[] | undefined {
 	return Array.isArray(content) ? content : undefined;
 }
 
-function toToolCallContent(value: unknown): ToolCallContent | undefined {
+function toToolCallContent(value: unknown, options: AcpEventMapperOptions): ToolCallContent | undefined {
 	const type = getContentType(value);
 	if (!type) {
 		return undefined;
@@ -638,21 +708,8 @@ function toToolCallContent(value: unknown): ToolCallContent | undefined {
 			return text ? textToolCallContent(text) : undefined;
 		}
 		case "image":
-		case "audio": {
-			const data = extractStringProperty<BinaryLikeContent>(value, "data");
-			const mimeType = extractStringProperty<BinaryLikeContent>(value, "mimeType");
-			if (!data || !mimeType) {
-				return undefined;
-			}
-			return {
-				type: "content",
-				content: {
-					type,
-					data,
-					mimeType,
-				},
-			};
-		}
+		case "audio":
+			return binaryToolCallContent(type, value, options);
 		case "resource_link": {
 			const uri = extractStringProperty<ResourceLinkLikeContent>(value, "uri");
 			const name = extractStringProperty<ResourceLinkLikeContent>(value, "name");
@@ -708,6 +765,64 @@ function toToolCallContent(value: unknown): ToolCallContent | undefined {
 		default:
 			return undefined;
 	}
+}
+
+function binaryToolCallContent(
+	type: "image" | "audio",
+	value: unknown,
+	options: AcpEventMapperOptions,
+): ToolCallContent | undefined {
+	const data = extractStringProperty<BinaryLikeContent>(value, "data");
+	const mimeType = extractStringProperty<BinaryLikeContent>(value, "mimeType");
+	if (!data || !mimeType) {
+		return undefined;
+	}
+	return {
+		type: "content",
+		content: {
+			type,
+			data: type === "image" ? (options.resolveImageData?.(data, mimeType) ?? data) : data,
+			mimeType,
+		},
+	};
+}
+
+function extractDetailsImageToolCallContent(
+	value: unknown,
+	options: AcpEventMapperOptions,
+	existing: ToolCallContent[],
+): ToolCallContent[] {
+	const images = extractDetailsImages(value);
+	if (!images) {
+		return [];
+	}
+	const seen = new Set(existing.map(imageContentKey).filter((key): key is string => key !== undefined));
+	const content: ToolCallContent[] = [];
+	for (const image of images) {
+		const toolCallContent = binaryToolCallContent("image", image, options);
+		const key = imageContentKey(toolCallContent);
+		if (!toolCallContent || !key || seen.has(key)) {
+			continue;
+		}
+		seen.add(key);
+		content.push(toolCallContent);
+	}
+	return content;
+}
+
+function extractDetailsImages(value: unknown): unknown[] | undefined {
+	if (typeof value !== "object" || value === null) return undefined;
+	const details = (value as DetailsContainer).details;
+	if (typeof details !== "object" || details === null) return undefined;
+	const images = (details as { images?: unknown }).images;
+	return Array.isArray(images) && images.length > 0 ? images : undefined;
+}
+
+function imageContentKey(value: ToolCallContent | undefined): string | undefined {
+	if (value?.type !== "content" || value.content.type !== "image") {
+		return undefined;
+	}
+	return `${value.content.mimeType}\u0000${value.content.data}`;
 }
 
 function extractEmbeddedResource(
@@ -787,6 +902,12 @@ function extractReadableText(value: unknown): string | undefined {
 		if (text.length > 0) {
 			return normalizeText(text);
 		}
+		if (hasBinaryContentBlock(contentBlocks)) {
+			return undefined;
+		}
+	}
+	if (extractDetailsImages(value)) {
+		return undefined;
 	}
 	if (isTerminalOnlyDetails(value)) {
 		return undefined;
@@ -806,7 +927,7 @@ function isTerminalOnlyDetails(value: unknown): boolean {
 	return content === undefined || (Array.isArray(content) && content.length === 0);
 }
 
-function extractAssistantMessageText(value: unknown): string {
+export function extractAssistantMessageText(value: unknown): string {
 	if (typeof value !== "object" || value === null || !("content" in value)) {
 		return "";
 	}
@@ -834,6 +955,13 @@ function getContentType(value: unknown): string | undefined {
 	}
 	const type = (value as TypedValue).type;
 	return typeof type === "string" ? type : undefined;
+}
+
+function hasBinaryContentBlock(blocks: unknown[]): boolean {
+	return blocks.some(block => {
+		const type = getContentType(block);
+		return type === "image" || type === "audio";
+	});
 }
 
 function extractStringProperty<T extends object>(value: unknown, key: keyof T): string | undefined {

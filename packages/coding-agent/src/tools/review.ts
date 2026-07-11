@@ -1,9 +1,10 @@
 /**
- * Review tools - report_finding for structured code review.
+ * Legacy hidden review-finding tool for agents that have not migrated to
+ * incremental `yield` sections.
  *
- * Used by the reviewer agent to report findings in a structured way.
- * Hidden by default - only enabled when explicitly listed in agent's tools.
- * Reviewers finish via `yield` tool with SubmitReviewDetails schema.
+ * Hidden by default - only enabled when explicitly listed in an agent's tools.
+ * Reviewers now finish via incremental `yield`; this tool remains for
+ * compatibility with older or custom review agents.
  */
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -12,9 +13,10 @@ import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Container, Text } from "@oh-my-pi/pi-tui";
 import { isRecord } from "@oh-my-pi/pi-utils";
-import * as z from "zod/v4";
+import { type } from "arktype";
 import type { Theme, ThemeColor } from "../modes/theme/theme";
 import { subprocessToolRegistry } from "../task/subprocess-tool-registry";
+import type { ReviewFinding } from "../task/types";
 export type FindingPriority = "P0" | "P1" | "P2" | "P3";
 
 export interface FindingPriorityInfo {
@@ -31,6 +33,10 @@ const PRIORITY_INFO: Record<FindingPriority, FindingPriorityInfo> = {
 };
 
 export const PRIORITY_LABELS: FindingPriority[] = ["P0", "P1", "P2", "P3"];
+
+export function isFindingPriority(value: unknown): value is FindingPriority {
+	return value === "P0" || value === "P1" || value === "P2" || value === "P3";
+}
 
 export function getPriorityInfo(priority: FindingPriority): FindingPriorityInfo {
 	return PRIORITY_INFO[priority] ?? { ord: 3, symbol: "status.info", color: "muted" };
@@ -51,17 +57,15 @@ function getPriorityDisplay(
 
 // report_finding schema
 // report_finding schema
-const ReportFindingParams = z
-	.object({
-		title: z.string().describe("prefixed imperative title"),
-		body: z.string().describe("problem explanation"),
-		priority: z.enum(["P0", "P1", "P2", "P3"] as const).describe("priority 0-3"),
-		confidence: z.number().min(0).max(1).describe("confidence score"),
-		file_path: z.string().describe("file path"),
-		line_start: z.number().describe("start line"),
-		line_end: z.number().describe("end line"),
-	})
-	.strict();
+const ReportFindingParams = type({
+	title: type("string").describe("prefixed imperative title"),
+	body: type("string").describe("problem explanation"),
+	priority: type("'P0' | 'P1' | 'P2' | 'P3'").describe("priority 0-3"),
+	confidence: type("number >= 0 & number <= 1").describe("confidence score"),
+	file_path: type("string").describe("file path"),
+	line_start: type("number").describe("start line"),
+	line_end: type("number").describe("end line"),
+});
 
 interface ReportFindingDetails {
 	title: string;
@@ -73,8 +77,13 @@ interface ReportFindingDetails {
 	line_end: number;
 }
 
-function isFindingPriority(value: unknown): value is FindingPriority {
-	return value === "P0" || value === "P1" || value === "P2" || value === "P3";
+function normalizeFindingPriority(value: unknown): FindingPriority | undefined {
+	if (isFindingPriority(value)) return value;
+	if (value === 0) return "P0";
+	if (value === 1) return "P1";
+	if (value === 2) return "P2";
+	if (value === 3) return "P3";
+	return undefined;
 }
 
 export function parseReportFindingDetails(value: unknown): ReportFindingDetails | undefined {
@@ -82,7 +91,7 @@ export function parseReportFindingDetails(value: unknown): ReportFindingDetails 
 
 	const title = typeof value.title === "string" ? value.title : undefined;
 	const body = typeof value.body === "string" ? value.body : undefined;
-	const priority = isFindingPriority(value.priority) ? value.priority : undefined;
+	const priority = normalizeFindingPriority(value.priority);
 	const confidence =
 		typeof value.confidence === "number" &&
 		Number.isFinite(value.confidence) &&
@@ -121,6 +130,7 @@ export function parseReportFindingDetails(value: unknown): ReportFindingDetails 
 export const reportFindingTool: AgentTool<typeof ReportFindingParams, ReportFindingDetails, Theme> = {
 	name: "report_finding",
 	label: "Report Finding",
+	approval: "read",
 	description: "Report a code review finding. Use this for each issue found. Call yield when done.",
 	parameters: ReportFindingParams,
 	intent: "omit",
@@ -167,7 +177,7 @@ export const reportFindingTool: AgentTool<typeof ReportFindingParams, ReportFind
 		}`;
 
 		return new Text(
-			`${theme.fg("success", theme.status.success)} ${icon} ${theme.fg(color, `[${label}]`)} ${theme.fg(
+			`${theme.styledSymbol("tool.review", "accent")} ${icon} ${theme.fg(color, `[${label}]`)} ${theme.fg(
 				"dim",
 				location,
 			)}`,
@@ -186,6 +196,28 @@ export interface SubmitReviewDetails {
 
 // Re-export types for external use
 export type { ReportFindingDetails };
+/**
+ * Coerce a tool-side `ReportFindingDetails` into the cross-boundary
+ * `ReviewFinding` shape consumed by the reviewer agent's JTD output schema.
+ *
+ * The `report_finding` tool exposes `priority` as a string enum (`"P0".."P3"`)
+ * for ergonomics, but the bundled reviewer schema (and every custom review
+ * agent that mirrors it) declares `priority: number`. Without this coercion
+ * the auto-populated `findings[]` fails JTD validation and every review run
+ * that surfaces a finding is rejected with `findings.0.priority: expected
+ * number, received string`.
+ */
+export function toReviewFinding(details: ReportFindingDetails): ReviewFinding {
+	return {
+		title: details.title,
+		body: details.body,
+		priority: getPriorityInfo(details.priority).ord,
+		confidence: details.confidence,
+		file_path: details.file_path,
+		line_start: details.line_start,
+		line_end: details.line_end,
+	};
+}
 
 // Register report_finding handler
 subprocessToolRegistry.register<ReportFindingDetails>("report_finding", {

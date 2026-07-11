@@ -1,21 +1,27 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getBundledModel } from "@oh-my-pi/pi-ai";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { createAgentSession, type ExtensionFactory } from "@oh-my-pi/pi-coding-agent/sdk";
-import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import {
+	type CreateAgentSessionOptions,
+	createAgentSession,
+	discoverAuthStorage,
+	type ExtensionFactory,
+} from "@oh-my-pi/pi-coding-agent/sdk";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { Snowflake } from "@oh-my-pi/pi-utils";
-import * as z from "zod/v4";
+import { VIBE_TOOL_NAMES } from "@oh-my-pi/pi-coding-agent/tools/vibe";
+import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
+import { type } from "arktype";
 
 const toolActivationExtension: ExtensionFactory = pi => {
 	pi.registerTool({
 		name: "default_inactive_tool",
 		label: "Default Inactive Tool",
 		description: "Tool hidden from the initial active set unless explicitly requested.",
-		parameters: z.object({}),
+		parameters: type({}),
 		defaultInactive: true,
 		async execute() {
 			return { content: [{ type: "text", text: "inactive" }] };
@@ -25,7 +31,7 @@ const toolActivationExtension: ExtensionFactory = pi => {
 		name: "default_active_tool",
 		label: "Default Active Tool",
 		description: "Tool included in the initial active set.",
-		parameters: z.object({}),
+		parameters: type({}),
 		async execute() {
 			return { content: [{ type: "text", text: "active" }] };
 		},
@@ -34,37 +40,71 @@ const toolActivationExtension: ExtensionFactory = pi => {
 
 describe("createAgentSession defaultInactive tool activation", () => {
 	const tempDirs: string[] = [];
-	const authStorages: AuthStorage[] = [];
 
-	afterEach(() => {
-		for (const tempDir of tempDirs.splice(0)) {
-			fs.rmSync(tempDir, { recursive: true, force: true });
-		}
-		for (const authStorage of authStorages.splice(0)) {
-			authStorage.close();
-		}
-		vi.restoreAllMocks();
-	});
+	// Built once and shared by every session. `ModelRegistry` eagerly loads all
+	// bundled + cached models and `discoverAuthStorage` opens the auth DB — the
+	// dominant (~50ms) slice of a cold boot, and identical for every test here.
+	// Injecting it drops each per-test boot to the ~4ms of activation-specific work
+	// these tests vary, and skips the background model refresh the SDK would
+	// otherwise start when it builds its own registry.
+	let modelRegistry!: ModelRegistry;
+	let registryAuthDir: string;
 
-	it("excludes defaultInactive extension tools from the initial active set unless explicitly requested", async () => {
+	const makeTempDir = (): string => {
 		const tempDir = path.join(os.tmpdir(), `pi-sdk-tool-activation-${Snowflake.next()}`);
 		tempDirs.push(tempDir);
 		fs.mkdirSync(tempDir, { recursive: true });
+		return tempDir;
+	};
+
+	beforeAll(async () => {
+		registryAuthDir = path.join(os.tmpdir(), `pi-sdk-tool-activation-auth-${Snowflake.next()}`);
+		fs.mkdirSync(registryAuthDir, { recursive: true });
+		modelRegistry = new ModelRegistry(await discoverAuthStorage(registryAuthDir));
+	});
+
+	// Shared options for every session. `rules: []` and `workspaceTree` short-circuit
+	// the two slow startup scans (rule discovery + native workspace walk, ~100ms each)
+	// that are irrelevant to tool activation: these tests assert only which tools are
+	// registered/active and that tool names appear in the system prompt. The shared
+	// `modelRegistry` is injected here; each call still returns fresh
+	// `settings`/`sessionManager` instances to keep tests isolated.
+	const baseOptions = (tempDir: string): CreateAgentSessionOptions => ({
+		cwd: tempDir,
+		agentDir: tempDir,
+		modelRegistry,
+		sessionManager: SessionManager.inMemory(),
+		settings: Settings.isolated(),
+		model: getBundledModel("openai", "gpt-4o-mini"),
+		disableExtensionDiscovery: true,
+		skills: [],
+		contextFiles: [],
+		promptTemplates: [],
+		slashCommands: [],
+		enableMCP: false,
+		enableLsp: false,
+		rules: [],
+		workspaceTree: { rootPath: tempDir, rendered: "", truncated: false, totalLines: 0, agentsMdFiles: [] },
+	});
+
+	afterEach(() => {
+		for (const tempDir of tempDirs.splice(0)) {
+			removeSyncWithRetries(tempDir);
+		}
+
+		vi.restoreAllMocks();
+	});
+
+	afterAll(() => {
+		removeSyncWithRetries(registryAuthDir);
+	});
+
+	it("excludes defaultInactive extension tools from the initial active set unless explicitly requested", async () => {
+		const tempDir = makeTempDir();
 
 		const { session } = await createAgentSession({
-			cwd: tempDir,
-			agentDir: tempDir,
-			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated(),
-			model: getBundledModel("openai", "gpt-4o-mini"),
-			disableExtensionDiscovery: true,
+			...baseOptions(tempDir),
 			extensions: [toolActivationExtension],
-			skills: [],
-			contextFiles: [],
-			promptTemplates: [],
-			slashCommands: [],
-			enableMCP: false,
-			enableLsp: false,
 		});
 
 		try {
@@ -81,24 +121,11 @@ describe("createAgentSession defaultInactive tool activation", () => {
 	});
 
 	it("allows explicitly requested defaultInactive extension tools into the initial active set", async () => {
-		const tempDir = path.join(os.tmpdir(), `pi-sdk-tool-activation-${Snowflake.next()}`);
-		tempDirs.push(tempDir);
-		fs.mkdirSync(tempDir, { recursive: true });
+		const tempDir = makeTempDir();
 
 		const { session } = await createAgentSession({
-			cwd: tempDir,
-			agentDir: tempDir,
-			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated(),
-			model: getBundledModel("openai", "gpt-4o-mini"),
-			disableExtensionDiscovery: true,
+			...baseOptions(tempDir),
 			extensions: [toolActivationExtension],
-			skills: [],
-			contextFiles: [],
-			promptTemplates: [],
-			slashCommands: [],
-			enableMCP: false,
-			enableLsp: false,
 			toolNames: ["read", "default_inactive_tool"],
 		});
 
@@ -112,93 +139,141 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		}
 	});
 
-	it("keeps edit active when vim edit mode is configured", async () => {
-		const tempDir = path.join(os.tmpdir(), `pi-sdk-tool-activation-${Snowflake.next()}`);
-		tempDirs.push(tempDir);
-		fs.mkdirSync(tempDir, { recursive: true });
+	it("activates the yield tool when requireYieldTool is set and toolNames is explicit", async () => {
+		// Regression for #1408: plan-mode subagents pass an explicit `toolNames` list
+		// (e.g. `["read", "grep", "glob", "lsp", "web_search"]`). Without this
+		// invariant, `yield` ended up registered but not active, and the model
+		// could not satisfy the idle-reminder contract that demands a `yield` call.
+		const tempDir = makeTempDir();
 
 		const { session } = await createAgentSession({
-			cwd: tempDir,
-			agentDir: tempDir,
-			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated({ "edit.mode": "vim" }),
-			model: getBundledModel("openai", "gpt-4o-mini"),
-			disableExtensionDiscovery: true,
-			extensions: [],
-			skills: [],
-			contextFiles: [],
-			promptTemplates: [],
-			slashCommands: [],
-			enableMCP: false,
-			enableLsp: false,
-			toolNames: ["read", "edit"],
+			...baseOptions(tempDir),
+			requireYieldTool: true,
+			toolNames: ["read", "grep", "glob", "web_search"],
 		});
 
 		try {
-			expect(session.getActiveToolNames()).toContain("edit");
-			expect(session.getActiveToolNames()).not.toContain("vim");
-			expect(session.getAllToolNames()).toContain("edit");
-			expect(session.getAllToolNames()).not.toContain("vim");
-
-			await session.setActiveToolsByName(["read", "edit"]);
-
-			expect(session.getActiveToolNames()).toContain("edit");
-			expect(session.getActiveToolNames()).not.toContain("vim");
+			expect(session.getActiveToolNames()).toContain("yield");
 		} finally {
 			await session.dispose();
 		}
 	});
 
-	it("keeps the visible edit tool stable when the active model changes edit modes", async () => {
-		const tempDir = path.join(os.tmpdir(), `pi-sdk-tool-activation-${Snowflake.next()}`);
-		tempDirs.push(tempDir);
-		fs.mkdirSync(tempDir, { recursive: true });
-
-		const settings = Settings.isolated();
-		vi.spyOn(settings, "getEditVariantForModel").mockImplementation(model =>
-			model?.includes("mini") ? "vim" : "hashline",
-		);
-
-		const authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
-		authStorages.push(authStorage);
-		authStorage.setRuntimeApiKey("openai", "test-key");
-
-		const baseModel = getBundledModel("openai", "gpt-4o");
-		const vimModel = getBundledModel("openai", "gpt-4o-mini");
-		if (!baseModel || !vimModel) {
-			throw new Error("Expected bundled OpenAI models for edit-mode switching test");
-		}
+	it("normalizes legacy builtin toolNames before selecting the active SDK tools", async () => {
+		const tempDir = makeTempDir();
 
 		const { session } = await createAgentSession({
-			cwd: tempDir,
-			agentDir: tempDir,
-			sessionManager: SessionManager.inMemory(),
-			settings,
-			authStorage,
-			model: baseModel,
-			disableExtensionDiscovery: true,
-			extensions: [],
-			skills: [],
-			contextFiles: [],
-			promptTemplates: [],
-			slashCommands: [],
-			enableMCP: false,
-			enableLsp: false,
-			toolNames: ["read", "edit"],
+			...baseOptions(tempDir),
+			toolNames: ["read", "search", "find"],
 		});
 
 		try {
-			expect(session.getActiveToolNames()).toContain("edit");
-			expect(session.getActiveToolNames()).not.toContain("vim");
-			expect(session.getAllToolNames()).toContain("edit");
-			expect(session.getAllToolNames()).not.toContain("vim");
+			const activeToolNames = session.getActiveToolNames();
 
-			await session.setModel(vimModel);
+			expect(activeToolNames).toContain("read");
+			expect(activeToolNames).toContain("grep");
+			expect(activeToolNames).toContain("glob");
+			expect(activeToolNames).not.toContain("search");
+			expect(activeToolNames).not.toContain("find");
+		} finally {
+			await session.dispose();
+		}
+	});
 
-			expect(session.getActiveToolNames()).toContain("edit");
-			expect(session.getActiveToolNames()).not.toContain("vim");
-			expect(session.getAllToolNames()).toContain("edit");
-			expect(session.getAllToolNames()).not.toContain("vim");
+	it("keeps the hidden resolve tool registered for plan mode even when no deferrable tool is requested", async () => {
+		// Regression for #1428: plan mode submits its finalized plan via
+		// `resolve { action: "apply" }` dispatched through a standing handler
+		// (interactive-mode.ts: `setStandingResolveHandler`). With an explicit
+		// read-only `toolNames` (e.g. `read`, `search`, `find`, `web_search`)
+		// the registry has no `deferrable` tool, so the previous gate dropped
+		// `resolve` from the registry and plan mode silently activated without
+		// it — leaving the agent stuck after drafting the plan.
+		const tempDir = makeTempDir();
+
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			toolNames: ["read", "grep", "glob", "web_search"],
+		});
+
+		try {
+			expect(session.getToolByName("resolve")).toBeDefined();
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("drops the hidden resolve tool when neither a deferrable tool nor plan mode can use it", async () => {
+		const tempDir = makeTempDir();
+
+		const settings = Settings.isolated();
+		settings.set("plan.enabled", false);
+
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			settings,
+			toolNames: ["read", "grep", "glob", "web_search"],
+		});
+
+		try {
+			expect(session.getToolByName("resolve")).toBeUndefined();
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("registers vibe tools only during explicit vibe activation", async () => {
+		const tempDir = makeTempDir();
+		const { session } = await createAgentSession(baseOptions(tempDir));
+		const previousActiveToolNames = session.getActiveToolNames();
+
+		try {
+			for (const name of VIBE_TOOL_NAMES) {
+				expect(session.getToolByName(name)).toBeUndefined();
+			}
+
+			await session.activateVibeTools(["read"]);
+			for (const name of VIBE_TOOL_NAMES) {
+				expect(session.getToolByName(name)).toBeDefined();
+				expect(session.getActiveToolNames()).toContain(name);
+			}
+
+			await session.deactivateVibeTools(previousActiveToolNames);
+			for (const name of VIBE_TOOL_NAMES) {
+				expect(session.getToolByName(name)).toBeUndefined();
+			}
+			expect(session.getActiveToolNames()).toEqual(previousActiveToolNames);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("does not register the xAI TTS tool unless enabled", async () => {
+		const tempDir = makeTempDir();
+
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+		});
+
+		try {
+			expect(session.getToolByName("tts")).toBeUndefined();
+			expect(session.getAllToolNames()).not.toContain("tts");
+			expect(session.getActiveToolNames()).not.toContain("tts");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("registers the xAI TTS tool when enabled", async () => {
+		const tempDir = makeTempDir();
+
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			settings: Settings.isolated({ "speechgen.enabled": true }),
+		});
+
+		try {
+			expect(session.getToolByName("tts")).toBeDefined();
+			expect(session.getActiveToolNames()).toContain("tts");
 		} finally {
 			await session.dispose();
 		}

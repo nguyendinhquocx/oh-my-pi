@@ -2,14 +2,16 @@
  * Lazy provider module loading.
  *
  * Each provider module is loaded only when its stream function is first called.
- * This avoids eagerly importing heavy SDK dependencies (e.g., @anthropic-ai/sdk,
- * openai) at startup. The loaded module promise is cached so subsequent calls
+ * This avoids eagerly importing heavy SDK dependencies (e.g., openai) at
+ * startup. The loaded module promise is cached so subsequent calls
  * reuse the same import.
  *
  * NOTE: stream.ts currently imports providers directly, so this file is not yet
  * wired into the main streaming path. It provides the infrastructure for lazy
  * loading that can be integrated when stream.ts is refactored.
  */
+
+import * as AIError from "../error";
 import type {
 	Api,
 	AssistantMessage,
@@ -21,11 +23,18 @@ import type {
 } from "../types";
 import { type AbortSourceTracker, createAbortSourceTracker } from "../utils/abort";
 import { AssistantMessageEventStream as EventStreamImpl } from "../utils/event-stream";
-import { getStreamFirstEventTimeoutMs, getStreamIdleTimeoutMs, iterateWithIdleTimeout } from "../utils/idle-iterator";
+import {
+	getOpenAIStreamFirstEventTimeoutMs,
+	getOpenAIStreamIdleTimeoutMs,
+	getStreamFirstEventTimeoutMs,
+	getStreamIdleTimeoutMs,
+	iterateWithIdleTimeout,
+} from "../utils/idle-iterator";
 import type { BedrockOptions } from "./amazon-bedrock";
 import type { AnthropicOptions } from "./anthropic";
 import type { AzureOpenAIResponsesOptions } from "./azure-openai-responses";
 import type { CursorOptions } from "./cursor";
+import type { DevinOptions } from "./devin";
 import type { GoogleOptions } from "./google";
 import type { GoogleGeminiCliOptions } from "./google-gemini-cli";
 import type { GoogleVertexOptions } from "./google-vertex";
@@ -122,6 +131,10 @@ interface CursorProviderModule {
 	) => AssistantMessageEventStream;
 }
 
+interface DevinProviderModule {
+	streamDevin: (model: Model<"devin-agent">, context: Context, options: DevinOptions) => AssistantMessageEventStream;
+}
+
 interface BedrockProviderModule {
 	streamBedrock: (
 		model: Model<"bedrock-converse-stream">,
@@ -144,12 +157,20 @@ let openAICompletionsProviderModulePromise: Promise<LazyProviderModule<"openai-c
 let openAIResponsesProviderModulePromise: Promise<LazyProviderModule<"openai-responses">> | undefined;
 let ollamaProviderModulePromise: Promise<LazyProviderModule<"ollama-chat">> | undefined;
 let cursorProviderModulePromise: Promise<LazyProviderModule<"cursor-agent">> | undefined;
+let cursorProviderModuleOverride: LazyProviderModule<"cursor-agent"> | undefined;
+let devinProviderModulePromise: Promise<LazyProviderModule<"devin-agent">> | undefined;
 let bedrockProviderModuleOverride: LazyProviderModule<"bedrock-converse-stream"> | undefined;
 let bedrockProviderModulePromise: Promise<LazyProviderModule<"bedrock-converse-stream">> | undefined;
 
 export function setBedrockProviderModule(module: BedrockProviderModule): void {
 	bedrockProviderModuleOverride = {
 		stream: module.streamBedrock,
+	};
+}
+
+export function setCursorProviderModule(module: CursorProviderModule): void {
+	cursorProviderModuleOverride = {
+		stream: module.streamCursor,
 	};
 }
 
@@ -166,23 +187,83 @@ function hasFinalResult(
 	return typeof (source as { result?: unknown }).result === "function";
 }
 
+/**
+ * floor used when neither caller option nor env var pins a value. Generic env
+ * vars (`PI_STREAM_FIRST_EVENT_TIMEOUT_MS`, `PI_STREAM_IDLE_TIMEOUT_MS`) still
+ * take precedence unless a provider opts into OpenAI-family idle flooring for
+ * local backends that users historically tuned with `PI_OPENAI_STREAM_IDLE_TIMEOUT_MS`.
+ */
+interface LazyStreamLimits {
+	defaultFirstEventTimeoutMs?: number;
+	defaultIdleTimeoutMs?: number;
+	/**
+	 * The provider implementation already wraps its upstream transport with
+	 * stream timeouts. Keep the lazy loader from racing it with generic errors.
+	 */
+	providerHandlesStreamTimeouts?: boolean;
+	/**
+	 * Apply OpenAI-family idle timeout precedence in the lazy wrapper. Used by
+	 * local backends whose users historically tune slow prompt-processing gaps
+	 * with `PI_OPENAI_STREAM_IDLE_TIMEOUT_MS`.
+	 */
+	openAIIdleEnvFloorsFirstEvent?: boolean;
+}
+/**
+ * Cloud Code Assist (google-gemini-cli / google-antigravity) routinely takes
+ * longer than the global 100s default to emit its first SSE event when serving
+ * the heavier Gemini 3.x Pro tiers at high thinking levels. Bump the first-event
+ * floor to five minutes so callers stop seeing spurious "stream timed out while
+ * waiting for the first event" aborts on legitimate cold reasoning starts.
+ * The steady-state idle watchdog stays on the global default since the upstream
+ * emits thinking tokens frequently once it gets going.
+ */
+const GOOGLE_GEMINI_CLI_LAZY_STREAM_LIMITS: LazyStreamLimits = {
+	defaultFirstEventTimeoutMs: 300_000,
+};
+
+const PROVIDER_HANDLED_STREAM_TIMEOUTS: LazyStreamLimits = {
+	providerHandlesStreamTimeouts: true,
+};
+
+const OPENAI_IDLE_FLOORED_LAZY_STREAM_LIMITS: LazyStreamLimits = {
+	openAIIdleEnvFloorsFirstEvent: true,
+};
+
 function forwardStream<TApi extends Api>(
 	target: EventStreamImpl,
 	source: AsyncIterable<AssistantMessageEvent>,
 	model: Model<TApi>,
 	options: OptionsForApi<TApi>,
 	abortTracker: AbortSourceTracker,
+	limits?: LazyStreamLimits,
 ): void {
 	(async () => {
 		try {
-			const idleTimeoutMs = options.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs();
+			const providerHandlesStreamTimeouts = limits?.providerHandlesStreamTimeouts === true;
+			const idleTimeoutMs = providerHandlesStreamTimeouts
+				? undefined
+				: (options.streamIdleTimeoutMs ??
+					(limits?.openAIIdleEnvFloorsFirstEvent
+						? getOpenAIStreamIdleTimeoutMs(limits.defaultIdleTimeoutMs)
+						: getStreamIdleTimeoutMs(limits?.defaultIdleTimeoutMs)));
+			const firstItemTimeoutMs = providerHandlesStreamTimeouts
+				? 0
+				: (options.streamFirstEventTimeoutMs ??
+					(limits?.openAIIdleEnvFloorsFirstEvent
+						? getOpenAIStreamFirstEventTimeoutMs(idleTimeoutMs, limits.defaultFirstEventTimeoutMs)
+						: getStreamFirstEventTimeoutMs(idleTimeoutMs, limits?.defaultFirstEventTimeoutMs)));
+			// Providers with a server-driven local tool bridge (e.g. the Cursor
+			// exec channel) mark their stream busy while a local tool runs; the
+			// watchdog must not read that silence as a provider stall (#4593).
+			const localWorkSource = source instanceof EventStreamImpl ? source : undefined;
 			const watchedSource = iterateWithIdleTimeout(source, {
 				idleTimeoutMs,
-				firstItemTimeoutMs: options.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs),
+				firstItemTimeoutMs,
 				errorMessage: LAZY_STREAM_IDLE_TIMEOUT_ERROR,
 				firstItemErrorMessage: LAZY_STREAM_FIRST_EVENT_TIMEOUT_ERROR,
-				onIdle: () => abortTracker.abortLocally(new Error(LAZY_STREAM_IDLE_TIMEOUT_ERROR)),
-				onFirstItemTimeout: () => abortTracker.abortLocally(new Error(LAZY_STREAM_FIRST_EVENT_TIMEOUT_ERROR)),
+				onIdle: () => abortTracker.abortLocally(new AIError.StreamTimeoutError(LAZY_STREAM_IDLE_TIMEOUT_ERROR)),
+				onFirstItemTimeout: () =>
+					abortTracker.abortLocally(new AIError.StreamTimeoutError(LAZY_STREAM_FIRST_EVENT_TIMEOUT_ERROR)),
 				abortSignal: options.signal,
 				// The synthetic `start` event is yielded immediately by every provider before
 				// the upstream model has emitted any tokens. Treating it as the first "real"
@@ -190,6 +271,7 @@ function forwardStream<TApi extends Api>(
 				// `idleTimeoutMs` while we're still legitimately waiting on the model's
 				// first response (slow first-token from reasoning models, cold proxies, etc.).
 				isProgressItem: event => (event as AssistantMessageEvent).type !== "start",
+				hasPendingLocalWork: localWorkSource ? () => localWorkSource.hasPendingLocalWork : undefined,
 			});
 
 			for await (const event of watchedSource) {
@@ -241,6 +323,7 @@ function createLazyLoadErrorMessage<TApi extends Api>(
 
 function createLazyStream<TApi extends Api>(
 	loadModule: () => Promise<LazyProviderModule<TApi>>,
+	limits?: LazyStreamLimits,
 ): (model: Model<TApi>, context: Context, options: OptionsForApi<TApi>) => EventStreamImpl {
 	return (model, context, options) => {
 		const outer = new EventStreamImpl();
@@ -251,7 +334,7 @@ function createLazyStream<TApi extends Api>(
 				const abortTracker = createAbortSourceTracker(streamOptions.signal);
 				const providerOptions = { ...streamOptions, signal: abortTracker.requestSignal } as OptionsForApi<TApi>;
 				const inner = module.stream(model, context, providerOptions);
-				forwardStream(outer, inner, model, streamOptions, abortTracker);
+				forwardStream(outer, inner, model, streamOptions, abortTracker, limits);
 			})
 			.catch(error => {
 				const message = createLazyLoadErrorMessage(model, error);
@@ -340,11 +423,22 @@ function loadOllamaProviderModule(): Promise<LazyProviderModule<"ollama-chat">> 
 }
 
 function loadCursorProviderModule(): Promise<LazyProviderModule<"cursor-agent">> {
+	if (cursorProviderModuleOverride) {
+		return Promise.resolve(cursorProviderModuleOverride);
+	}
 	cursorProviderModulePromise ||= import("./cursor").then(module => {
 		const provider = module as CursorProviderModule;
 		return { stream: provider.streamCursor };
 	});
 	return cursorProviderModulePromise;
+}
+
+function loadDevinProviderModule(): Promise<LazyProviderModule<"devin-agent">> {
+	devinProviderModulePromise ||= import("./devin").then(module => {
+		const provider = module as DevinProviderModule;
+		return { stream: provider.streamDevin };
+	});
+	return devinProviderModulePromise;
 }
 
 function loadBedrockProviderModule(): Promise<LazyProviderModule<"bedrock-converse-stream">> {
@@ -366,15 +460,31 @@ function loadBedrockProviderModule(): Promise<LazyProviderModule<"bedrock-conver
 // providers, the lazy loading will take effect on the main code path.
 // ---------------------------------------------------------------------------
 
-export const streamAnthropic = createLazyStream(loadAnthropicProviderModule);
-export const streamAzureOpenAIResponses = createLazyStream(loadAzureOpenAIResponsesProviderModule);
+export const streamAnthropic = createLazyStream(loadAnthropicProviderModule, PROVIDER_HANDLED_STREAM_TIMEOUTS);
+export const streamAzureOpenAIResponses = createLazyStream(
+	loadAzureOpenAIResponsesProviderModule,
+	PROVIDER_HANDLED_STREAM_TIMEOUTS,
+);
 export const streamGoogle = createLazyStream(loadGoogleProviderModule);
-export const streamGoogleGeminiCli = createLazyStream(loadGoogleGeminiCliProviderModule);
+export const streamGoogleGeminiCli = createLazyStream(
+	loadGoogleGeminiCliProviderModule,
+	GOOGLE_GEMINI_CLI_LAZY_STREAM_LIMITS,
+);
 export const streamGoogleVertex = createLazyStream(loadGoogleVertexProviderModule);
-export const streamOpenAICodexResponses = createLazyStream(loadOpenAICodexResponsesProviderModule);
-export const streamOpenAICompletions = createLazyStream(loadOpenAICompletionsProviderModule);
-export const streamOpenAIResponses = createLazyStream(loadOpenAIResponsesProviderModule);
+export const streamOpenAICodexResponses = createLazyStream(
+	loadOpenAICodexResponsesProviderModule,
+	PROVIDER_HANDLED_STREAM_TIMEOUTS,
+);
+export const streamOpenAICompletions = createLazyStream(
+	loadOpenAICompletionsProviderModule,
+	PROVIDER_HANDLED_STREAM_TIMEOUTS,
+);
+export const streamOpenAIResponses = createLazyStream(
+	loadOpenAIResponsesProviderModule,
+	PROVIDER_HANDLED_STREAM_TIMEOUTS,
+);
 export const streamCursor = createLazyStream(loadCursorProviderModule);
-export const streamOllama = createLazyStream(loadOllamaProviderModule);
+export const streamDevin = createLazyStream(loadDevinProviderModule);
+export const streamOllama = createLazyStream(loadOllamaProviderModule, OPENAI_IDLE_FLOORED_LAZY_STREAM_LIMITS);
 
 export const streamBedrock = createLazyStream(loadBedrockProviderModule);

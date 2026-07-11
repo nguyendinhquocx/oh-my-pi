@@ -1,11 +1,13 @@
-import { describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ToolExecutionComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tool-execution";
 import * as themeModule from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { toolRenderers } from "@oh-my-pi/pi-coding-agent/tools/renderers";
 import type { TUI } from "@oh-my-pi/pi-tui";
+import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 async function getUiTheme() {
 	await themeModule.initTheme(false, undefined, undefined, "dark", "light");
@@ -14,6 +16,31 @@ async function getUiTheme() {
 	return theme!;
 }
 
+async function waitForRenderedText(
+	component: ToolExecutionComponent,
+	width: number,
+	expectedText: string,
+): Promise<string> {
+	const deadline = Date.now() + 1_000;
+	let rendered = "";
+	while (Date.now() < deadline) {
+		rendered = Bun.stripANSI(component.render(width).join("\n"));
+		if (rendered.includes(expectedText)) {
+			return rendered;
+		}
+		await Bun.sleep(10);
+	}
+	return rendered;
+}
+
+beforeEach(async () => {
+	await Settings.init({ inMemory: true, cwd: process.cwd() });
+});
+
+afterEach(() => {
+	resetSettingsForTest();
+});
+
 describe("apply_patch rendering", () => {
 	it("registers apply_patch to use the edit renderer", () => {
 		expect(toolRenderers.apply_patch).toBe(toolRenderers.edit);
@@ -21,7 +48,7 @@ describe("apply_patch rendering", () => {
 
 	it("renders apply_patch results through edit UI instead of generic fallback", async () => {
 		await getUiTheme();
-		const uiStub = { requestRender() {} } as unknown as TUI;
+		const uiStub = { requestRender() {}, requestComponentRender() {} } as unknown as TUI;
 
 		const component = new ToolExecutionComponent(
 			"apply_patch",
@@ -100,7 +127,7 @@ describe("apply_patch rendering", () => {
 
 	it("shows apply_patch preview diffs after args complete", async () => {
 		await getUiTheme();
-		const uiStub = { requestRender() {} } as unknown as TUI;
+		const uiStub = { requestRender() {}, requestComponentRender() {} } as unknown as TUI;
 		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "apply-patch-preview-"));
 		try {
 			await Bun.write(path.join(tmpDir, "preview.ts"), "const value = 1;\n");
@@ -118,19 +145,17 @@ describe("apply_patch rendering", () => {
 			expect(before).not.toContain("(preview)");
 
 			component.setArgsComplete();
-			await Bun.sleep(50);
-
-			const after = Bun.stripANSI(component.render(160).join("\n"));
+			const after = await waitForRenderedText(component, 160, "(preview)");
 			expect(after).toContain("(preview)");
 			expect(after).toContain("const value = 2;");
 		} finally {
-			await fs.rm(tmpDir, { recursive: true, force: true });
+			await removeWithRetries(tmpDir);
 		}
 	});
 
 	it("refreshes streaming preview immediately on arg updates without scheduling a debounce", async () => {
 		await getUiTheme();
-		const uiStub = { requestRender() {} } as unknown as TUI;
+		const uiStub = { requestRender() {}, requestComponentRender() {} } as unknown as TUI;
 		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "apply-patch-instant-preview-"));
 		const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
 		try {
@@ -152,13 +177,13 @@ describe("apply_patch rendering", () => {
 			expect(setTimeoutSpy).not.toHaveBeenCalled();
 		} finally {
 			setTimeoutSpy.mockRestore();
-			await fs.rm(tmpDir, { recursive: true, force: true });
+			await removeWithRetries(tmpDir);
 		}
 	});
 
 	it("aligns rendered edit diff separators", async () => {
 		await getUiTheme();
-		const uiStub = { requestRender() {} } as unknown as TUI;
+		const uiStub = { requestRender() {}, requestComponentRender() {} } as unknown as TUI;
 		const component = new ToolExecutionComponent(
 			"edit",
 			{ path: "packages/coding-agent/src/tools/image-gen.ts" },

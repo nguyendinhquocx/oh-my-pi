@@ -1,28 +1,22 @@
-<critical>
-Plan approved. You MUST execute it now.
-</critical>
-
-Finalized plan artifact: `{{finalPlanFilePath}}`
+Plan approved.
 {{#if contextPreserved}}
-Context preserved. Use conversation history when useful; the finalized plan is the source of truth if it conflicts with earlier exploration.
-{{else}}
-Execution may be in fresh context. Treat the finalized plan as the source of truth.
+- Context preserved. Use conversation history when useful; the plan file is the source of truth if it conflicts with earlier exploration.
 {{/if}}
 
-## Plan
-
-{{planContent}}
-
 <instruction>
-You MUST execute this plan step by step from `{{finalPlanFilePath}}`. You have full tool access.
+You MUST read `{{planFilePath}}` before executing.
+The file content is the authoritative plan; visible/compressed context is secondary.
+Read failure? Report the exact path and error instead of guessing.
+After reading, you MUST execute the plan step by step with full tool access.
 You MUST verify each step before proceeding to the next.
-{{#has tools "todo_write"}}
-Before execution, initialize todo tracking with `todo_write`.
-After each completed step, immediately update `todo_write`.
-If `todo_write` fails, fix the payload and retry before continuing.
+{{#has tools "todo"}}
+After reading the plan, initialize todo tracking with `todo`.
+After each completed step, immediately update `todo`.
+If `todo` fails, fix the payload and retry before continuing.
 {{/has}}
 </instruction>
 
 <critical>
+NEVER stop because inline plan content is compressed, expired, or unrecoverable. Read `{{planFilePath}}`.
 You MUST keep going until complete. This matters.
 </critical>

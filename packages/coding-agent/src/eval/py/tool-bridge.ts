@@ -30,6 +30,48 @@ interface BridgeServer {
 const registrations = new Map<string, PyToolBridgeEntry>();
 let serverPromise: Promise<BridgeServer> | null = null;
 
+/**
+ * Forward a bridge call to {@link callSessionTool}, but resolve the HTTP request
+ * the instant the cell's signal aborts instead of waiting for the tool/subagent
+ * to fully tear down.
+ *
+ * The kernel invokes this bridge with a *blocking* `urllib` request from a
+ * worker thread (each `agent()` / `tool.*` call). When the cell is interrupted,
+ * `parallel()`'s `ThreadPoolExecutor.__exit__` joins those worker threads
+ * (`shutdown(wait=True)`), so they cannot unwind until their `urllib` call
+ * returns — i.e. until this handler responds. A host-side `agent()` teardown
+ * (aborting nested LLM streams + tools across a wide fan-out) routinely exceeds
+ * the kernel's SIGINT escalation window, so the kernel was hard-killed and its
+ * persistent state lost while the subagents were still winding down. Responding
+ * immediately on abort lets the kernel raise through the blocked call and settle
+ * cleanly (preserving state); the already-signaled call keeps tearing down in
+ * the background, its eventual result/rejection swallowed.
+ */
+async function callSessionToolPromptOnAbort(name: string, args: unknown, entry: PyToolBridgeEntry): Promise<unknown> {
+	const call = callSessionTool(name, args, {
+		session: entry.toolSession,
+		signal: entry.signal,
+		emitStatus: entry.emitStatus,
+	});
+	const signal = entry.signal;
+	if (!signal) return await call;
+	if (signal.aborted) {
+		void call.catch(() => {});
+		throw new Error(`bridge call ${JSON.stringify(name)} aborted: eval cell was interrupted`);
+	}
+	const { promise: aborted, reject } = Promise.withResolvers<never>();
+	const onAbort = () => reject(new Error(`bridge call ${JSON.stringify(name)} aborted: eval cell was interrupted`));
+	signal.addEventListener("abort", onAbort, { once: true });
+	try {
+		return await Promise.race([call, aborted]);
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+		// `call` may still be settling (subagent teardown after its own abort);
+		// swallow its outcome so an abort-won race can't surface as unhandled.
+		void call.catch(() => {});
+	}
+}
+
 async function startServer(): Promise<BridgeServer> {
 	const token = crypto.randomUUID();
 	const server = Bun.serve({
@@ -44,31 +86,29 @@ async function startServer(): Promise<BridgeServer> {
 				return new Response("Forbidden", { status: 403 });
 			}
 
-			let body: { session?: unknown; name?: unknown; args?: unknown };
+			let body: { session?: unknown; run?: unknown; name?: unknown; args?: unknown };
 			try {
-				body = (await req.json()) as { session?: unknown; name?: unknown; args?: unknown };
+				body = (await req.json()) as { session?: unknown; run?: unknown; name?: unknown; args?: unknown };
 			} catch {
 				return Response.json({ ok: false, error: "Invalid JSON body" }, { status: 400 });
 			}
 			const sessionId = typeof body.session === "string" ? body.session : "";
+			const runId = typeof body.run === "string" ? body.run : "";
 			const name = typeof body.name === "string" ? body.name : "";
-			if (!sessionId || !name) {
-				return Response.json({ ok: false, error: "Missing session/name" }, { status: 400 });
+			if (!sessionId || !runId || !name) {
+				return Response.json({ ok: false, error: "Missing session/run/name" }, { status: 400 });
 			}
-			const entry = registrations.get(sessionId);
+			const registrationKey = bridgeRegistrationKey(sessionId, runId);
+			const entry = registrations.get(registrationKey) ?? registrations.get(sessionId);
 			if (!entry) {
 				return Response.json(
-					{ ok: false, error: `No active Python tool bridge session: ${sessionId}` },
+					{ ok: false, error: `No active Python tool bridge session: ${registrationKey}` },
 					{ status: 200 },
 				);
 			}
 
 			try {
-				const value = await callSessionTool(name, body.args, {
-					session: entry.toolSession,
-					signal: entry.signal,
-					emitStatus: entry.emitStatus,
-				});
+				const value = await callSessionToolPromptOnAbort(name, body.args, entry);
 				return Response.json({ ok: true, value });
 			} catch (err) {
 				return Response.json({
@@ -111,11 +151,16 @@ export async function ensurePyToolBridge(): Promise<PyToolBridgeInfo> {
  * Register a tool session for the duration of one execution. The returned
  * function MUST be called to remove the entry once execution finishes.
  */
-export function registerPyToolBridge(sessionId: string, entry: PyToolBridgeEntry): () => void {
-	registrations.set(sessionId, entry);
+function bridgeRegistrationKey(sessionId: string, runId: string): string {
+	return `${sessionId}:${runId}`;
+}
+
+export function registerPyToolBridge(sessionId: string, runId: string, entry: PyToolBridgeEntry): () => void {
+	const key = bridgeRegistrationKey(sessionId, runId);
+	registrations.set(key, entry);
 	return () => {
-		if (registrations.get(sessionId) === entry) {
-			registrations.delete(sessionId);
+		if (registrations.get(key) === entry) {
+			registrations.delete(key);
 		}
 	};
 }

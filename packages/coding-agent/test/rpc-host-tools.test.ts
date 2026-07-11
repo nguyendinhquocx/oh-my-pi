@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentEvent } from "@oh-my-pi/pi-agent-core";
@@ -10,6 +9,7 @@ import type {
 	RpcHostToolCancelRequest,
 	RpcHostToolUpdate,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
+import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 const tempPaths: string[] = [];
 
@@ -17,7 +17,7 @@ afterEach(async () => {
 	await Promise.all(
 		tempPaths.splice(0).map(async filePath => {
 			try {
-				await fs.rm(filePath, { force: true });
+				await removeWithRetries(filePath);
 			} catch {}
 		}),
 	);
@@ -53,7 +53,7 @@ describe("RpcHostToolBridge", () => {
 
 		expect(frames).toHaveLength(1);
 		const request = frames[0];
-		if (!request || request.type !== "host_tool_call") {
+		if (request?.type !== "host_tool_call") {
 			throw new Error("Expected host_tool_call frame");
 		}
 
@@ -100,7 +100,7 @@ describe("RpcHostToolBridge", () => {
 		const controller = new AbortController();
 		const execution = tool.execute("toolu_2", {}, controller.signal);
 		const request = frames[0];
-		if (!request || request.type !== "host_tool_call") {
+		if (request?.type !== "host_tool_call") {
 			throw new Error("Expected host_tool_call frame");
 		}
 

@@ -8,14 +8,15 @@ import type {
 	UsageReport,
 	UsageWindow,
 } from "../usage";
-import { refreshGoogleCloudToken } from "../utils/oauth/google-gemini-cli";
+
+// (Refresh is the sole responsibility of AuthStorage; no provider-direct refresh here.)
 
 const DEFAULT_ENDPOINT = "https://cloudcode-pa.googleapis.com";
 
 const GEMINI_TIER_MAP: Array<{ tier: string; models: string[] }> = [
 	{
 		tier: "3-Flash",
-		models: ["gemini-3-flash-preview", "gemini-3-flash"],
+		models: ["gemini-3-flash-preview", "gemini-3-flash", "gemini-3.5-flash"],
 	},
 	{
 		tier: "Flash",
@@ -23,7 +24,15 @@ const GEMINI_TIER_MAP: Array<{ tier: string; models: string[] }> = [
 	},
 	{
 		tier: "Pro",
-		models: ["gemini-2.5-pro", "gemini-3-pro-preview", "gemini-3.1-pro-preview", "gemini-3-pro", "gemini-1.5-pro"],
+		models: [
+			"gemini-2.5-pro",
+			"gemini-3-pro-preview",
+			"gemini-3.1-pro-preview",
+			"gemini-3-pro",
+			"gemini-3.1-pro",
+			"gemini-pro-agent",
+			"gemini-1.5-pro",
+		],
 	},
 ];
 
@@ -100,20 +109,21 @@ function buildAmount(remainingFraction: number | undefined): UsageAmount {
 	};
 }
 
-async function resolveAccessToken(params: UsageFetchParams, ctx: UsageFetchContext): Promise<string | undefined> {
+/**
+ * Return the OAuth access token to use against `/v1internal:*`. AuthStorage is
+ * the sole refresh authority (broker-aware, single-flighted, rotation-safe);
+ * if the token landed here expired or near-expired, the next usage cycle will
+ * carry a freshly-refreshed credential. Returning `undefined` short-circuits
+ * the probe rather than POSTing a stale token to Google.
+ */
+function resolveAccessToken(params: UsageFetchParams): string | undefined {
 	const { credential } = params;
 	if (credential.type !== "oauth") return undefined;
-	if (credential.accessToken && (!credential.expiresAt || credential.expiresAt > Date.now() + 60_000)) {
-		return credential.accessToken;
+	if (!credential.accessToken) return undefined;
+	if (credential.expiresAt !== undefined && credential.expiresAt <= Date.now()) {
+		return undefined;
 	}
-	if (!credential.refreshToken || !credential.projectId) return credential.accessToken;
-	try {
-		const refreshed = await refreshGoogleCloudToken(credential.refreshToken, credential.projectId);
-		return refreshed.access;
-	} catch (error) {
-		ctx.logger?.warn("Gemini CLI token refresh failed", { error: String(error) });
-		return credential.accessToken;
-	}
+	return credential.accessToken;
 }
 
 async function loadCodeAssist(
@@ -191,7 +201,7 @@ export const googleGeminiCliUsageProvider: UsageProvider = {
 		if (credential.type !== "oauth") {
 			return null;
 		}
-		const accessToken = await resolveAccessToken(params, ctx);
+		const accessToken = resolveAccessToken(params);
 		if (!accessToken) {
 			return null;
 		}

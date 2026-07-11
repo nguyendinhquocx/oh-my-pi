@@ -5,8 +5,8 @@ import {
 	AuthStorage,
 	type CredentialDisabledEvent,
 	type StoredAuthCredential,
-} from "../src/auth-storage";
-import * as oauthUtils from "../src/utils/oauth";
+} from "@oh-my-pi/pi-ai/auth-storage";
+import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
 
 // Env vars short-circuit AuthStorage.getApiKey before the OAuth refresh path runs; suppress
 // them for every test in this file so the credential-disable code path can be exercised.
@@ -22,7 +22,11 @@ const expiredOAuth = () =>
 	}) as const;
 
 const failOAuthRefresh = (message = 'HTTP 400 invalid_grant {"error":"invalid_grant"}'): void => {
-	vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async () => {
+	// AuthStorage now refreshes through `refreshOAuthToken` before formatting
+	// the API key, so intercept the refresh call itself to simulate a failed
+	// refresh attempt. Mocking `getOAuthApiKey` no longer fires because the
+	// refresh short-circuits the path with a real provider call.
+	vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async () => {
 		throw new Error(message);
 	});
 };

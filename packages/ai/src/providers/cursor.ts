@@ -3,34 +3,7 @@ import * as fs from "node:fs/promises";
 import http2 from "node:http2";
 import { create, fromBinary, fromJson, type JsonValue, toBinary, toJson } from "@bufbuild/protobuf";
 import { ValueSchema } from "@bufbuild/protobuf/wkt";
-import { $env, extractHttpStatusFromError, sanitizeText } from "@oh-my-pi/pi-utils";
-import { calculateCost } from "../models";
-import type {
-	Api,
-	AssistantMessage,
-	Context,
-	CursorExecHandlerResult,
-	CursorExecHandlers,
-	CursorMcpCall,
-	CursorShellStreamCallbacks,
-	CursorToolResultHandler,
-	ImageContent,
-	Message,
-	Model,
-	StreamFunction,
-	StreamOptions,
-	TextContent,
-	ThinkingContent,
-	Tool,
-	ToolCall,
-	ToolResultMessage,
-} from "../types";
-import { normalizeSystemPrompts } from "../utils";
-import { AssistantMessageEventStream } from "../utils/event-stream";
-import { parseStreamingJson } from "../utils/json-parse";
-import { formatErrorMessageWithRetryAfter } from "../utils/retry-after";
-import { toolWireSchema } from "../utils/schema/wire";
-import type { McpToolDefinition } from "./cursor/gen/agent_pb";
+import type { McpToolDefinition } from "@oh-my-pi/pi-catalog/discovery/cursor-gen/agent_pb";
 import {
 	AgentClientMessageSchema,
 	AgentConversationTurnStructureSchema,
@@ -103,6 +76,9 @@ import {
 	RequestContextResultSchema,
 	RequestContextSchema,
 	RequestContextSuccessSchema,
+	ResumeActionSchema,
+	SelectedContextSchema,
+	SelectedImageSchema,
 	SetBlobResultSchema,
 	type ShellArgs,
 	ShellFailureSchema,
@@ -124,10 +100,55 @@ import {
 	WriteShellStdinErrorSchema,
 	WriteShellStdinResultSchema,
 	WriteSuccessSchema,
-} from "./cursor/gen/agent_pb";
+} from "@oh-my-pi/pi-catalog/discovery/cursor-gen/agent_pb";
+import { calculateCost } from "@oh-my-pi/pi-catalog/models";
+import {
+	$env,
+	parseJsonWithRepair,
+	parseStreamingJson,
+	parseStreamingJsonThrottled,
+	sanitizeText,
+} from "@oh-my-pi/pi-utils";
+import * as AIError from "../error";
+import type {
+	Api,
+	AssistantMessage,
+	Context,
+	CursorExecHandlerResult,
+	CursorExecHandlers,
+	CursorMcpCall,
+	CursorShellStreamCallbacks,
+	CursorToolResultHandler,
+	ImageContent,
+	Message,
+	Model,
+	StreamFunction,
+	StreamOptions,
+	TextContent,
+	ThinkingContent,
+	Tool,
+	ToolCall,
+	ToolResultMessage,
+} from "../types";
+import { normalizeSystemPrompts } from "../utils";
+import {
+	clearStreamingPartialJson,
+	kCursorExecResolved,
+	kStreamingBlockIndex,
+	kStreamingBlockKind,
+	kStreamingLastParseLen,
+	kStreamingPartialJson,
+} from "../utils/block-symbols";
+import { deterministicUuid } from "../utils/deterministic-id";
+import { AssistantMessageEventStream } from "../utils/event-stream";
+import { connectProxiedSocket, getProxyForProvider, shouldBypassProxy } from "../utils/proxy";
+import { createRequestDebugSession, isRequestDebugEnabled, type RequestDebugResponseLog } from "../utils/request-debug";
+import { toolWireSchema } from "../utils/schema/wire";
 
 export const CURSOR_API_URL = "https://api2.cursor.sh";
 export const CURSOR_CLIENT_VERSION = "cli-2026.01.09-231024f";
+
+const CURSOR_PROXY_TUNNEL_TIMEOUT_MS = 30_000;
 
 const conversationStateCache = new Map<string, ConversationStateStructure>();
 const conversationBlobStores = new Map<string, Map<string, Uint8Array>>();
@@ -183,11 +204,11 @@ function parseConnectEndStream(data: Uint8Array): Error | null {
 		if (error) {
 			const code = typeof error.code === "string" ? error.code : "unknown";
 			const message = typeof error.message === "string" ? error.message : "Unknown error";
-			return new Error(`Connect error ${code}: ${message}`);
+			return new AIError.ProviderResponseError(`Connect error ${code}: ${message}`, { kind: "envelope" });
 		}
 		return null;
 	} catch {
-		return new Error("Failed to parse Connect end stream");
+		return new AIError.ProviderResponseError("Failed to parse Connect end stream", { kind: "envelope" });
 	}
 }
 
@@ -304,7 +325,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 	const stream = new AssistantMessageEventStream();
 
 	(async () => {
-		const startTime = Date.now();
+		const startTime = performance.now();
 		let firstTokenTime: number | undefined;
 
 		const output: AssistantMessage = {
@@ -328,11 +349,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let h2Client: http2.ClientHttp2Session | null = null;
 		let h2Request: http2.ClientHttp2Stream | null = null;
 		let heartbeatTimer: NodeJS.Timeout | null = null;
+		let debugResponseLogPromise: Promise<RequestDebugResponseLog | undefined> | undefined;
 
 		try {
 			const apiKey = options?.apiKey;
 			if (!apiKey) {
-				throw new Error("Cursor API key (access token) is required");
+				throw new AIError.MissingApiKeyError(undefined, "Cursor API key (access token) is required");
 			}
 
 			const conversationId = options?.conversationId ?? options?.sessionId ?? crypto.randomUUID();
@@ -348,11 +370,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			const requestContextTools = buildMcpToolDefinitions(context.tools);
 
 			const baseUrl = model.baseUrl || CURSOR_API_URL;
-			h2Client = http2.connect(baseUrl);
-
-			h2Request = h2Client.request({
+			const requestPath = "/agent.v1.AgentService/Run";
+			const requestHeaders = {
 				":method": "POST",
-				":path": "/agent.v1.AgentService/Run",
+				":path": requestPath,
 				"content-type": "application/connect+proto",
 				"connect-protocol-version": "1",
 				te: "trailers",
@@ -361,14 +382,38 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				"x-cursor-client-version": CURSOR_CLIENT_VERSION,
 				"x-cursor-client-type": "cli",
 				"x-request-id": crypto.randomUUID(),
-			});
+			};
+			const debugSession = isRequestDebugEnabled()
+				? await createRequestDebugSession({
+						protocol: "http2",
+						method: "POST",
+						url: new URL(requestPath, baseUrl).toString(),
+						headers: requestHeaders,
+						bodyBase64: Buffer.from(requestBytes).toString("base64"),
+					})
+				: undefined;
+
+			const proxyUrl = shouldBypassProxy(new URL(baseUrl)) ? undefined : getProxyForProvider(model.provider);
+			if (proxyUrl) {
+				const tlsSocket = await connectProxiedSocket(proxyUrl, baseUrl, {
+					signal: options?.signal,
+					timeoutMs: CURSOR_PROXY_TUNNEL_TIMEOUT_MS,
+				});
+				h2Client = http2.connect(baseUrl, {
+					createConnection: () => tlsSocket,
+				});
+			} else {
+				h2Client = http2.connect(baseUrl);
+			}
+
+			h2Request = h2Client.request(requestHeaders);
 
 			stream.push({ type: "start", partial: output });
 
 			let pendingBuffer = Buffer.alloc(0);
 			let endStreamError: Error | null = null;
-			let currentTextBlock: (TextContent & { index: number }) | null = null;
-			let currentThinkingBlock: (ThinkingContent & { index: number }) | null = null;
+			let currentTextBlock: (TextContent & { [kStreamingBlockIndex]: number }) | null = null;
+			let currentThinkingBlock: (ThinkingContent & { [kStreamingBlockIndex]: number }) | null = null;
 			let currentToolCall: ToolCallState | null = null;
 			const usageState: UsageState = { sawTokenDelta: false };
 
@@ -395,7 +440,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					currentToolCall = t;
 				},
 				setFirstTokenTime: () => {
-					if (!firstTokenTime) firstTokenTime = Date.now();
+					if (!firstTokenTime) firstTokenTime = performance.now();
 				},
 			};
 
@@ -405,7 +450,19 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 			let resolveH2: (() => void) | undefined;
 
+			h2Request.on("response", headers => {
+				debugResponseLogPromise = debugSession?.openResponseLog(
+					`HTTP/2 ${headers[":status"] ?? ""}`.trim(),
+					headers,
+				);
+			});
+
 			h2Request.on("data", (chunk: Buffer) => {
+				if (debugResponseLogPromise) {
+					void debugResponseLogPromise.then(log => {
+						log?.write(chunk);
+					});
+				}
 				pendingBuffer = Buffer.concat([pendingBuffer, chunk]);
 
 				while (pendingBuffer.length >= 5) {
@@ -477,56 +534,59 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			await new Promise<void>((resolve, reject) => {
 				resolveH2 = resolve;
 
+				const closeDebugLog = async (): Promise<void> => {
+					const log = await debugResponseLogPromise;
+					await log?.close();
+				};
+
 				h2Request!.on("trailers", trailers => {
 					const status = trailers["grpc-status"];
 					const msg = trailers["grpc-message"];
 					if (status && status !== "0") {
-						reject(new Error(`gRPC error ${status}: ${decodeURIComponent(String(msg || ""))}`));
+						void closeDebugLog().finally(() => {
+							reject(
+								new AIError.ProviderResponseError(
+									`gRPC error ${status}: ${decodeURIComponent(String(msg || ""))}`,
+									{ kind: "envelope" },
+								),
+							);
+						});
 					}
 				});
 
 				h2Request!.on("end", () => {
 					resolveH2 = undefined;
-					if (endStreamError) {
-						reject(endStreamError);
-						return;
-					}
-					resolve();
+					void closeDebugLog()
+						.then(() => {
+							if (endStreamError) {
+								reject(endStreamError);
+								return;
+							}
+							resolve();
+						})
+						.catch(reject);
 				});
 
-				h2Request!.on("error", reject);
+				h2Request!.on("error", error => {
+					void closeDebugLog().finally(() => reject(error));
+				});
 
 				if (options?.signal) {
 					options.signal.addEventListener("abort", () => {
 						h2Request?.close();
-						reject(new Error("Request was aborted"));
+						void closeDebugLog().finally(() => {
+							reject(new AIError.AbortError());
+						});
 					});
 				}
 			});
 
-			if (state.currentTextBlock) {
-				const idx = output.content.indexOf(state.currentTextBlock);
-				stream.push({
-					type: "text_end",
-					contentIndex: idx,
-					content: state.currentTextBlock.text,
-					partial: output,
-				});
-			}
-			if (state.currentThinkingBlock) {
-				const idx = output.content.indexOf(state.currentThinkingBlock);
-				stream.push({
-					type: "thinking_end",
-					contentIndex: idx,
-					content: state.currentThinkingBlock.thinking,
-					partial: output,
-				});
-			}
+			endCurrentTextBlock(output, stream, state);
+			endCurrentThinkingBlock(output, stream, state);
 			if (state.currentToolCall) {
 				const idx = output.content.indexOf(state.currentToolCall);
-				state.currentToolCall.arguments = parseStreamingJson(state.currentToolCall.partialJson);
-				delete (state.currentToolCall as any).partialJson;
-				delete (state.currentToolCall as any).index;
+				state.currentToolCall.arguments = parseStreamingJson(state.currentToolCall[kStreamingPartialJson]);
+				clearStreamingPartialJson(state.currentToolCall);
 				stream.push({
 					type: "toolcall_end",
 					contentIndex: idx,
@@ -537,7 +597,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 			calculateCost(model, output.usage);
 
-			output.duration = Date.now() - startTime;
+			output.duration = performance.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({
 				type: "done",
@@ -546,14 +606,18 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			});
 			stream.end();
 		} catch (error) {
-			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorStatus = extractHttpStatusFromError(error);
-			output.errorMessage = formatErrorMessageWithRetryAfter(error);
-			output.duration = Date.now() - startTime;
+			const result = await AIError.finalize(error, { api: model.api, signal: options?.signal });
+			output.stopReason = result.stopReason;
+			output.errorStatus = result.status;
+			output.errorId = result.id;
+			output.errorMessage = result.message;
+			output.duration = performance.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		} finally {
+			const log = await debugResponseLogPromise;
+			await log?.close();
 			if (heartbeatTimer) {
 				clearInterval(heartbeatTimer);
 				heartbeatTimer = null;
@@ -566,24 +630,31 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 	return stream;
 };
 
-type ToolCallState = ToolCall & { index: number; partialJson?: string; kind: "mcp" | "todo_write" };
+export type ToolCallState = ToolCall & {
+	[kStreamingBlockIndex]: number;
+	[kStreamingPartialJson]?: string;
+	[kStreamingLastParseLen]?: number;
+	[kStreamingBlockKind]: "mcp" | "todo" | "cursor-exec";
+	[kCursorExecResolved]?: true;
+};
 
-interface BlockState {
-	currentTextBlock: (TextContent & { index: number }) | null;
-	currentThinkingBlock: (ThinkingContent & { index: number }) | null;
+export interface BlockState {
+	currentTextBlock: (TextContent & { [kStreamingBlockIndex]: number }) | null;
+	currentThinkingBlock: (ThinkingContent & { [kStreamingBlockIndex]: number }) | null;
 	currentToolCall: ToolCallState | null;
 	firstTokenTime: number | undefined;
-	setTextBlock: (b: (TextContent & { index: number }) | null) => void;
-	setThinkingBlock: (b: (ThinkingContent & { index: number }) | null) => void;
+	setTextBlock: (b: (TextContent & { [kStreamingBlockIndex]: number }) | null) => void;
+	setThinkingBlock: (b: (ThinkingContent & { [kStreamingBlockIndex]: number }) | null) => void;
 	setToolCall: (t: ToolCallState | null) => void;
 	setFirstTokenTime: () => void;
 }
 
-interface UsageState {
+export interface UsageState {
 	sawTokenDelta: boolean;
 }
 
-async function handleServerMessage(
+/** Exported for tests: drives one Cursor server message through the stream (exec waits mark the stream busy). */
+export async function handleServerMessage(
 	msg: AgentServerMessage,
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
@@ -605,12 +676,21 @@ async function handleServerMessage(
 	} else if (msgCase === "kvServerMessage") {
 		handleKvServerMessage(msg.message.value as KvServerMessage, blobStore, h2Request);
 	} else if (msgCase === "execServerMessage") {
-		await handleExecServerMessage(
-			msg.message.value as ExecServerMessage,
-			h2Request,
-			execHandlers,
-			onToolResult,
-			requestContextTools,
+		// The server is waiting on OUR local tool result during this window — no
+		// AssistantMessageEvent flows until the handler finishes. Mark the wait
+		// as local work so the lazy stream idle watchdog attributes the silence
+		// to the tool run instead of aborting a healthy stream (issue #4593).
+		await stream.trackLocalWork(
+			handleExecServerMessage(
+				msg.message.value as ExecServerMessage,
+				h2Request,
+				execHandlers,
+				onToolResult,
+				requestContextTools,
+				output,
+				stream,
+				state,
+			),
 		);
 	} else if (msgCase === "conversationCheckpointUpdate") {
 		handleConversationCheckpointUpdate(msg.message.value, output, usageState, onConversationCheckpoint);
@@ -712,7 +792,7 @@ async function handleShellStreamArgs(
 ): Promise<void> {
 	const normalizedWorkingDirectory = args.workingDirectory || process.cwd();
 	const normalizedArgs: ShellArgs = { ...args, workingDirectory: normalizedWorkingDirectory };
-	const startTs = Date.now();
+	const startTs = performance.now();
 	log("shellStream", "start", {
 		command: (args as any).command,
 		workingDirectory: normalizedWorkingDirectory,
@@ -850,7 +930,7 @@ async function handleShellStreamArgs(
 	sendExecClientMessage(h2Request, execMsg, "shellResult", sanitizedExecResult);
 	sendExecClientStreamClose(h2Request, execMsg);
 
-	log("shellStream", "done", { elapsed: Date.now() - startTs });
+	log("shellStream", "done", { elapsed: performance.now() - startTs });
 }
 
 function sendShellStreamExitFromResult(
@@ -967,6 +1047,9 @@ async function handleExecServerMessage(
 	execHandlers: CursorExecHandlers | undefined,
 	onToolResult: CursorToolResultHandler | undefined,
 	requestContextTools: McpToolDefinition[],
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+	state: BlockState,
 ): Promise<void> {
 	const execCase = execMsg.message.case;
 	log("exec", "dispatch", { execCase, execId: execMsg.execId, hasHandlers: !!execHandlers });
@@ -1001,6 +1084,8 @@ async function handleExecServerMessage(
 	switch (execCase) {
 		case "readArgs": {
 			const args = execMsg.message.value;
+			if (!args.toolCallId) args.toolCallId = crypto.randomUUID();
+			synthesizeCursorExecToolCall(output, stream, state, args.toolCallId, "read", { path: args.path });
 			const { execResult } = await resolveExecHandler(
 				args,
 				execHandlers?.read?.bind(execHandlers),
@@ -1014,6 +1099,11 @@ async function handleExecServerMessage(
 		}
 		case "lsArgs": {
 			const args = execMsg.message.value;
+			if (!args.toolCallId) args.toolCallId = crypto.randomUUID();
+			// Bridge maps `ls` onto the coding-agent `read` tool (see
+			// `CursorExecHandlers.ls` in `pi-coding-agent/src/cursor.ts`); mirror
+			// that here so the synthesized block matches the toolResult's `toolName`.
+			synthesizeCursorExecToolCall(output, stream, state, args.toolCallId, "read", { path: args.path });
 			const { execResult } = await resolveExecHandler(
 				args,
 				execHandlers?.ls?.bind(execHandlers),
@@ -1027,6 +1117,27 @@ async function handleExecServerMessage(
 		}
 		case "grepArgs": {
 			const args = execMsg.message.value;
+			if (!args.toolCallId) args.toolCallId = crypto.randomUUID();
+			// Cursor's model sometimes emits `grepArgs` with an empty `pattern` and a
+			// non-empty `glob`, expecting grep to list files matching the glob. Reject
+			// that up front with an actionable error so the model retries with a real
+			// regex or switches to `ls`/`read`, instead of the local grep tool
+			// surfacing a bare "Pattern must not be empty" (issue #4574) after the
+			// synthesized block has already been persisted with a placeholder pattern.
+			const emptyPatternError = emptyGrepPatternRejection(args.pattern, args.glob);
+			if (emptyPatternError !== null) {
+				sendExecClientMessage(h2Request, execMsg, "grepResult", buildGrepErrorResult(emptyPatternError));
+				return;
+			}
+			// Mirror the coding-agent bridge's arg mapping so live UI (from
+			// `tool_execution_start`) and rebuilt transcript (from this block)
+			// display identical args.
+			const searchPath = args.glob ? `${args.path || "."}/${args.glob}` : args.path || ".";
+			synthesizeCursorExecToolCall(output, stream, state, args.toolCallId, "grep", {
+				pattern: args.pattern,
+				path: searchPath,
+				case: args.caseInsensitive === true ? false : undefined,
+			});
 			const { execResult } = await resolveExecHandler(
 				args,
 				execHandlers?.grep?.bind(execHandlers),
@@ -1040,6 +1151,13 @@ async function handleExecServerMessage(
 		}
 		case "writeArgs": {
 			const args = execMsg.message.value;
+			if (!args.toolCallId) args.toolCallId = crypto.randomUUID();
+			// Match the bridge: prefer `fileText`, fall back to decoded `fileBytes`.
+			const content = args.fileText ?? new TextDecoder().decode(args.fileBytes ?? new Uint8Array());
+			synthesizeCursorExecToolCall(output, stream, state, args.toolCallId, "write", {
+				path: args.path,
+				content,
+			});
 			const { execResult } = await resolveExecHandler(
 				args,
 				execHandlers?.write?.bind(execHandlers),
@@ -1062,6 +1180,8 @@ async function handleExecServerMessage(
 		}
 		case "deleteArgs": {
 			const args = execMsg.message.value;
+			if (!args.toolCallId) args.toolCallId = crypto.randomUUID();
+			synthesizeCursorExecToolCall(output, stream, state, args.toolCallId, "delete", { path: args.path });
 			const { execResult } = await resolveExecHandler(
 				args,
 				execHandlers?.delete?.bind(execHandlers),
@@ -1075,7 +1195,16 @@ async function handleExecServerMessage(
 		}
 		case "shellArgs": {
 			const args = execMsg.message.value;
+			if (!args.toolCallId) args.toolCallId = crypto.randomUUID();
 			const normalizedArgs: ShellArgs = { ...args, workingDirectory: args.workingDirectory || process.cwd() };
+			// Match the bridge (`CursorExecHandlers.shell`): map `workingDirectory`
+			// → `cwd`, drop non-positive timeouts.
+			const shellTimeout = args.timeout && args.timeout > 0 ? args.timeout : undefined;
+			synthesizeCursorExecToolCall(output, stream, state, args.toolCallId, "bash", {
+				command: args.command,
+				cwd: args.workingDirectory || undefined,
+				timeout: shellTimeout,
+			});
 			const { execResult } = await resolveExecHandler(
 				args,
 				execHandlers?.shell?.bind(execHandlers),
@@ -1090,6 +1219,13 @@ async function handleExecServerMessage(
 		}
 		case "shellStreamArgs": {
 			const args = execMsg.message.value;
+			if (!args.toolCallId) args.toolCallId = crypto.randomUUID();
+			const shellStreamTimeout = args.timeout && args.timeout > 0 ? args.timeout : undefined;
+			synthesizeCursorExecToolCall(output, stream, state, args.toolCallId, "bash", {
+				command: args.command,
+				cwd: args.workingDirectory || undefined,
+				timeout: shellStreamTimeout,
+			});
 			await handleShellStreamArgs(args, execMsg, h2Request, execHandlers, onToolResult);
 			return;
 		}
@@ -1137,6 +1273,13 @@ async function handleExecServerMessage(
 		}
 		case "diagnosticsArgs": {
 			const args = execMsg.message.value;
+			if (!args.toolCallId) args.toolCallId = crypto.randomUUID();
+			// Bridge maps `diagnostics` onto the coding-agent `lsp` tool with
+			// `action: "diagnostics"` and `file: path`.
+			synthesizeCursorExecToolCall(output, stream, state, args.toolCallId, "lsp", {
+				action: "diagnostics",
+				file: args.path,
+			});
 			const { execResult } = await resolveExecHandler(
 				args,
 				execHandlers?.diagnostics?.bind(execHandlers),
@@ -1710,6 +1853,31 @@ function buildGrepErrorResult(error: string) {
 	});
 }
 
+/**
+ * Reject a Cursor exec-channel `grepArgs` frame whose `pattern` is empty or
+ * whitespace-only. Returns an actionable error message when the pattern is
+ * unusable (with a `glob`-aware hint when the model likely meant to list
+ * files), or `null` when the pattern is valid and grep should run.
+ *
+ * Exported for tests. Cursor's model sometimes sends `pattern=""` together
+ * with a non-empty `glob`, expecting grep to enumerate matching files; the
+ * downstream coding-agent `grep` tool rejects that with a bare "Pattern must
+ * not be empty", which the TUI renders as `?` in the tool preview (issue
+ * #4574). Handling it at the Cursor exec dispatch keeps the synthesized
+ * `toolCall` block off the persisted assistant message and gives the model a
+ * specific recovery hint.
+ */
+export function emptyGrepPatternRejection(pattern: string | undefined, glob: string | undefined): string | null {
+	if (pattern && pattern.trim().length > 0) return null;
+	if (glob && glob.length > 0) {
+		return (
+			`grep pattern is required (received an empty pattern). To list files matching "${glob}", ` +
+			`pass a non-empty regex (e.g. ".") and set path to that glob, or use the ls/read tool instead.`
+		);
+	}
+	return "grep pattern is required (received an empty pattern).";
+}
+
 function buildDiagnosticsResultFromToolResult(path: string, toolResult: ToolResultMessage) {
 	const text = toolResultToText(toolResult);
 	if (toolResult.isError) {
@@ -1751,13 +1919,10 @@ function parseToolArgsJson(text: string): unknown {
 		return text;
 	}
 	try {
-		const normalized = trimmed
-			.replace(/\bNone\b/g, "null")
-			.replace(/\bTrue\b/g, "true")
-			.replace(/\bFalse\b/g, "false");
-		return Bun.JSON5.parse(normalized);
-	} catch {}
-	return text;
+		return parseJsonWithRepair<unknown>(trimmed);
+	} catch {
+		return text;
+	}
 }
 
 function decodeMcpArgValue(value: Uint8Array): unknown {
@@ -1826,7 +1991,7 @@ interface CursorUpdateTodosToolCall {
 	updateTodosToolCall?: { args?: { todos?: CursorTodoItem[] } };
 }
 
-function buildTodoWriteArgs(toolCall: CursorUpdateTodosToolCall): {
+function buildTodoArgs(toolCall: CursorUpdateTodosToolCall): {
 	todos: Array<{ id?: string; content: string; activeForm: string; status: "pending" | "in_progress" | "completed" }>;
 } | null {
 	const todos = toolCall.updateTodosToolCall?.args?.todos;
@@ -1894,7 +2059,114 @@ function buildMcpErrorResult(error: string) {
 	});
 }
 
-function processInteractionUpdate(
+/**
+ * Merge the decoded completion-frame `McpArgs` map into the args assembled
+ * from streamed `args_text_delta` snapshots.
+ *
+ * The completion frame is authoritative for the scalars it carries — but it
+ * can omit oversized parameters entirely and can downgrade a structured value
+ * to its raw string fallback when `decodeMcpArgValue` cannot parse it as
+ * JSON. Overwriting the streamed args wholesale therefore loses data (e.g.
+ * the task tool's `tasks` array on multi-subagent dispatches, issue #2615).
+ *
+ * Rules per key:
+ * - completion key absent  → keep the streamed value.
+ * - completion is a string while the streamed value is structured (object or
+ *   array) → keep the streamed value (the completion frame downgraded it).
+ * - otherwise               → completion wins.
+ */
+export function mergeCursorMcpToolCallArgs(
+	streamed: Record<string, unknown> | undefined,
+	completion: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+	const merged: Record<string, unknown> = { ...(streamed ?? {}) };
+	if (!completion) return merged;
+	for (const [key, completionValue] of Object.entries(completion)) {
+		const streamedValue = merged[key];
+		if (typeof completionValue === "string" && streamedValue !== null && typeof streamedValue === "object") {
+			continue;
+		}
+		merged[key] = completionValue;
+	}
+	return merged;
+}
+
+function endCurrentTextBlock(output: AssistantMessage, stream: AssistantMessageEventStream, state: BlockState): void {
+	const block = state.currentTextBlock;
+	if (!block) return;
+	const idx = output.content.indexOf(block);
+	stream.push({
+		type: "text_end",
+		contentIndex: idx,
+		content: block.text,
+		partial: output,
+	});
+	state.setTextBlock(null);
+}
+
+function endCurrentThinkingBlock(
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+	state: BlockState,
+): void {
+	const block = state.currentThinkingBlock;
+	if (!block) return;
+	const idx = output.content.indexOf(block);
+	stream.push({
+		type: "thinking_end",
+		contentIndex: idx,
+		content: block.thinking,
+		partial: output,
+	});
+	state.setThinkingBlock(null);
+}
+
+/**
+ * Synthesize a completed `toolCall` content block for a Cursor exec-channel
+ * native tool (`shell`, `read`, `write`, `grep`, `ls`, `delete`, `diagnostics`).
+ *
+ * Args arrive complete on the exec message, so the block opens and closes in
+ * one step — no partial-JSON streaming path. Without this the persisted
+ * assistant message carries only text/thinking blocks, and on replay the
+ * following `toolResult` messages have no matching `toolCall.id` in
+ * `renderSessionContext`, so they render as header-less `⎿` lines beneath the
+ * last text block instead of proper tool components (issue #4348).
+ *
+ * The block is stamped with {@link kCursorExecResolved} so the shared
+ * `agent-loop.ts` execution pass skips it — Cursor's server-driven exec
+ * channel already ran the tool via the bridge and buffered the result, so
+ * treating this block as runnable would re-execute the same side-effecting
+ * tool a second time.
+ *
+ * Exported for tests to exercise ordering with adjacent text/thinking blocks.
+ */
+export function synthesizeCursorExecToolCall(
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+	state: BlockState,
+	toolCallId: string,
+	toolName: string,
+	args: Record<string, unknown>,
+): void {
+	endCurrentTextBlock(output, stream, state);
+	endCurrentThinkingBlock(output, stream, state);
+	const block: ToolCallState = {
+		type: "toolCall",
+		id: toolCallId,
+		name: toolName,
+		arguments: args,
+		[kStreamingBlockIndex]: output.content.length,
+		[kStreamingBlockKind]: "cursor-exec",
+		[kCursorExecResolved]: true,
+	};
+	output.content.push(block);
+	const idx = output.content.length - 1;
+	stream.push({ type: "toolcall_start", contentIndex: idx, partial: output });
+	stream.push({ type: "toolcall_end", contentIndex: idx, toolCall: block, partial: output });
+}
+
+/** Exported for tests: drives one Cursor interaction update through the streaming state machine. */
+export function processInteractionUpdate(
 	update: any,
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
@@ -1909,10 +2181,10 @@ function processInteractionUpdate(
 		state.setFirstTokenTime();
 		const delta = update.message.value.text || "";
 		if (!state.currentTextBlock) {
-			const block: TextContent & { index: number } = {
+			const block: TextContent & { [kStreamingBlockIndex]: number } = {
 				type: "text",
 				text: "",
-				index: output.content.length,
+				[kStreamingBlockIndex]: output.content.length,
 			};
 			output.content.push(block);
 			state.setTextBlock(block);
@@ -1925,10 +2197,10 @@ function processInteractionUpdate(
 		state.setFirstTokenTime();
 		const delta = update.message.value.text || "";
 		if (!state.currentThinkingBlock) {
-			const block: ThinkingContent & { index: number } = {
+			const block: ThinkingContent & { [kStreamingBlockIndex]: number } = {
 				type: "thinking",
 				thinking: "",
-				index: output.content.length,
+				[kStreamingBlockIndex]: output.content.length,
 			};
 			output.content.push(block);
 			state.setThinkingBlock(block);
@@ -1938,18 +2210,10 @@ function processInteractionUpdate(
 		const idx = output.content.indexOf(state.currentThinkingBlock!);
 		stream.push({ type: "thinking_delta", contentIndex: idx, delta, partial: output });
 	} else if (updateCase === "thinkingCompleted") {
-		if (state.currentThinkingBlock) {
-			const idx = output.content.indexOf(state.currentThinkingBlock);
-			delete (state.currentThinkingBlock as any).index;
-			stream.push({
-				type: "thinking_end",
-				contentIndex: idx,
-				content: state.currentThinkingBlock.thinking,
-				partial: output,
-			});
-			state.setThinkingBlock(null);
-		}
+		endCurrentThinkingBlock(output, stream, state);
 	} else if (updateCase === "toolCallStarted") {
+		endCurrentTextBlock(output, stream, state);
+		endCurrentThinkingBlock(output, stream, state);
 		const toolCall = update.message.value.toolCall;
 		if (toolCall) {
 			const mcpCall = toolCall.mcpToolCall;
@@ -1960,9 +2224,9 @@ function processInteractionUpdate(
 					id: args.toolCallId || crypto.randomUUID(),
 					name: args.name || args.toolName || "",
 					arguments: {},
-					index: output.content.length,
-					partialJson: "",
-					kind: "mcp",
+					[kStreamingBlockIndex]: output.content.length,
+					[kStreamingPartialJson]: "",
+					[kStreamingBlockKind]: "mcp",
 				};
 				output.content.push(block);
 				state.setToolCall(block);
@@ -1970,16 +2234,16 @@ function processInteractionUpdate(
 				return;
 			}
 
-			const todoArgs = buildTodoWriteArgs(toolCall);
+			const todoArgs = buildTodoArgs(toolCall);
 			if (todoArgs) {
 				const callId = update.message.value.callId || crypto.randomUUID();
 				const block: ToolCallState = {
 					type: "toolCall",
 					id: callId,
-					name: "todo_write",
+					name: "todo",
 					arguments: todoArgs,
-					index: output.content.length,
-					kind: "todo_write",
+					[kStreamingBlockIndex]: output.content.length,
+					[kStreamingBlockKind]: "todo",
 				};
 				output.content.push(block);
 				state.setToolCall(block);
@@ -1987,31 +2251,53 @@ function processInteractionUpdate(
 			}
 		}
 	} else if (updateCase === "toolCallDelta" || updateCase === "partialToolCall") {
-		if (state.currentToolCall?.kind === "mcp") {
-			const delta = update.message.value.argsTextDelta || "";
-			state.currentToolCall.partialJson = `${state.currentToolCall.partialJson ?? ""}${delta}`;
-			state.currentToolCall.arguments = parseStreamingJson(state.currentToolCall.partialJson ?? "");
+		if (state.currentToolCall?.[kStreamingBlockKind] === "mcp") {
+			// Cursor's `args_text_delta` is "aggregated args text so far" per agent.proto: each
+			// delta is a cumulative snapshot of the JSON-text args. Strip the prefix we already
+			// have to recover the new suffix; fall back to treating the value as an incremental
+			// fragment when it doesn't extend the buffer.
+			const snapshot: string = update.message.value.argsTextDelta || "";
+			const current = state.currentToolCall[kStreamingPartialJson] ?? "";
+			const chunk = snapshot.startsWith(current) ? snapshot.slice(current.length) : snapshot;
+			if (chunk.length === 0) {
+				return;
+			}
+			const nextBuffer = current + chunk;
+			state.currentToolCall[kStreamingPartialJson] = nextBuffer;
+			// Throttle mid-stream parses to keep total parse work O(N) instead of O(N²)
+			// in the argument-buffer length; the authoritative full parse runs in
+			// `toolCallCompleted` (mcp branch) and the fallback end-of-stream path.
+			const throttled = parseStreamingJsonThrottled(nextBuffer, state.currentToolCall[kStreamingLastParseLen] ?? 0);
+			if (throttled) {
+				state.currentToolCall.arguments = throttled.value;
+				state.currentToolCall[kStreamingLastParseLen] = throttled.parsedLen;
+			}
 			const idx = output.content.indexOf(state.currentToolCall);
-			stream.push({ type: "toolcall_delta", contentIndex: idx, delta, partial: output });
+			stream.push({ type: "toolcall_delta", contentIndex: idx, delta: chunk, partial: output });
 		}
 	} else if (updateCase === "toolCallCompleted") {
 		if (state.currentToolCall) {
 			const toolCall = update.message.value.toolCall;
-			if (state.currentToolCall.kind === "mcp") {
-				const decodedArgs = decodeMcpArgsMap(toolCall?.mcpToolCall?.args?.args);
-				if (decodedArgs) {
-					state.currentToolCall.arguments = decodedArgs;
+			if (state.currentToolCall[kStreamingBlockKind] === "mcp") {
+				// Authoritative full parse of the accumulated argument buffer; the delta
+				// path throttles mid-stream parses, so `arguments` may lag the buffer.
+				const partial = state.currentToolCall[kStreamingPartialJson];
+				if (partial !== undefined) {
+					state.currentToolCall.arguments = parseStreamingJson(partial);
 				}
-			} else if (state.currentToolCall.kind === "todo_write" && toolCall) {
-				const todoArgs = buildTodoWriteArgs(toolCall);
+				const decodedArgs = decodeMcpArgsMap(toolCall?.mcpToolCall?.args?.args);
+				state.currentToolCall.arguments = mergeCursorMcpToolCallArgs(
+					state.currentToolCall.arguments as Record<string, unknown> | undefined,
+					decodedArgs,
+				);
+			} else if (state.currentToolCall[kStreamingBlockKind] === "todo" && toolCall) {
+				const todoArgs = buildTodoArgs(toolCall);
 				if (todoArgs) {
 					state.currentToolCall.arguments = todoArgs;
 				}
 			}
 			const idx = output.content.indexOf(state.currentToolCall);
-			delete (state.currentToolCall as any).partialJson;
-			delete (state.currentToolCall as any).index;
-			delete (state.currentToolCall as any).kind;
+			clearStreamingPartialJson(state.currentToolCall);
 			stream.push({ type: "toolcall_end", contentIndex: idx, toolCall: state.currentToolCall, partial: output });
 			state.setToolCall(null);
 		}
@@ -2055,7 +2341,15 @@ function storeCursorBlob(blobStore: Map<string, Uint8Array>, data: Uint8Array): 
 	return blobId;
 }
 
-const CURSOR_NATIVE_TOOL_NAMES = new Set(["bash", "read", "write", "delete", "ls", "grep", "lsp", "todo_write"]);
+function readCursorBlob(blobStore: Map<string, Uint8Array>, blobId: Uint8Array): Uint8Array {
+	const data = blobStore.get(Buffer.from(blobId).toString("hex"));
+	if (!data) {
+		throw new AIError.ValidationError("Cursor blob not found");
+	}
+	return data;
+}
+
+const CURSOR_NATIVE_TOOL_NAMES = new Set(["bash", "read", "write", "delete", "ls", "grep", "lsp", "todo"]);
 
 function buildMcpToolDefinitions(tools: Tool[] | undefined): McpToolDefinition[] {
 	if (!tools || tools.length === 0) {
@@ -2098,6 +2392,52 @@ function extractUserMessageText(msg: Message): string {
 	return text.trim();
 }
 
+function hasUserMessageImages(msg: Message): boolean {
+	return (
+		(msg.role === "user" || msg.role === "developer") &&
+		Array.isArray(msg.content) &&
+		msg.content.some(item => item.type === "image")
+	);
+}
+
+type CursorRootPromptContentPart = { type: "text"; text: string } | { type: "image"; image: string; mediaType: string };
+
+function buildCursorRootPromptContent(content: string | (TextContent | ImageContent)[]): CursorRootPromptContentPart[] {
+	if (typeof content === "string") {
+		const text = content.trim();
+		return text ? [{ type: "text", text }] : [];
+	}
+	const parts: CursorRootPromptContentPart[] = [];
+	for (const item of content) {
+		if (item.type === "text") {
+			const text = item.text.trim();
+			if (text) {
+				parts.push({ type: "text", text });
+			}
+		} else {
+			parts.push({ type: "image", image: item.data, mediaType: item.mimeType });
+		}
+	}
+	return parts;
+}
+
+function cursorUserContentKey(content: string | (TextContent | ImageContent)[]): string {
+	if (typeof content === "string") {
+		return content.trim();
+	}
+	const hash = createHash("sha256");
+	for (const item of content) {
+		hash.update(item.type);
+		if (item.type === "text") {
+			hash.update(item.text);
+		} else {
+			hash.update(item.mimeType);
+			hash.update(item.data);
+		}
+	}
+	return hash.digest("hex");
+}
+
 /**
  * Extract text content from an assistant message.
  */
@@ -2108,17 +2448,6 @@ function extractAssistantMessageText(msg: Message): string {
 		.filter((c): c is TextContent => c.type === "text")
 		.map(c => c.text)
 		.join("\n");
-}
-
-/**
- * Derive a stable, UUID-formatted `message_id` from a content key.
- * Ensures identical historical messages hash to the same blob IDs across
- * requests, so `conversationBlobStores` does not grow unboundedly and
- * unchanged history reuses existing blob IDs.
- */
-function deterministicMessageId(key: string): string {
-	const hex = createHash("sha256").update(key).digest("hex");
-	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
 }
 
 /**
@@ -2145,7 +2474,7 @@ function findLastUserMessageIndex(messages: Message[]): number {
  * actual model prompt. `turns[]` is UI/display metadata. Without populating
  * this field, multi-turn conversations lose prior context — the model sees
  * only an empty placeholder where historical user turns should be.
- * The last user message is excluded because it is sent in the action.
+ * The active user message is excluded because it is sent in the action.
  */
 /**
  * Build one Cursor system-message JSON blob per ordered system prompt. Emitting separate blobs
@@ -2168,22 +2497,21 @@ function buildRootPromptMessagesJson(
 	messages: Message[],
 	systemPromptIds: Uint8Array[],
 	blobStore: Map<string, Uint8Array>,
+	activeUserMessageIndex = findLastUserMessageIndex(messages),
 ): Uint8Array[] {
 	const entries: Uint8Array[] = [...systemPromptIds];
-	const lastUserIdx = findLastUserMessageIndex(messages);
-
 	const pushJson = (obj: unknown) => {
 		const bytes = new TextEncoder().encode(JSON.stringify(obj));
 		entries.push(storeCursorBlob(blobStore, bytes));
 	};
 
 	for (let i = 0; i < messages.length; i++) {
-		if (i === lastUserIdx) break;
+		if (i === activeUserMessageIndex) break;
 		const msg = messages[i];
 		if (msg.role === "user" || msg.role === "developer") {
-			const text = extractUserMessageText(msg);
-			if (!text) continue;
-			pushJson({ role: "user", content: [{ type: "text", text }] });
+			const content = buildCursorRootPromptContent(msg.content);
+			if (content.length === 0) continue;
+			pushJson({ role: "user", content });
 		} else if (msg.role === "assistant") {
 			const text = extractAssistantMessageText(msg);
 			if (!text) continue;
@@ -2191,9 +2519,10 @@ function buildRootPromptMessagesJson(
 		} else if (msg.role === "toolResult") {
 			const text = toolResultToText(msg);
 			if (!text) continue;
+			const prefix = msg.isError ? "[Tool Error]" : "[Tool Result]";
 			pushJson({
 				role: "user",
-				content: [{ type: "text", text: `[Tool Result]\n${text}` }],
+				content: [{ type: "text", text: `${prefix}\n${text}` }],
 			});
 		}
 	}
@@ -2204,12 +2533,16 @@ function buildRootPromptMessagesJson(
 /**
  * Convert context.messages to Cursor's ConversationTurnStructure blob IDs.
  * Groups messages into turns: each turn is a user message followed by the assistant's response.
- * Excludes the last user message (which goes in the action).
+ * Excludes the active user message (which goes in the action).
  *
  * Each `AgentConversationTurnStructure.user_message`, `steps[]`, and the outer
  * `ConversationStateStructure.turns[]` entry is a blob ID into `blobStore`.
  */
-function buildConversationTurns(messages: Message[], blobStore: Map<string, Uint8Array>): Uint8Array[] {
+function buildConversationTurns(
+	messages: Message[],
+	blobStore: Map<string, Uint8Array>,
+	activeUserMessageIndex = findLastUserMessageIndex(messages),
+): Uint8Array[] {
 	const turns: Uint8Array[] = [];
 
 	// Find turn boundaries - each turn starts with a user message
@@ -2223,29 +2556,25 @@ function buildConversationTurns(messages: Message[], blobStore: Map<string, Uint
 			continue;
 		}
 
-		// Check if this is the last user message (which goes in the action, not turns)
-		let isLastUserMessage = true;
-		for (let j = i + 1; j < messages.length; j++) {
-			if (messages[j].role === "user" || messages[j].role === "developer") {
-				isLastUserMessage = false;
-				break;
-			}
-		}
-		if (isLastUserMessage) {
+		// The active user message goes in the action, not turns. A prior user
+		// followed by assistant/tool-result messages is complete history and
+		// must remain serialized for resume actions.
+		if (i === activeUserMessageIndex) {
 			break;
 		}
 
 		// Create and serialize user message
 		const userText = extractUserMessageText(msg);
-		if (!userText || userText.length === 0) {
+		if (userText.length === 0 && !hasUserMessageImages(msg)) {
 			i++;
 			continue;
 		}
 
-		const userMessage = create(UserMessageSchema, {
-			text: userText,
-			messageId: deterministicMessageId(`u:${turns.length}:${userText}`),
-		});
+		const userMessage = createCursorUserMessage(
+			msg.content,
+			userText,
+			deterministicUuid(`u:${turns.length}:${cursorUserContentKey(msg.content)}`),
+		);
 		const userMessageBytes = toBinary(UserMessageSchema, userMessage);
 		const userMessageBlobId = storeCursorBlob(blobStore, userMessageBytes);
 
@@ -2271,10 +2600,11 @@ function buildConversationTurns(messages: Message[], blobStore: Map<string, Uint
 				// Include tool results as assistant text for context
 				const text = toolResultToText(stepMsg);
 				if (text) {
+					const prefix = stepMsg.isError ? "[Tool Error]" : "[Tool Result]";
 					const step = create(ConversationStepSchema, {
 						message: {
 							case: "assistantMessage",
-							value: create(AssistantMessageSchema, { text: `[Tool Result]\n${text}` }),
+							value: create(AssistantMessageSchema, { text: `${prefix}\n${text}` }),
 						},
 					});
 					stepBlobIds.push(storeCursorBlob(blobStore, toBinary(ConversationStepSchema, step)));
@@ -2302,6 +2632,71 @@ function buildConversationTurns(messages: Message[], blobStore: Map<string, Uint
 	return turns;
 }
 
+/** Exported for tests: decodes Cursor history blobs built from conversation messages. */
+export function buildCursorHistoryForTest(
+	messages: Message[],
+	activeUserMessageIndex = findLastUserMessageIndex(messages),
+): {
+	rootPromptMessagesJson: unknown[];
+	turnUserMessagesJson: JsonValue[];
+	turnStepMessagesJson: JsonValue[][];
+} {
+	const blobStore = new Map<string, Uint8Array>();
+	const rootPromptMessagesJson = buildRootPromptMessagesJson(messages, [], blobStore, activeUserMessageIndex).map(
+		blobId => JSON.parse(new TextDecoder().decode(readCursorBlob(blobStore, blobId))),
+	);
+	const turnUserMessagesJson: JsonValue[] = [];
+	const turnStepMessagesJson: JsonValue[][] = [];
+	for (const turnBlobId of buildConversationTurns(messages, blobStore, activeUserMessageIndex)) {
+		const turn = fromBinary(ConversationTurnStructureSchema, readCursorBlob(blobStore, turnBlobId));
+		if (turn.turn.case !== "agentConversationTurn") {
+			continue;
+		}
+		const userMessage = fromBinary(UserMessageSchema, readCursorBlob(blobStore, turn.turn.value.userMessage));
+		turnUserMessagesJson.push(toJson(UserMessageSchema, userMessage));
+		turnStepMessagesJson.push(
+			turn.turn.value.steps.map(stepBlobId => {
+				const step = fromBinary(ConversationStepSchema, readCursorBlob(blobStore, stepBlobId));
+				return toJson(ConversationStepSchema, step);
+			}),
+		);
+	}
+	return { rootPromptMessagesJson, turnUserMessagesJson, turnStepMessagesJson };
+}
+function createCursorUserMessage(
+	content: string | (TextContent | ImageContent)[],
+	text: string,
+	messageId = crypto.randomUUID(),
+) {
+	const images = typeof content === "string" ? [] : extractImages(content);
+	return create(UserMessageSchema, {
+		text,
+		messageId,
+		...(images.length > 0
+			? {
+					selectedContext: create(SelectedContextSchema, {
+						selectedImages: images,
+					}),
+				}
+			: {}),
+	});
+}
+
+function extractImages(content: (TextContent | ImageContent)[]) {
+	return content
+		.filter((item): item is ImageContent => item.type === "image")
+		.map(image =>
+			create(SelectedImageSchema, {
+				uuid: crypto.randomUUID(),
+				mimeType: image.mimeType,
+				dataOrBlobId: {
+					case: "data",
+					value: Uint8Array.from(Buffer.from(image.data, "base64")),
+				},
+			}),
+		);
+}
+
 function buildGrpcRequest(
 	model: Model<"cursor-agent">,
 	context: Context,
@@ -2322,40 +2717,52 @@ function buildGrpcRequest(
 		storeCursorBlob(blobStore, new TextEncoder().encode(json)),
 	);
 
-	const lastMessage = context.messages[context.messages.length - 1];
-	const userText =
-		lastMessage?.role === "user" || lastMessage?.role === "developer"
-			? typeof lastMessage.content === "string"
-				? lastMessage.content.trim()
-				: extractText(lastMessage.content)
-			: "";
-
-	// Validate that we have non-empty user text for the action
-	if (!userText || userText.trim().length === 0) {
-		throw new Error("Cannot send empty user message to Cursor API");
+	const activeUserMessageIndex = context.messages.length - 1;
+	const activeMessage = context.messages[activeUserMessageIndex];
+	const activeUserMessage =
+		activeMessage?.role === "user" || activeMessage?.role === "developer" ? activeMessage : undefined;
+	let userContent: string | (TextContent | ImageContent)[] | undefined;
+	let userText = "";
+	let hasUserImages = false;
+	if (activeUserMessage?.role === "user" || activeUserMessage?.role === "developer") {
+		userContent = activeUserMessage.content;
+		if (typeof userContent === "string") {
+			userText = userContent.trim();
+		} else {
+			userText = extractText(userContent);
+			hasUserImages = hasImages(userContent);
+		}
 	}
 
-	const userMessage = create(UserMessageSchema, {
-		text: userText,
-		messageId: crypto.randomUUID(),
-	});
-
 	const action = create(ConversationActionSchema, {
-		action: {
-			case: "userMessageAction",
-			value: create(UserMessageActionSchema, { userMessage }),
-		},
+		action:
+			userContent && (userText.trim().length > 0 || hasUserImages)
+				? {
+						case: "userMessageAction",
+						value: create(UserMessageActionSchema, {
+							userMessage: createCursorUserMessage(userContent, userText),
+						}),
+					}
+				: {
+						case: "resumeAction",
+						value: create(ResumeActionSchema, {}),
+					},
 	});
 
-	// Build conversation turns from prior messages (excluding the last user message).
-	// This populates the UI-side history view (`turns[]`).
-	const turns = buildConversationTurns(context.messages, blobStore);
+	// Build conversation turns from prior messages, excluding only the active user message
+	// when the request is sending one. Resume actions must preserve trailing tool results.
+	const turns = buildConversationTurns(context.messages, blobStore, activeUserMessage ? activeUserMessageIndex : -1);
 
 	// Build `rootPromptMessagesJson` from prior messages. Cursor's server uses this
 	// field (not `turns[]`) to construct the actual model prompt; if we only send the
 	// system prompt here, multi-turn conversations lose prior context and the model
 	// sees only the current user message.
-	const rootPromptMessagesJson = buildRootPromptMessagesJson(context.messages, systemPromptIds, blobStore);
+	const rootPromptMessagesJson = buildRootPromptMessagesJson(
+		context.messages,
+		systemPromptIds,
+		blobStore,
+		activeUserMessage ? activeUserMessageIndex : -1,
+	);
 
 	// Preserve cached non-history state fields (todos, file states, summaries, etc.)
 	// when the system prompt is unchanged; otherwise start fresh.
@@ -2432,6 +2839,9 @@ function buildGrpcRequest(
 	return { requestBytes, blobStore, conversationState };
 }
 
+function hasImages(content: (TextContent | ImageContent)[]): boolean {
+	return content.some(item => item.type === "image");
+}
 function extractText(content: (TextContent | ImageContent)[]): string {
 	return content
 		.filter((c): c is TextContent => c.type === "text")

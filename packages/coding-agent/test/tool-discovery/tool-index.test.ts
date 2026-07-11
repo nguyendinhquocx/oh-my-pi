@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import type { DiscoverableTool } from "../../src/tool-discovery/tool-index";
+import type { DiscoverableTool } from "@oh-my-pi/pi-coding-agent/tool-discovery/tool-index";
 import {
 	buildDiscoverableToolSearchIndex,
 	collectDiscoverableTools,
@@ -10,7 +10,8 @@ import {
 	searchDiscoverableTools,
 	selectDiscoverableToolNamesByServer,
 	summarizeDiscoverableTools,
-} from "../../src/tool-discovery/tool-index";
+} from "@oh-my-pi/pi-coding-agent/tool-discovery/tool-index";
+import { type } from "arktype";
 
 // ─── Minimal AgentTool stub ───────────────────────────────────────────────────
 
@@ -114,6 +115,14 @@ describe("getDiscoverableTool", () => {
 		});
 		const result = getDiscoverableTool(tool);
 		// sorted alphabetically
+		expect(result!.schemaKeys).toEqual(["alpha", "beta", "gamma"]);
+	});
+
+	it("extracts schema keys from Zod-schema parameters via wire conversion", () => {
+		const tool = makeAgentTool("foo", {
+			parameters: type({ gamma: "string", alpha: "number?", beta: "boolean" }),
+		});
+		const result = getDiscoverableTool(tool);
 		expect(result!.schemaKeys).toEqual(["alpha", "beta", "gamma"]);
 	});
 });
@@ -252,8 +261,8 @@ describe("BM25 search", () => {
 			schemaKeys: ["channel", "text"],
 		},
 		{
-			name: "find",
-			label: "find",
+			name: "glob",
+			label: "glob",
 			summary: "Find files and directories matching a glob pattern",
 			source: "builtin",
 			schemaKeys: ["pattern", "path"],
@@ -275,7 +284,7 @@ describe("BM25 search", () => {
 
 	it("finds built-in tools too", () => {
 		const results = searchDiscoverableTools(index, "find files", 5);
-		expect(results.some(r => r.tool.name === "find")).toBe(true);
+		expect(results.some(r => r.tool.name === "glob")).toBe(true);
 	});
 
 	it("respects the limit", () => {
@@ -298,48 +307,5 @@ describe("BM25 search", () => {
 		const emptyIndex = buildDiscoverableToolSearchIndex([]);
 		const results = searchDiscoverableTools(emptyIndex, "github", 5);
 		expect(results).toHaveLength(0);
-	});
-});
-
-// ─── Back-compat: legacy MCP functions ───────────────────────────────────────
-
-describe("back-compat MCP functions via mcp/discoverable-tool-metadata", () => {
-	it("isMCPToolName still works", async () => {
-		const { isMCPToolName: legacyIsMCPToolName } = await import("../../src/mcp/discoverable-tool-metadata");
-		expect(legacyIsMCPToolName("mcp__foo")).toBe(true);
-		expect(legacyIsMCPToolName("read")).toBe(false);
-	});
-
-	it("collectDiscoverableMCPTools still works", async () => {
-		const { collectDiscoverableMCPTools } = await import("../../src/mcp/discoverable-tool-metadata");
-		const tools = [
-			mcpAgentTool("mcp__gh_search", "github", "search", "Search repos", ["query"]),
-			makeAgentTool("read"), // non-MCP — should be filtered out
-		];
-		const result = collectDiscoverableMCPTools(tools as any);
-		expect(result).toHaveLength(1);
-		expect(result[0]!.name).toBe("mcp__gh_search");
-		expect(result[0]!.description).toBe("Search repos");
-	});
-
-	it("buildDiscoverableMCPSearchIndex still works and is searchable", async () => {
-		const { buildDiscoverableMCPSearchIndex, searchDiscoverableMCPTools } = await import(
-			"../../src/mcp/discoverable-tool-metadata"
-		);
-		const legacyTools = [
-			{
-				name: "mcp__test",
-				label: "test/tool",
-				description: "A test MCP tool",
-				serverName: "test",
-				mcpToolName: "tool",
-				schemaKeys: ["query"],
-			},
-		];
-		const index = buildDiscoverableMCPSearchIndex(legacyTools);
-		expect(index.documents).toHaveLength(1);
-		const results = searchDiscoverableMCPTools(index, "test", 5);
-		expect(results).toHaveLength(1);
-		expect(results[0]!.tool.name).toBe("mcp__test");
 	});
 });

@@ -1,9 +1,11 @@
 import { Box, Container, Spacer, Text } from "@oh-my-pi/pi-tui";
 import { theme } from "../../modes/theme/theme";
-import type { TodoItem } from "../../tools/todo-write";
+import type { TodoItem } from "../../tools/todo";
 
 /**
- * Component that renders a todo completion reminder notification.
+ * Component that renders a todo completion reminder notification, committed into
+ * the transcript like a TTSR notification so it stays anchored in history rather
+ * than floating above the editor.
  * Shows when the agent stops with incomplete todos.
  */
 export class TodoReminderComponent extends Container {
@@ -19,6 +21,7 @@ export class TodoReminderComponent extends Container {
 		this.addChild(new Spacer(1));
 
 		this.#box = new Box(1, 1, t => theme.inverse(theme.fg("warning", t)));
+		this.#box.setIgnoreTight(true);
 		this.addChild(this.#box);
 
 		this.#rebuild();

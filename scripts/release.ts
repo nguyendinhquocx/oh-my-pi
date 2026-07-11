@@ -3,20 +3,20 @@
  * Release script for pi-mono
  *
  * Usage:
- *   bun scripts/release.ts <version>   Full release (preflight, version, changelog, commit, push, watch)
- *   bun scripts/release.ts watch       Watch CI for current commit
+ *   bun scripts/release.ts <version|major|minor|patch>   Full release (preflight, version, changelog, commit, push, watch)
+ *   bun scripts/release.ts watch                         Watch CI for current commit
  *
- * Example: bun scripts/release.ts 3.10.0
+ * Example: bun scripts/release.ts minor
  */
-
 import { $, Glob } from "bun";
+import { runChangelogFixer } from "./fix-changelogs";
 
 const changelogGlob = new Glob("packages/*/CHANGELOG.md");
 const packageJsonGlob = new Glob("packages/*/package.json");
 const cargoTomlGlob = new Glob("crates/*/Cargo.toml");
 
 function git(args: readonly string[]) {
-	return $`git -c core.fsmonitor=false -c core.untrackedCache=false ${args}`;
+	return $`git -c core.fsmonitor=false -c core.untrackedCache=false -c fetch.pruneTags=false ${args}`;
 }
 
 // =============================================================================
@@ -40,11 +40,10 @@ async function watchCI(): Promise<boolean> {
 
 		// Check job-level status for in-progress runs (fail fast on first job failure)
 		const failedJobs: Array<{ workflow: string; job: string; jobId: number; conclusion: string }> = [];
-		const inProgressRuns = runs.filter((r) => r.status === "in_progress" || r.status === "queued");
+		const inProgressRuns = runs.filter(r => r.status === "in_progress" || r.status === "queued");
 
 		for (const run of inProgressRuns) {
-			const jobsOutput =
-				await $`gh run view ${run.databaseId} --json jobs`.quiet().nothrow().text();
+			const jobsOutput = await $`gh run view ${run.databaseId} --json jobs`.quiet().nothrow().text();
 			try {
 				const { jobs } = JSON.parse(jobsOutput) as {
 					jobs: Array<{ name: string; databaseId: number; status: string; conclusion: string | null }>;
@@ -80,9 +79,9 @@ async function watchCI(): Promise<boolean> {
 		}
 
 		// Check workflow-level status
-		const pending = runs.filter((r) => r.status !== "completed");
-		const failed = runs.filter((r) => r.status === "completed" && r.conclusion !== "success");
-		const passed = runs.filter((r) => r.status === "completed" && r.conclusion === "success");
+		const pending = runs.filter(r => r.status !== "completed");
+		const failed = runs.filter(r => r.status === "completed" && r.conclusion !== "success");
+		const passed = runs.filter(r => r.status === "completed" && r.conclusion === "success");
 
 		console.log(`  ${passed.length} passed, ${pending.length} pending, ${failed.length} failed`);
 
@@ -172,7 +171,19 @@ async function cmdWatch(): Promise<void> {
 function parseVersion(v: string): [number, number, number] {
 	const match = v.replace(/^v/, "").match(/^(\d+)\.(\d+)\.(\d+)/);
 	if (!match) throw new Error(`Invalid version: ${v}`);
-	return [parseInt(match[1]), parseInt(match[2]), parseInt(match[3])];
+	return [parseInt(match[1], 10), parseInt(match[2], 10), parseInt(match[3], 10)];
+}
+
+function bumpVersion(current: string, bump: "major" | "minor" | "patch"): string {
+	const [major, minor, patch] = parseVersion(current);
+	switch (bump) {
+		case "major":
+			return `${major + 1}.0.0`;
+		case "minor":
+			return `${major}.${minor + 1}.0`;
+		case "patch":
+			return `${major}.${minor}.${patch + 1}`;
+	}
 }
 
 function compareVersions(a: string, b: string): number {
@@ -183,7 +194,7 @@ function compareVersions(a: string, b: string): number {
 	return aPatch - bPatch;
 }
 
-async function cmdRelease(version: string): Promise<void> {
+async function cmdRelease(versionOrBump: string): Promise<void> {
 	console.log("\n=== Release Script ===\n");
 
 	// 1. Pre-flight checks
@@ -204,7 +215,13 @@ async function cmdRelease(version: string): Promise<void> {
 	}
 	console.log("  Working directory clean");
 
-	const latestTag = (await git(["describe", "--tags", "--abbrev=0"]).text()).trim();
+	const latestTag = (await git(["describe", "--tags", "--abbrev=0", "--match", "v*"]).text()).trim();
+	let version = versionOrBump;
+	if (version === "major" || version === "minor" || version === "patch") {
+		version = bumpVersion(latestTag, version);
+		console.log(`Bumping ${versionOrBump} version from ${latestTag} -> ${version}`);
+	}
+
 	if (compareVersions(version, latestTag) <= 0) {
 		console.error(`Error: Version ${version} must be greater than latest tag ${latestTag}`);
 		process.exit(1);
@@ -239,10 +256,7 @@ async function cmdRelease(version: string): Promise<void> {
 	// Update @oh-my-pi/* catalog entries in root package.json
 	console.log("Updating root catalog versions...");
 	let rootPkgRaw = await Bun.file("package.json").text();
-	rootPkgRaw = rootPkgRaw.replace(
-		/("@oh-my-pi\/[^"]+":\s*)"[^"]+"/g,
-		`$1"${version}"`,
-	);
+	rootPkgRaw = rootPkgRaw.replace(/("@oh-my-pi\/[^"]+":\s*)"[^"]+"/g, `$1"${version}"`);
 	await Bun.write("package.json", rootPkgRaw);
 	console.log("  Updated root catalog @oh-my-pi/* entries");
 
@@ -305,6 +319,17 @@ async function cmdRelease(version: string): Promise<void> {
 
 	// 5. Update changelogs
 	console.log("Updating CHANGELOGs...");
+	// Omit `since` so the fixer resolves its own baseline: the `clog` tag (last
+	// authoritative rewrite) when newer than `latestTag`, else `latestTag`. This
+	// keeps a release run from re-promoting bullets a prior `--recover` restored.
+	const fixResult = await runChangelogFixer({});
+	for (const fixed of fixResult.changedFiles) {
+		console.log(
+			`  Fixed ${fixed.path}: ${fixed.promotedItems} promoted, ` +
+				`${fixed.mergedDuplicateHeadings} duplicate heading(s) merged, ` +
+				`${fixed.removedEmptyHeadings} empty heading(s) removed`,
+		);
+	}
 	await updateChangelogsForRelease(version);
 	console.log();
 
@@ -313,17 +338,37 @@ async function cmdRelease(version: string): Promise<void> {
 	await $`bun run check`;
 	console.log();
 
-	// 7. Commit and tag
-	console.log("Committing and tagging...");
+	// 7. Commit
+	console.log("Committing...");
 	await git(["add", "."]);
 	await git(["commit", "-m", `chore: bump version to ${version}`]);
-	await git(["tag", `v${version}`]);
 	console.log();
 
-	// 8. Push
-	console.log("Pushing to remote...");
-	await git(["push", "origin", "main"]);
-	await git(["push", "origin", `v${version}`]);
+	// 8. Tag, then push branch + tag atomically — pushing the tag by object id.
+	//
+	// This repo is in the global `[maintenance] repo = …` list, so a scheduled
+	// `git maintenance run` fetches origin with `fetch.pruneTags=true` (set
+	// globally) and deletes any local tag not yet on the remote — i.e. the
+	// brand-new release tag. The `-c fetch.pruneTags=false` on our git wrapper
+	// only governs our own git calls, not the concurrent maintenance process, so
+	// a local tag ref may vanish before or while the push resolves it.
+	//
+	// A bare push refspec (`refs/tags/v…` with no `:dst`) re-resolves the tag on
+	// disk during refspec matching (git's remote.c:match_explicit); if the prune
+	// lands in that window git dies with
+	// "refs/tags/v… cannot be resolved to branch", and if it lands before the
+	// push it dies with "src refspec … does not match any". We sidestep both by
+	// pushing the HEAD commit object id straight into the remote tag ref
+	// (`<sha>:refs/tags/v…`): the push has no dependency on a local tag, and the
+	// commit is reachable from main so maintenance cannot prune it. The local
+	// tag we still create is only for `git describe`; losing it is harmless. The
+	// default Git LFS pre-push hook uploads the branch's LFS objects as part of
+	// this same atomic push — no separate `git lfs push` is needed.
+	console.log("Tagging and pushing to remote...");
+	const tagRef = `v${version}`;
+	const sha = (await git(["rev-parse", "HEAD"]).text()).trim();
+	await git(["tag", "-f", tagRef]);
+	await git(["push", "--atomic", "origin", "refs/heads/main:refs/heads/main", `${sha}:refs/tags/${tagRef}`]);
 	console.log();
 
 	// 9. Watch CI
@@ -333,10 +378,16 @@ async function cmdRelease(version: string): Promise<void> {
 	if (success) {
 		console.log(`=== Released v${version} ===`);
 	} else {
+		// CI's `concurrency` block (.github/workflows/ci.yml) recognizes a
+		// release run by its `chore: bump version to vX.Y.Z` subject (#2564),
+		// so retries that keep that subject also get the per-sha, never-cancel
+		// group. Reword the body, not the subject.
 		console.log("\nTo retry after fixing (repeat until CI passes):");
-		console.log("  git commit -m \"fix: <brief description>\"");
-		console.log("  git push origin main");
-		console.log(`  git tag -f v${version} && git push origin v${version} --force`);
+		console.log(`  git commit -m "chore: bump version to ${version}" -m "<what was fixed>"`);
+		console.log(`  git tag -f v${version}`);
+		console.log(
+			`  git push --atomic origin refs/heads/main:refs/heads/main "+$(git rev-parse HEAD):refs/tags/v${version}"`,
+		);
 		console.log("  bun scripts/release.ts watch");
 		process.exit(1);
 	}
@@ -350,19 +401,19 @@ const arg = process.argv[2];
 
 if (!arg) {
 	console.error("Usage:");
-	console.error("  bun scripts/release.ts <version>   Full release");
-	console.error("  bun scripts/release.ts watch       Watch CI for current commit");
+	console.error("  bun scripts/release.ts <version|major|minor|patch>   Full release");
+	console.error("  bun scripts/release.ts watch                         Watch CI for current commit");
 	process.exit(1);
 }
 
 if (arg === "watch") {
 	await cmdWatch();
-} else if (/^\d+\.\d+\.\d+/.test(arg)) {
+} else if (arg === "major" || arg === "minor" || arg === "patch" || /^\d+\.\d+\.\d+$/.test(arg)) {
 	await cmdRelease(arg);
 } else {
 	console.error(`Unknown command or invalid version: ${arg}`);
 	console.error("Usage:");
-	console.error("  bun scripts/release.ts <version>   Full release");
-	console.error("  bun scripts/release.ts watch       Watch CI for current commit");
+	console.error("  bun scripts/release.ts <version|major|minor|patch>   Full release");
+	console.error("  bun scripts/release.ts watch                         Watch CI for current commit");
 	process.exit(1);
 }

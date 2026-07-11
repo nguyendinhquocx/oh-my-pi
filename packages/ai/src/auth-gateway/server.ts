@@ -11,20 +11,26 @@
  * Endpoints:
  *   GET  /healthz                          → unauth; ok + version
  *   GET  /v1/usage                         → aggregated provider usage (5-min per-credential cache via AuthStorage)
+ *   GET  /v1/credentials/check             → per-credential auth probe (diagnose 401s in a multi-account pool)
  *   GET  /v1/models                        → list known models from the registry
  *   POST /v1/chat/completions              → OpenAI chat-completions in/out
  *   POST /v1/messages                      → Anthropic messages in/out
  *   POST /v1/responses                     → OpenAI Responses in/out
  */
-import { logger } from "@oh-my-pi/pi-utils";
+
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
+import { extractHttpStatusFromError, extractRetryHint, logger } from "@oh-my-pi/pi-utils";
+import type { ApiKeyResolver } from "../auth-retry";
 import type { AuthStorage } from "../auth-storage";
-import { Effort } from "../model-thinking";
+import { classifyGatewayError } from "../error/gateway";
+import { isUsageLimitOutcome } from "../error/rate-limit";
 import * as anthropicMessages from "../providers/anthropic-messages-server";
 import * as openaiChat from "../providers/openai-chat-server";
 import * as openaiResponses from "../providers/openai-responses-server";
 import * as piNative from "../providers/pi-native-server";
-import { streamSimple } from "../stream";
+import { completeSimple, streamSimple } from "../stream";
 import type { Api, AssistantMessageEventStream, Context, Model, SimpleStreamOptions } from "../types";
+import { deterministicUuid } from "../utils/deterministic-id";
 import { parseBind } from "../utils/parse-bind";
 import { captureRequestHeaders, corsHeaders, isAuthorized, json, resolvePeer, withCors } from "./http";
 import type {
@@ -106,30 +112,28 @@ function deriveSessionId(modelId: string, context: Context): string {
 		parts.push(JSON.stringify({ role: first.role, content: first.content }));
 	}
 	const seed = parts.join("\u0000");
-	const hex = new Bun.CryptoHasher("sha256").update(seed).digest("hex");
-	// Format the leading 128 bits as a v4-shape UUID (8-4-4-4-12). Codex's
-	// `normalizeOpenAIResponsesPromptCacheKey` accepts ≤64 chars verbatim, so
-	// the 36-char UUID flows through unchanged.
-	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+	// The 36-char UUID flows through unchanged:
+	// `normalizeOpenAIPromptCacheKey` accepts ≤64 chars verbatim.
+	return deterministicUuid(seed);
 }
 
 function buildStreamOptions(parsed: ParsedFormatRequest, api: Api, signal: AbortSignal): SimpleStreamOptions {
 	const opts: SimpleStreamOptions = { signal };
 	const { options } = parsed;
-	// Codex backend rejects `temperature` / `top_p` (per-model defaults only),
-	// so we drop them silently for that one provider. Every other unsupported
-	// option is just ignored by `streamSimple` if the underlying provider
-	// doesn't honour it.
+	// Codex backend rejects every sampling control with
+	// `Unsupported parameter: …` (#3117). Strip the full set for that one
+	// provider; everything else is harmless to forward — `streamSimple` ignores
+	// what the underlying provider doesn't honour.
 	const isCodex = api === "openai-codex-responses";
 	if (options.maxOutputTokens !== undefined) opts.maxTokens = options.maxOutputTokens;
 	if (options.temperature !== undefined && !isCodex) opts.temperature = options.temperature;
 	if (options.topP !== undefined && !isCodex) opts.topP = options.topP;
-	if (options.topK !== undefined) opts.topK = options.topK;
-	if (options.minP !== undefined) opts.minP = options.minP;
-	if (options.stopSequences !== undefined) opts.stopSequences = options.stopSequences;
-	if (options.presencePenalty !== undefined) opts.presencePenalty = options.presencePenalty;
-	if (options.frequencyPenalty !== undefined) opts.frequencyPenalty = options.frequencyPenalty;
-	if (options.repetitionPenalty !== undefined) opts.repetitionPenalty = options.repetitionPenalty;
+	if (options.topK !== undefined && !isCodex) opts.topK = options.topK;
+	if (options.minP !== undefined && !isCodex) opts.minP = options.minP;
+	if (options.stopSequences !== undefined && !isCodex) opts.stopSequences = options.stopSequences;
+	if (options.presencePenalty !== undefined && !isCodex) opts.presencePenalty = options.presencePenalty;
+	if (options.frequencyPenalty !== undefined && !isCodex) opts.frequencyPenalty = options.frequencyPenalty;
+	if (options.repetitionPenalty !== undefined && !isCodex) opts.repetitionPenalty = options.repetitionPenalty;
 	if (options.metadata !== undefined) opts.metadata = options.metadata;
 	if (options.headers !== undefined) opts.headers = { ...(opts.headers ?? {}), ...options.headers };
 	if (options.toolChoice !== undefined) {
@@ -139,12 +143,15 @@ function buildStreamOptions(parsed: ParsedFormatRequest, api: Api, signal: Abort
 	if (options.reasoning !== undefined) opts.reasoning = options.reasoning;
 	if (options.disableReasoning !== undefined) opts.disableReasoning = options.disableReasoning;
 	if (options.hideThinkingSummary !== undefined) opts.hideThinkingSummary = options.hideThinkingSummary;
+	if (options.taskBudget !== undefined) opts.taskBudget = options.taskBudget;
 	if (options.serviceTier !== undefined) opts.serviceTier = options.serviceTier;
 	if (options.cacheRetention !== undefined) opts.cacheRetention = options.cacheRetention;
 	// Client-supplied `prompt_cache_key` wins; otherwise derive a stable
 	// key from the model + system + tools so prefix caching engages on
 	// Codex-class backends across turns of the same logical conversation.
-	opts.sessionId = options.promptCacheKey ?? deriveSessionId(parsed.modelId, parsed.context);
+	const promptCacheKey = options.promptCacheKey ?? deriveSessionId(parsed.modelId, parsed.context);
+	opts.promptCacheKey = promptCacheKey;
+	opts.sessionId = promptCacheKey;
 	if (options.thinkingBudgets) {
 		opts.thinkingBudgets = { ...(opts.thinkingBudgets ?? {}), ...options.thinkingBudgets };
 	}
@@ -187,53 +194,31 @@ function buildStreamOptions(parsed: ParsedFormatRequest, api: Api, signal: Abort
 }
 
 /**
- * Classify an upstream / gateway-internal error into a status code and a
- * provider-style error type tag. Used by `handleFormatEndpoint` /
- * `handlePassthrough` to drive `route.module.formatError` so every wire
- * format emits its native envelope shape.
+ * Hook fired by {@link streamSimple} when the upstream request fails in a
+ * way that's rotatable — today that's HTTP 401 (credential is bad) and
+ * usage-limit phrasing matched by {@link isUsageLimitError} (Codex's
+ * `usage_limit_reached`, Anthropic's `usage_limit_reached`, Google's
+ * `resource_exhausted`, …). The two cases need different storage actions:
+ *
+ * - **usage-limit** → {@link AuthStorage.markUsageLimitReached}. Marks just
+ *   the current session's credential as temporarily blocked (honouring
+ *   `retry-after` / `resets_at` hints when present) and returns `true` only
+ *   when a sibling credential is still available. Burning the credential
+ *   with `invalidateCredentialMatching` here would orphan accounts whose
+ *   reset window is several hours away — exactly the bug this helper exists
+ *   to avoid.
+ * - **auth-failure** → {@link AuthStorage.invalidateCredentialMatching}.
+ *   Suspect/delete the row so it doesn't get re-picked next request.
+ *
+ * In both branches we return the next `getApiKey` result (sticky on the
+ * same `sessionId`) so streamSimple can transparently retry the pre-emit
+ * failure with a fresh credential. Returning `undefined` aborts the retry
+ * and surfaces the original error to the caller.
  */
-function classifyGatewayError(err: unknown): { status: number; type: string; message: string } {
-	const message = err instanceof Error ? err.message : String(err);
-	const lower = message.toLowerCase();
-
-	// Custom pi-ai errors may attach a numeric `status` property; honor it
-	// when present and pick the matching tag.
-	const statusProp =
-		typeof err === "object" && err !== null && typeof (err as { status?: unknown }).status === "number"
-			? (err as { status: number }).status | 0
-			: undefined;
-	if (statusProp !== undefined) {
-		if (statusProp === 401 || statusProp === 403)
-			return { status: statusProp, type: "authentication_error", message };
-		if (statusProp === 429) return { status: 429, type: "rate_limit_error", message };
-		if (statusProp >= 400 && statusProp < 500) return { status: statusProp, type: "invalid_request_error", message };
-		if (statusProp >= 500) return { status: statusProp, type: "upstream_error", message };
-	}
-
-	if (err instanceof Error && err.name === "AbortError") return { status: 499, type: "request_aborted", message };
-	if (lower.includes("aborted") || lower.includes("abortsignal")) {
-		return { status: 499, type: "request_aborted", message };
-	}
-	if (
-		lower.includes("401") ||
-		lower.includes("403") ||
-		lower.includes("unauthorized") ||
-		lower.includes("forbidden")
-	) {
-		return { status: 401, type: "authentication_error", message };
-	}
-	if (lower.includes("429") || lower.includes("rate") || lower.includes("quota")) {
-		return { status: 429, type: "rate_limit_error", message };
-	}
-	if (lower.includes("unsupported") || lower.includes("invalid")) {
-		return { status: 400, type: "invalid_request_error", message };
-	}
-	return { status: 502, type: "upstream_error", message };
-}
-
 async function refreshGatewayApiKeyAfterAuthError(
 	storage: AuthStorage,
 	model: Model<Api>,
+	sessionId: string,
 	provider: string,
 	oldKey: string,
 	error: unknown,
@@ -241,14 +226,90 @@ async function refreshGatewayApiKeyAfterAuthError(
 	format: string,
 	peer: string,
 ): Promise<string | undefined> {
-	await storage.invalidateCredentialMatching(provider, oldKey, signal);
+	const message = error instanceof Error ? error.message : String(error);
+	if (isUsageLimitOutcome(extractHttpStatusFromError(error), message)) {
+		const retryAfterMs = extractRetryHint(undefined, message);
+		const { switched, retryAtMs } = await storage.markUsageLimitReached(provider, sessionId, {
+			retryAfterMs,
+			baseUrl: model.baseUrl,
+			modelId: model.id,
+			apiKey: oldKey,
+			signal,
+		});
+		logger.debug("auth-gateway retrying provider request after usage-limit block", {
+			format,
+			provider,
+			peer,
+			switched,
+			retryAfterMs,
+			retryAtMs,
+			error: message,
+		});
+		if (!switched) return undefined;
+		return storage.getApiKey(provider, sessionId, { modelId: model.id, signal });
+	}
+	await storage.invalidateCredentialMatching(provider, oldKey, { sessionId, signal });
 	logger.debug("auth-gateway retrying provider request after credential invalidation", {
 		format,
 		provider,
 		peer,
-		error: error instanceof Error ? error.message : String(error),
+		error: message,
 	});
-	return storage.getApiKey(provider, undefined, { modelId: model.id, signal });
+	return storage.getApiKey(provider, sessionId, { modelId: model.id, signal });
+}
+
+/**
+ * Build the {@link ApiKeyResolver} handed to `streamSimple` for a gateway
+ * request. Drives the central a/b/c auth-retry policy server-side:
+ *
+ * - initial resolve → the credential already resolved for this request.
+ * - step (b) `!lastChance` → force-refresh the SAME session-sticky credential
+ *   (a peer/broker may have rotated its token out from under our cached copy).
+ * - step (c) `lastChance` → {@link refreshGatewayApiKeyAfterAuthError} switches
+ *   to a sibling (usage-limit block vs credential invalidation by error class).
+ *
+ * `lastKey` tracks the most recent bearer so the switch step invalidates the
+ * credential that actually failed.
+ */
+function buildGatewayApiKeyResolver(
+	storage: AuthStorage,
+	model: Model<Api>,
+	sessionId: string,
+	initialKey: string,
+	requestSignal: AbortSignal,
+	format: string,
+	peer: string,
+): ApiKeyResolver {
+	let lastKey = initialKey;
+	return async ({ lastChance, error, signal }) => {
+		const sig = signal ?? requestSignal;
+		if (error === undefined) {
+			lastKey = initialKey;
+			return initialKey;
+		}
+		if (!lastChance) {
+			const refreshed = await storage.getApiKey(model.provider, sessionId, {
+				modelId: model.id,
+				signal: sig,
+				forceRefresh: true,
+			});
+			lastKey = refreshed ?? lastKey;
+			return refreshed;
+		}
+		const next = await refreshGatewayApiKeyAfterAuthError(
+			storage,
+			model,
+			sessionId,
+			model.provider,
+			lastKey,
+			error,
+			sig,
+			format,
+			peer,
+		);
+		lastKey = next ?? lastKey;
+		return next;
+	};
 }
 
 function clientClosedResponse(route: { module: FormatModule }): Response {
@@ -301,37 +362,12 @@ async function handleFormatEndpoint(
 		return route.module.formatError(404, "invalid_request_error", `Unknown model: ${modelId}`);
 	}
 
-	// pi-ai's stream() does NOT consult AuthStorage — the caller (us) is
-	// expected to resolve the credential and pass it as `options.apiKey`.
-	// For OAuth providers this returns the access token (refreshed via the
-	// broker override on AuthStorage when needed).
-	let apiKey: string | undefined;
-	try {
-		apiKey = await bootOpts.storage.getApiKey(model.provider, undefined, {
-			modelId: model.id,
-			signal: controller.signal,
-		});
-	} catch (error) {
-		if (controller.signal.aborted) return clientClosedResponse(route);
-		const classified = classifyGatewayError(error);
-		logger.warn("auth-gateway getApiKey threw", { provider: model.provider, peer, error: classified.message });
-		return route.module.formatError(classified.status, classified.type, classified.message);
-	}
-	if (controller.signal.aborted) return clientClosedResponse(route);
-	if (!apiKey) {
-		return route.module.formatError(
-			401,
-			"authentication_error",
-			`No credential available for provider ${model.provider}`,
-		);
-	}
-
-	// Parse + validate against the strict format schema, rebuild as omp's
-	// canonical Context, dispatch through pi-ai's streamSimple, encode the
-	// canonical event stream back to the inbound format. There is no
-	// passthrough fast-path — every request flows through pi-ai so that
-	// credential-specific request shaping (OAuth Claude-Code prefix, beta
-	// headers, codex websocket transport, …) always applies.
+	// Parse the wire-format request BEFORE resolving the credential so we
+	// have a stable per-conversation `sessionId` to thread into AuthStorage.
+	// Sticky-credential tracking and `markUsageLimitReached` both key off
+	// this id; without it `getApiKey` would re-roundrobin every request
+	// and `markUsageLimitReached` would no-op (it can only mark the
+	// credential it last handed out to that session).
 	let parsed: ParsedFormatRequest;
 	try {
 		parsed = route.module.parseRequest(body, req.headers);
@@ -350,19 +386,48 @@ async function handleFormatEndpoint(
 	}
 	if (controller.signal.aborted) return clientClosedResponse(route);
 
-	const streamOpts = buildStreamOptions(parsed, model.api, controller.signal);
-	streamOpts.apiKey = apiKey;
-	streamOpts.onAuthError = (provider, oldKey, error) =>
-		refreshGatewayApiKeyAfterAuthError(
-			bootOpts.storage,
-			model,
-			provider,
-			oldKey,
-			error,
-			controller.signal,
-			route.label,
-			peer,
+	// Sticky credential id: honour the client's `prompt_cache_key` when
+	// supplied (so external session ids align), otherwise derive from
+	// modelId + system + tools + first message. Mirrored into
+	// streamOpts.sessionId / promptCacheKey by `buildStreamOptions`.
+	const sessionId = parsed.options.promptCacheKey ?? deriveSessionId(parsed.modelId, parsed.context);
+	parsed.options.promptCacheKey ??= sessionId;
+
+	// pi-ai's stream() does NOT consult AuthStorage — the caller (us) is
+	// expected to resolve the credential and pass it as `options.apiKey`.
+	// For OAuth providers this returns the access token (refreshed via the
+	// broker override on AuthStorage when needed).
+	let apiKey: string | undefined;
+	try {
+		apiKey = await bootOpts.storage.getApiKey(model.provider, sessionId, {
+			modelId: model.id,
+			signal: controller.signal,
+		});
+	} catch (error) {
+		if (controller.signal.aborted) return clientClosedResponse(route);
+		const classified = classifyGatewayError(error);
+		logger.warn("auth-gateway getApiKey threw", { provider: model.provider, peer, error: classified.message });
+		return route.module.formatError(classified.status, classified.type, classified.message);
+	}
+	if (controller.signal.aborted) return clientClosedResponse(route);
+	if (!apiKey) {
+		return route.module.formatError(
+			401,
+			"authentication_error",
+			`No credential available for provider ${model.provider}`,
 		);
+	}
+
+	const streamOpts = buildStreamOptions(parsed, model.api, controller.signal);
+	streamOpts.apiKey = buildGatewayApiKeyResolver(
+		bootOpts.storage,
+		model,
+		sessionId,
+		apiKey,
+		controller.signal,
+		route.label,
+		peer,
+	);
 
 	logger.info("auth-gateway request", {
 		format: route.label,
@@ -373,20 +438,10 @@ async function handleFormatEndpoint(
 		peer,
 	});
 
-	let events: AssistantMessageEventStream;
-	try {
-		if (controller.signal.aborted) return clientClosedResponse(route);
-		events = streamSimple(model, parsed.context, streamOpts);
-	} catch (error) {
-		const classified = classifyGatewayError(error);
-		logger.warn("auth-gateway streamSimple threw", { format: route.label, error: classified.message, peer });
-		return route.module.formatError(classified.status, classified.type, classified.message);
-	}
-
 	if (!parsed.stream) {
 		try {
 			if (controller.signal.aborted) return clientClosedResponse(route);
-			const message = await events.result();
+			const message = await completeSimple(model, parsed.context, streamOpts);
 			if (message.stopReason === "aborted" || message.stopReason === "error") {
 				const errorMessage =
 					message.errorMessage ??
@@ -400,7 +455,7 @@ async function handleFormatEndpoint(
 				if (message.stopReason === "aborted") {
 					return route.module.formatError(499, "request_aborted", errorMessage);
 				}
-				const classified = classifyGatewayError(new Error(errorMessage));
+				const classified = classifyGatewayError(errorMessage);
 				return route.module.formatError(classified.status, classified.type, errorMessage);
 			}
 			return json(200, route.module.encodeResponse(message, parsed.modelId));
@@ -415,9 +470,26 @@ async function handleFormatEndpoint(
 			return route.module.formatError(classified.status, classified.type, classified.message);
 		}
 	}
+
+	let events: AssistantMessageEventStream;
+	try {
+		if (controller.signal.aborted) return clientClosedResponse(route);
+		events = streamSimple(model, parsed.context, streamOpts);
+	} catch (error) {
+		const classified = classifyGatewayError(error);
+		logger.warn("auth-gateway streamSimple threw", { format: route.label, error: classified.message, peer });
+		return route.module.formatError(classified.status, classified.type, classified.message);
+	}
 	if (controller.signal.aborted) return clientClosedResponse(route);
 
-	const sseStream = route.module.encodeStream(events, parsed.modelId, parsed.options);
+	const sseStream = route.module.encodeStream(events, parsed.modelId, parsed.options, {
+		signal: controller.signal,
+		onCancel: reason => {
+			if (!controller.signal.aborted) {
+				controller.abort(reason instanceof Error ? reason : new Error("client closed request"));
+			}
+		},
+	});
 	return new Response(sseStream, {
 		status: 200,
 		headers: {
@@ -473,10 +545,17 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 	if (!model) {
 		return piNative.formatError(404, "invalid_request_error", `Unknown model: ${parsed.modelId}`);
 	}
+	// Pi-native already parsed `streamOpts.sessionId` (when set by the
+	// client); fall back to the derived key so credential-stickiness lines
+	// up with cache-prefix stickiness — same identity used for both means
+	// the next turn of this conversation reuses the same credential until
+	// it hits a usage cap, then markUsageLimitReached can hand off.
+	const sessionId = parsed.options.sessionId ?? deriveSessionId(parsed.modelId, parsed.context);
+	parsed.options.sessionId ??= sessionId;
 
 	let apiKey: string | undefined;
 	try {
-		apiKey = await bootOpts.storage.getApiKey(model.provider, undefined, {
+		apiKey = await bootOpts.storage.getApiKey(model.provider, sessionId, {
 			modelId: model.id,
 			signal: controller.signal,
 		});
@@ -497,32 +576,33 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 
 	// Build the SimpleStreamOptions actually handed to `streamSimple`. We
 	// trust the client's options (already allow-listed by `parseRequest`) and
-	// only inject server-controlled fields. The codex temperature/topP strip
-	// matches `buildStreamOptions` — Codex rejects them with a 400.
+	// only inject server-controlled fields. The codex sampling strip mirrors
+	// `buildStreamOptions` — Codex rejects every one with a 400 (#3117).
 	const streamOpts: SimpleStreamOptions = { ...parsed.options, apiKey, signal: controller.signal };
-	streamOpts.onAuthError = (provider, oldKey, error) =>
-		refreshGatewayApiKeyAfterAuthError(
-			bootOpts.storage,
-			model,
-			provider,
-			oldKey,
-			error,
-			controller.signal,
-			"pi-native",
-			peer,
-		);
+	streamOpts.apiKey = buildGatewayApiKeyResolver(
+		bootOpts.storage,
+		model,
+		sessionId,
+		apiKey,
+		controller.signal,
+		"pi-native",
+		peer,
+	);
 	if (model.api === "openai-codex-responses") {
 		delete streamOpts.temperature;
 		delete streamOpts.topP;
+		delete streamOpts.topK;
+		delete streamOpts.minP;
+		delete streamOpts.stopSequences;
+		delete streamOpts.presencePenalty;
+		delete streamOpts.frequencyPenalty;
+		delete streamOpts.repetitionPenalty;
 	}
 	// Merge gateway-captured passthrough headers under the client's own
 	// headers — the client's values win when they collide.
 	const captured = captureRequestHeaders(req.headers);
 	streamOpts.headers = { ...captured, ...(streamOpts.headers ?? {}) };
-	// Cache identity: explicit `sessionId` wins, then derive a stable key
-	// from model + system + tools + first message so Codex prefix caching
-	// engages on the same logical conversation across turns.
-	streamOpts.sessionId ??= deriveSessionId(parsed.modelId, parsed.context);
+	streamOpts.sessionId ??= sessionId;
 
 	logger.info("auth-gateway request", {
 		format: "pi-native",
@@ -533,20 +613,10 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 		peer,
 	});
 
-	let events: AssistantMessageEventStream;
-	try {
-		if (controller.signal.aborted) return aborted();
-		events = streamSimple(model, parsed.context, streamOpts);
-	} catch (error) {
-		const classified = classifyGatewayError(error);
-		logger.warn("auth-gateway streamSimple threw", { format: "pi-native", error: classified.message, peer });
-		return piNative.formatError(classified.status, classified.type, classified.message);
-	}
-
 	if (!parsed.stream) {
 		try {
 			if (controller.signal.aborted) return aborted();
-			const message = await events.result();
+			const message = await completeSimple(model, parsed.context, streamOpts);
 			if (message.stopReason === "aborted" || message.stopReason === "error") {
 				const errorMessage =
 					message.errorMessage ??
@@ -560,7 +630,7 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 				if (message.stopReason === "aborted") {
 					return piNative.formatError(499, "request_aborted", errorMessage);
 				}
-				const classified = classifyGatewayError(new Error(errorMessage));
+				const classified = classifyGatewayError(errorMessage);
 				return piNative.formatError(classified.status, classified.type, errorMessage);
 			}
 			return json(200, { message });
@@ -571,9 +641,26 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 			return piNative.formatError(classified.status, classified.type, classified.message);
 		}
 	}
+
+	let events: AssistantMessageEventStream;
+	try {
+		if (controller.signal.aborted) return aborted();
+		events = streamSimple(model, parsed.context, streamOpts);
+	} catch (error) {
+		const classified = classifyGatewayError(error);
+		logger.warn("auth-gateway streamSimple threw", { format: "pi-native", error: classified.message, peer });
+		return piNative.formatError(classified.status, classified.type, classified.message);
+	}
 	if (controller.signal.aborted) return aborted();
 
-	const sseStream = piNative.encodeStream(events);
+	const sseStream = piNative.encodeStream(events, parsed.modelId, parsed.options, {
+		signal: controller.signal,
+		onCancel: reason => {
+			if (!controller.signal.aborted) {
+				controller.abort(reason instanceof Error ? reason : new Error("client closed request"));
+			}
+		},
+	});
 	return new Response(sseStream, {
 		status: 200,
 		headers: {
@@ -598,6 +685,22 @@ async function handleUsage(storage: AuthStorage, signal: AbortSignal): Promise<R
 	// client struct (Swift widget, llm-git, ...) works against either endpoint.
 	const trimmed = reports.map(({ raw: _raw, ...rest }) => rest);
 	return json(200, { generatedAt: Date.now(), reports: trimmed });
+}
+
+/**
+ * Per-credential health probe surfaced on `GET /v1/credentials/check`. Tells
+ * the caller exactly which row in their broker is producing 401s — the
+ * aggregate `/v1/usage` endpoint silently drops failed credentials, which is
+ * the wrong shape when you're diagnosing auth.
+ *
+ * The probe is sequential (one credential at a time) to avoid synchronized
+ * N-account fan-out tripping per-IP rate limits on provider `/usage`
+ * endpoints. For multi-account pools that's the difference between getting
+ * a clean diagnosis and getting a 429 storm.
+ */
+async function handleCredentialsCheck(storage: AuthStorage, signal: AbortSignal): Promise<Response> {
+	const credentials = await storage.checkCredentials({ signal });
+	return json(200, { generatedAt: Date.now(), credentials });
 }
 
 function handleModelsList(opts: AuthGatewayBootOptions): Response {
@@ -643,6 +746,13 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 				// same client struct.
 				if (req.method === "GET" && pathname === "/v1/usage") {
 					return withCors(await handleUsage(opts.storage, req.signal), req);
+				}
+
+				// Per-credential auth probe — diagnoses which row in a multi-account
+				// pool is producing 401s. Aggregated `/v1/usage` silently drops failed
+				// credentials, so we need a separate endpoint that captures errors.
+				if (req.method === "GET" && pathname === "/v1/credentials/check") {
+					return withCors(await handleCredentialsCheck(opts.storage, req.signal), req);
 				}
 
 				// Provider-format dispatch.

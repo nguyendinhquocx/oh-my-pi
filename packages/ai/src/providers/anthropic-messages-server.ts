@@ -1,5 +1,8 @@
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { logger } from "@oh-my-pi/pi-utils";
+import { type } from "arktype";
 import { captureRequestHeaders, resolvePromptCacheKey } from "../auth-gateway/http";
+import * as AIError from "../error";
 import type {
 	AssistantMessage,
 	AssistantMessageEventStream,
@@ -30,7 +33,7 @@ import {
  * omp AssistantMessage[Stream] → Anthropic-shaped JSON / SSE.
  */
 
-import type { AuthGatewayParsedRequest as ParsedRequest } from "../auth-gateway/types";
+import type { AuthGatewayStreamControl, AuthGatewayParsedRequest as ParsedRequest } from "../auth-gateway/types";
 
 export type { ParsedRequest };
 
@@ -203,7 +206,10 @@ function walkAssistantContent(
 					type: "toolCall",
 					id: block.id,
 					name: block.name,
-					arguments: block.input ?? {},
+					arguments:
+						block.input && typeof block.input === "object" && !Array.isArray(block.input)
+							? (block.input as Record<string, unknown>)
+							: {},
 				});
 				break;
 			default: {
@@ -286,12 +292,24 @@ function deriveCacheRetention(data: {
 	return strongest;
 }
 
+/**
+ * Inbound `output_config.effort` wire literal → catalog `Effort` (1:1).
+ * Values outside this table (none exist in the schema today) are ignored
+ * rather than guessed at.
+ */
+const REASONING_EFFORT_BY_WIRE: Partial<Record<string, Effort>> = {
+	low: Effort.Low,
+	medium: Effort.Medium,
+	high: Effort.High,
+	xhigh: Effort.XHigh,
+	max: Effort.Max,
+};
+
 export function parseRequest(body: unknown, headers?: Headers): ParsedRequest {
-	const parsed = anthropicMessagesRequestSchema.safeParse(body);
-	if (!parsed.success) {
-		throw new Error(`anthropic-messages: ${parsed.error.message}`);
+	const data = anthropicMessagesRequestSchema(body);
+	if (data instanceof type.errors) {
+		throw new AIError.ValidationError(`anthropic-messages: ${data.summary}`);
 	}
-	const data = parsed.data;
 
 	const now = Date.now();
 	const messages: Message[] = [];
@@ -343,6 +361,13 @@ export function parseRequest(body: unknown, headers?: Headers): ParsedRequest {
 				}
 				break;
 		}
+	}
+	if (data.output_config?.task_budget) {
+		options.taskBudget = data.output_config.task_budget;
+	}
+	if (data.output_config?.effort) {
+		const mapped = REASONING_EFFORT_BY_WIRE[data.output_config.effort];
+		if (mapped !== undefined) options.reasoning = mapped;
 	}
 	const cacheRetention = deriveCacheRetention(data);
 	if (cacheRetention !== undefined) options.cacheRetention = cacheRetention;
@@ -451,7 +476,13 @@ function encodeUsage(message: AssistantMessage): Record<string, unknown> {
 
 export function encodeResponse(message: AssistantMessage, requestedModelId: string): Record<string, unknown> {
 	if (message.stopReason === "error" || message.stopReason === "aborted") {
-		throw new Error(message.errorMessage ?? `anthropic-messages: upstream ${message.stopReason}`);
+		throw new AIError.ProviderResponseError(
+			message.errorMessage ?? `anthropic-messages: upstream ${message.stopReason}`,
+			{
+				provider: "anthropic",
+				kind: "output",
+			},
+		);
 	}
 	return {
 		id: message.responseId ?? newMessageId(),
@@ -485,17 +516,44 @@ interface OpenBlock {
 	kind: BlockKind;
 }
 
+// Keepalive cadence for the SSE encoder. Anthropic's API pings periodically;
+// without frames between message_start and the first content block (slow first
+// token) SDK first-event/idle watchdogs classify the stream as stalled.
+const STREAM_PING_INTERVAL_MS = 15_000;
+
+const ZERO_WIRE_USAGE: Record<string, unknown> = {
+	input_tokens: 0,
+	output_tokens: 0,
+	cache_read_input_tokens: 0,
+	cache_creation_input_tokens: 0,
+};
+
 export function encodeStream(
 	events: AssistantMessageEventStream,
 	requestedModelId: string,
+	_options?: ParsedRequest["options"],
+	control?: AuthGatewayStreamControl,
 ): ReadableStream<Uint8Array> {
+	let pingTimer: NodeJS.Timeout | undefined;
+	let cancelled = control?.signal?.aborted === true;
+	const markCancelled = () => {
+		cancelled = true;
+	};
+	control?.signal?.addEventListener("abort", markCancelled, { once: true });
+	const stopPings = () => {
+		if (pingTimer !== undefined) {
+			clearInterval(pingTimer);
+			pingTimer = undefined;
+		}
+	};
 	return new ReadableStream<Uint8Array>({
 		async start(controller) {
 			const messageId = newMessageId();
 			let started = false;
+			let lastPartial: AssistantMessage | undefined;
 			const open = new Map<number, OpenBlock>();
 
-			const ensureStart = (partial: AssistantMessage) => {
+			const ensureStart = (partial: AssistantMessage | undefined) => {
 				if (started) return;
 				started = true;
 				controller.enqueue(
@@ -511,7 +569,7 @@ export function encodeStream(
 							// TODO: same as encodeResponse — surface matched stop sequence
 							// once pi-ai propagates it.
 							stop_sequence: null,
-							usage: encodeUsage(partial),
+							usage: partial ? encodeUsage(partial) : ZERO_WIRE_USAGE,
 						},
 					}),
 				);
@@ -523,8 +581,26 @@ export function encodeStream(
 				open.delete(index);
 			};
 
+			pingTimer = setInterval(() => {
+				try {
+					if (cancelled) {
+						stopPings();
+						return;
+					}
+					controller.enqueue(sseFrame("ping", { type: "ping" }));
+				} catch {
+					// Controller already closed/errored (client gone); stop the timer.
+					stopPings();
+				}
+			}, STREAM_PING_INTERVAL_MS);
+
 			try {
+				if (cancelled) {
+					controller.close();
+					return;
+				}
 				for await (const ev of events) {
+					if (cancelled) return;
 					switch (ev.type) {
 						case "start":
 							ensureStart(ev.partial);
@@ -643,19 +719,40 @@ export function encodeStream(
 						}
 					}
 				}
-				// stream ended without explicit done; close gracefully
+				// Stream ended without an explicit done: emit a complete envelope
+				// (message_start + message_delta carrying a stop_reason) so strict
+				// clients don't reject the response as a protocol error.
+				ensureStart(lastPartial);
 				for (const idx of [...open.keys()]) closeBlock(idx);
+				controller.enqueue(
+					sseFrame("message_delta", {
+						type: "message_delta",
+						delta: { stop_reason: "end_turn", stop_sequence: null },
+						usage: lastPartial ? encodeUsage(lastPartial) : ZERO_WIRE_USAGE,
+					}),
+				);
 				controller.enqueue(sseFrame("message_stop", { type: "message_stop" }));
 				controller.close();
 			} catch (err) {
-				controller.enqueue(
-					sseFrame("error", {
-						type: "error",
-						error: { type: "api_error", message: err instanceof Error ? err.message : String(err) },
-					}),
-				);
-				controller.close();
+				if (!cancelled) {
+					controller.enqueue(
+						sseFrame("error", {
+							type: "error",
+							error: { type: "api_error", message: err instanceof Error ? err.message : String(err) },
+						}),
+					);
+					controller.close();
+				}
+			} finally {
+				control?.signal?.removeEventListener("abort", markCancelled);
+				stopPings();
 			}
+		},
+		cancel(reason) {
+			cancelled = true;
+			control?.signal?.removeEventListener("abort", markCancelled);
+			control?.onCancel?.(reason);
+			stopPings();
 		},
 	});
 }

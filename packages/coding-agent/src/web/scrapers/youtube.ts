@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ptree, Snowflake } from "@oh-my-pi/pi-utils";
 import { settings } from "../../config/settings";
+import type { AgentStorage } from "../../session/agent-storage";
 import { throwIfAborted } from "../../tools/tool-errors";
 import { ensureTool } from "../../utils/tools-manager";
 import { extractWithParallel, findParallelApiKey, getParallelExtractContent } from "../parallel";
@@ -101,6 +102,7 @@ export const handleYouTube: SpecialHandler = async (
 	url: string,
 	timeout: number,
 	userSignal?: AbortSignal,
+	storage?: AgentStorage | null,
 ): Promise<RenderResult | null> => {
 	throwIfAborted(userSignal);
 	const yt = parseYouTubeUrl(url);
@@ -111,15 +113,20 @@ export const handleYouTube: SpecialHandler = async (
 	const notes: string[] = [];
 	const videoUrl = `https://www.youtube.com/watch?v=${yt.videoId}`;
 
-	// Prefer Parallel extract when credentials are available
-	if (settings.get("providers.parallelFetch") && (await findParallelApiKey())) {
+	// Prefer Parallel extract when it sits in the reader chain and creds exist
+	const fetchPreference = settings.get("providers.fetch");
+	if ((fetchPreference === "auto" || fetchPreference === "parallel") && findParallelApiKey(storage)) {
 		try {
-			const parallelResult = await extractWithParallel([videoUrl], {
-				objective: "Extract the main content of this YouTube video page",
-				excerpts: true,
-				fullContent: false,
-				signal,
-			});
+			const parallelResult = await extractWithParallel(
+				[videoUrl],
+				{
+					objective: "Extract the main content of this YouTube video page",
+					excerpts: true,
+					fullContent: false,
+					signal,
+				},
+				storage,
+			);
 			const firstDocument = parallelResult.results[0];
 			if (firstDocument) {
 				const content = getParallelExtractContent(firstDocument);
@@ -281,11 +288,16 @@ export const handleYouTube: SpecialHandler = async (
 			}
 		}
 	} finally {
-		throwIfAborted(signal);
 		// Cleanup temp files (fire-and-forget with error suppression)
 		Array.fromAsync(new Bun.Glob(`${tmpBase}*`).scan({ absolute: true }))
 			.then(tmpFiles => Promise.all(tmpFiles.map(f => fs.unlink(f).catch(() => {}))))
 			.catch(() => {});
+	}
+	// Only a user-initiated abort is fatal; the per-fetch time budget expiring
+	// just means partial metadata/transcript, which we surface as a note.
+	throwIfAborted(userSignal);
+	if (signal?.aborted) {
+		notes.push("Fetch time budget exhausted; metadata/transcript may be incomplete");
 	}
 
 	// Build markdown output

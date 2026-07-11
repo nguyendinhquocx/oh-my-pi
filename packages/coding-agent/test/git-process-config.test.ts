@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
 import type { Subprocess } from "bun";
-import * as git from "../src/utils/git";
 
 type SpawnOptions = Bun.SpawnOptions.SpawnOptions<
 	Bun.SpawnOptions.Writable,
@@ -86,5 +86,66 @@ describe("git subprocess config", () => {
 			"--",
 			"tracked.txt",
 		]);
+	});
+
+	it("scopes pushes to the named refspec, never following tags", async () => {
+		const spawnCalls: SpawnCall[] = [];
+		vi.spyOn(Bun, "spawn").mockImplementation(createSpawnMock(spawnCalls));
+
+		await git.push("/work/pi", { remote: "fork", refspec: "HEAD:refs/heads/feature" });
+
+		// `--no-follow-tags` must override a user's `push.followTags = true`:
+		// implicit tag pushes are rejected on remotes the user cannot tag
+		// (e.g. PR-head forks) and fail the call after the branch updated.
+		expect(spawnCalls).toHaveLength(1);
+		expect(spawnCalls[0]?.cmd).toEqual([
+			"git",
+			"-c",
+			"core.fsmonitor=false",
+			"-c",
+			"core.untrackedCache=false",
+			"push",
+			"--no-follow-tags",
+			"fork",
+			"HEAD:refs/heads/feature",
+		]);
+	});
+
+	it("preserves the caller's GPG_TTY for signing-capable commands", async () => {
+		const originalGpgTty = process.env.GPG_TTY;
+		const spawnCalls: SpawnCall[] = [];
+		vi.spyOn(Bun, "spawn").mockImplementation(createSpawnMock(spawnCalls));
+
+		process.env.GPG_TTY = "/dev/pts/42";
+		try {
+			await git.commit("/work/pi", "fix: preserve signing tty");
+		} finally {
+			if (originalGpgTty === undefined) {
+				delete process.env.GPG_TTY;
+			} else {
+				process.env.GPG_TTY = originalGpgTty;
+			}
+		}
+
+		expect(spawnCalls).toHaveLength(1);
+		expect(spawnCalls[0]?.options.env?.GPG_TTY).toBe("/dev/pts/42");
+	});
+
+	it("does not invent a bogus GPG_TTY when the caller has none", async () => {
+		const originalGpgTty = process.env.GPG_TTY;
+		const spawnCalls: SpawnCall[] = [];
+		vi.spyOn(Bun, "spawn").mockImplementation(createSpawnMock(spawnCalls));
+
+		delete process.env.GPG_TTY;
+		try {
+			await git.commit("/work/pi", "fix: allow gui pinentry");
+		} finally {
+			if (originalGpgTty !== undefined) {
+				process.env.GPG_TTY = originalGpgTty;
+			}
+		}
+
+		expect(spawnCalls).toHaveLength(1);
+		expect(spawnCalls[0]?.options.env).not.toHaveProperty("GPG_TTY");
 	});
 });

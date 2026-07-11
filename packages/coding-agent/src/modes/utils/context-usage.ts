@@ -1,10 +1,12 @@
+import { countTokens } from "@oh-my-pi/pi-agent-core";
 import type { CompactionSettings } from "@oh-my-pi/pi-agent-core/compaction";
 import { effectiveReserveTokens, estimateTokens, resolveThresholdTokens } from "@oh-my-pi/pi-agent-core/compaction";
-import type { Model } from "@oh-my-pi/pi-ai";
-import { countTokens } from "@oh-my-pi/pi-natives";
+import type { Tool as AiTool, Model } from "@oh-my-pi/pi-ai";
+import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { formatNumber } from "@oh-my-pi/pi-utils";
 import type { Skill } from "../../extensibility/skills";
 import type { AgentSession } from "../../session/agent-session";
+import { estimateInlineSavings, type SnapcompactSavingsEstimate } from "../../session/snapcompact-inline";
 import type { Tool } from "../../tools";
 import type { theme as Theme } from "../theme/theme";
 
@@ -35,9 +37,15 @@ export interface ContextBreakdown {
 	usedTokens: number;
 	autoCompactBufferTokens: number;
 	freeTokens: number;
+	/** Estimated snapcompact wire savings; set when requested and a snapcompact.* setting is enabled. */
+	snapcompact?: SnapcompactSavingsEstimate;
 }
 
-function estimateSkillsTokens(skills: readonly Skill[]): number {
+const EMPTY_STRING_PARTS: readonly string[] = [];
+const EMPTY_TOOLS: ReadonlyArray<Pick<Tool, "name" | "description" | "parameters">> = [];
+const EMPTY_SKILLS: readonly Skill[] = [];
+
+export function estimateSkillsTokens(skills: readonly Skill[]): number {
 	const fragments: string[] = [];
 	for (const skill of skills) {
 		// "- name: description\n" wire framing tokenizes ~identically to the
@@ -47,12 +55,19 @@ function estimateSkillsTokens(skills: readonly Skill[]): number {
 	return countTokens(fragments);
 }
 
-function estimateToolSchemaTokens(tools: ReadonlyArray<Pick<Tool, "name" | "description" | "parameters">>): number {
+export function estimateToolSchemaTokens(
+	tools: ReadonlyArray<Pick<Tool, "name" | "description" | "parameters">>,
+): number {
 	const fragments: string[] = [];
 	for (const tool of tools) {
 		fragments.push(tool.name, tool.description);
 		try {
-			fragments.push(JSON.stringify(tool.parameters ?? {}));
+			const wireTool: AiTool = {
+				name: tool.name,
+				description: tool.description,
+				parameters: tool.parameters as AiTool["parameters"],
+			};
+			fragments.push(JSON.stringify(toolWireSchema(wireTool) ?? {}));
 		} catch {
 			// Schema may contain functions or cycles; ignore.
 		}
@@ -61,33 +76,136 @@ function estimateToolSchemaTokens(tools: ReadonlyArray<Pick<Tool, "name" | "desc
 }
 
 /**
+ * Compute just the NON-MESSAGE token total: system prompt (with its skills
+ * section subtracted, since skills are tokenized separately) + system context
+ * (the rest of the system-prompt array) + tools + skills.
+ *
+ * Exposed so callers like `StatusLineComponent` can cache the non-message
+ * total separately from the message total. Non-message inputs (skills,
+ * tools, system prompt) change rarely; the message list grows on every
+ * streaming turn. Splitting the two lets the caller refresh each on its own
+ * cadence — non-message recomputed only when the inputs identity changes,
+ * messages walked incrementally as new entries append.
+ */
+// Non-message inputs (system prompt, tools, skills) change rarely — at most
+// once per turn via setSystemPrompt/setTools — but the per-turn compaction and
+// threshold paths call these helpers several times: getContextBreakdown calls
+// both, and #estimateStoredContextTokens adds a third. Memoize on the identity
+// of the three input arrays so the expensive parts (system-prompt tokenization
+// and the per-tool JSON.stringify(toolWireSchema) inside estimateToolSchemaTokens)
+// run at most once per input change rather than per call. The identity keys are
+// the same stable references the StatusLineComponent cache already trusts
+// (setSystemPrompt/setTools replace the array reference rather than mutating it).
+interface NonMessageTokenCache {
+	systemPromptRef: readonly string[];
+	toolsRef: ReadonlyArray<Pick<Tool, "name" | "description" | "parameters">>;
+	skillsRef: readonly Skill[];
+	tokens: number | undefined;
+	breakdown:
+		| {
+				skillsTokens: number;
+				toolsTokens: number;
+				systemContextTokens: number;
+				systemPromptTokens: number;
+		  }
+		| undefined;
+}
+
+const nonMessageTokenCache = new WeakMap<AgentSession, NonMessageTokenCache>();
+
+function nonMessageTokenCacheEntry(session: AgentSession): NonMessageTokenCache {
+	const systemPromptRef = session.systemPrompt ?? EMPTY_STRING_PARTS;
+	const toolsRef = session.agent?.state?.tools ?? EMPTY_TOOLS;
+	const skillsRef = session.skills ?? EMPTY_SKILLS;
+	let entry = nonMessageTokenCache.get(session);
+	if (
+		entry &&
+		entry.systemPromptRef === systemPromptRef &&
+		entry.toolsRef === toolsRef &&
+		entry.skillsRef === skillsRef
+	) {
+		return entry;
+	}
+	entry = { systemPromptRef, toolsRef, skillsRef, tokens: undefined, breakdown: undefined };
+	nonMessageTokenCache.set(session, entry);
+	return entry;
+}
+
+export function computeNonMessageTokens(session: AgentSession): number {
+	const entry = nonMessageTokenCacheEntry(session);
+	if (entry.tokens !== undefined) return entry.tokens;
+	const systemPromptParts = session.systemPrompt ?? EMPTY_STRING_PARTS;
+	const tools = session.agent?.state?.tools ?? EMPTY_TOOLS;
+	const tokens = countTokens(systemPromptParts) + estimateToolSchemaTokens(tools);
+	entry.tokens = tokens;
+	return tokens;
+}
+
+/**
+ * Shared helper for the four non-message token totals used by
+ * `computeContextBreakdown` (/context panel). Keep this category split stable:
+ * the status-line fast path intentionally uses the equivalent collapsed total
+ * in `computeNonMessageTokens`.
+ */
+export function computeNonMessageBreakdown(session: AgentSession): {
+	skillsTokens: number;
+	toolsTokens: number;
+	systemContextTokens: number;
+	systemPromptTokens: number;
+} {
+	const entry = nonMessageTokenCacheEntry(session);
+	if (entry.breakdown) return entry.breakdown;
+	const skillsTokens = estimateSkillsTokens(session.skills ?? EMPTY_SKILLS);
+	const toolsTokens = estimateToolSchemaTokens(session.agent?.state?.tools ?? EMPTY_TOOLS);
+	const systemPromptParts = session.systemPrompt ?? EMPTY_STRING_PARTS;
+	const systemContextTokens = countTokens(systemPromptParts.slice(1));
+	const systemPromptTokens = Math.max(0, countTokens(systemPromptParts[0] ?? "") - skillsTokens);
+	const breakdown = { skillsTokens, toolsTokens, systemContextTokens, systemPromptTokens };
+	entry.breakdown = breakdown;
+	return breakdown;
+}
+
+/**
  * Compute a breakdown of estimated context usage by category for the active
  * session and model.
  */
-export function computeContextBreakdown(session: AgentSession): ContextBreakdown {
+export function computeContextBreakdown(
+	session: AgentSession,
+	options?: { snapcompactSavings?: boolean },
+): ContextBreakdown {
 	const model = session.model;
 	const contextWindow = model?.contextWindow ?? 0;
 
-	const skillsTokens = estimateSkillsTokens(session.skills ?? []);
-	const toolsTokens = estimateToolSchemaTokens(session.agent?.state?.tools ?? []);
+	const breakdown = typeof session.getContextBreakdown === "function" ? session.getContextBreakdown() : undefined;
 
 	let messagesTokens = 0;
-	const convo = session.messages;
-	if (convo) {
-		for (const message of convo) {
-			messagesTokens += estimateTokens(message);
-		}
-	}
+	let skillsTokens = 0;
+	let toolsTokens = 0;
+	let systemContextTokens = 0;
+	let systemPromptTokens = 0;
+	let usedTokens = 0;
 
-	// The rendered system prompt already contains the skill descriptions and the
-	// markdown tool descriptions. To present a non-overlapping breakdown:
-	//   System prompt = total system prompt text - skills section (tool descriptions stay)
-	//   Tools         = JSON tool schema sent separately on the wire
-	//   Skills        = the skill list embedded in the system prompt
-	//   Messages      = conversation messages
-	const systemPromptParts = session.systemPrompt;
-	const systemPromptTokens = Math.max(0, countTokens(systemPromptParts?.[0] ?? "") - skillsTokens);
-	const systemContextTokens = countTokens(systemPromptParts?.slice(1) ?? []);
+	if (breakdown) {
+		messagesTokens = breakdown.messagesTokens;
+		skillsTokens = breakdown.skillsTokens;
+		toolsTokens = breakdown.systemToolsTokens;
+		systemContextTokens = breakdown.systemContextTokens;
+		systemPromptTokens = breakdown.systemPromptTokens;
+		usedTokens = breakdown.usedTokens;
+	} else {
+		const convo = session.messages;
+		if (convo) {
+			for (const message of convo) {
+				messagesTokens += estimateTokens(message);
+			}
+		}
+		const nonMessage = computeNonMessageBreakdown(session);
+		skillsTokens = nonMessage.skillsTokens;
+		toolsTokens = nonMessage.toolsTokens;
+		systemContextTokens = nonMessage.systemContextTokens;
+		systemPromptTokens = nonMessage.systemPromptTokens;
+		usedTokens = skillsTokens + toolsTokens + systemContextTokens + systemPromptTokens + messagesTokens;
+	}
 
 	const categories: CategoryInfo[] = [
 		{ id: "systemPrompt", label: "System prompt", tokens: systemPromptTokens, color: "accent", glyph: CELL_FILLED },
@@ -109,8 +227,6 @@ export function computeContextBreakdown(session: AgentSession): ContextBreakdown
 		},
 	];
 
-	const usedTokens = categories.reduce((sum, c) => sum + c.tokens, 0);
-
 	let autoCompactBufferTokens = 0;
 	if (contextWindow > 0) {
 		const compactionSettings = session.settings.getGroup("compaction") as CompactionSettings;
@@ -129,6 +245,22 @@ export function computeContextBreakdown(session: AgentSession): ContextBreakdown
 
 	const freeTokens = Math.max(0, contextWindow - usedTokens - autoCompactBufferTokens);
 
+	// Estimated wire savings from snapcompact inline imaging. Opt-in: only the
+	// /context surfaces need it; other callers skip the extra token counting.
+	let snapcompactSavings: SnapcompactSavingsEstimate | undefined;
+	if (options?.snapcompactSavings) {
+		const renderSystemPrompt = session.settings.get("snapcompact.systemPrompt");
+		const renderToolResults = session.settings.get("snapcompact.toolResults");
+		if (renderSystemPrompt !== "none" || renderToolResults) {
+			snapcompactSavings = estimateInlineSavings({
+				options: { renderSystemPrompt, renderToolResults, shape: session.settings.get("snapcompact.shape") },
+				model,
+				systemPrompt: session.systemPrompt ?? [],
+				messages: session.messages ?? [],
+			});
+		}
+	}
+
 	return {
 		model,
 		contextWindow,
@@ -136,6 +268,7 @@ export function computeContextBreakdown(session: AgentSession): ContextBreakdown
 		usedTokens,
 		autoCompactBufferTokens,
 		freeTokens,
+		snapcompact: snapcompactSavings,
 	};
 }
 
@@ -256,6 +389,57 @@ function buildLegendLines(breakdown: ContextBreakdown, theme: typeof Theme): str
 				`tokens (${percentString(autoCompactBufferTokens, contextWindow)})`,
 			)}`,
 		);
+	}
+
+	const snap = breakdown.snapcompact;
+	if (snap) {
+		lines.push("");
+		if (!snap.visionCapable) {
+			lines.push(theme.fg("muted", "Snapcompact: inactive (model has no image input)"));
+		} else {
+			lines.push(theme.fg("muted", "Snapcompact (estimated wire savings)"));
+			if (snap.systemPrompt) {
+				const sp = snap.systemPrompt;
+				if (sp.applied) {
+					lines.push(
+						`  System prompt (${sp.scope === "agents-md" ? "AGENTS.md" : "all"}): saves ${theme.bold(`~${formatNumber(sp.savedTokens)}`)} ` +
+							theme.fg(
+								"dim",
+								`(${formatNumber(sp.textTokens)} text → ${sp.frames} frame${sp.frames === 1 ? "" : "s"} ≈ ${formatNumber(sp.imageTokens)})`,
+							),
+					);
+				} else {
+					const reason =
+						sp.reason === "budget"
+							? "image budget exhausted"
+							: sp.reason === "empty"
+								? "nothing to image"
+								: "frames would not save tokens";
+					lines.push(
+						`  System prompt (${sp.scope === "agents-md" ? "AGENTS.md" : "all"}): ${theme.fg("dim", `stays text (${reason})`)}`,
+					);
+				}
+			}
+			if (snap.toolResults) {
+				const tr = snap.toolResults;
+				if (tr.swapped > 0) {
+					lines.push(
+						`  Tool results: saves ${theme.bold(`~${formatNumber(tr.savedTokens)}`)} ` +
+							theme.fg(
+								"dim",
+								`(${tr.swapped}/${tr.total} imaged, ${formatNumber(tr.textTokens)} text → ${tr.frames} frames ≈ ${formatNumber(tr.imageTokens)})`,
+							),
+					);
+				} else {
+					lines.push(`  Tool results: ${theme.fg("dim", `none imaged (${tr.total} in history)`)}`);
+				}
+			}
+			if (snap.savedTokens > 0) {
+				lines.push(
+					`  Next request: ${theme.bold(`~${formatNumber(Math.max(0, usedTokens - snap.savedTokens))}`)} ${theme.fg("dim", "tokens on the wire")}`,
+				);
+			}
+		}
 	}
 
 	return lines;

@@ -9,9 +9,12 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { expandPromptTemplate, type PromptTemplate } from "@oh-my-pi/pi-coding-agent/config/prompt-templates";
 import { expandSlashCommand, type FileSlashCommand } from "@oh-my-pi/pi-coding-agent/extensibility/slash-commands";
 import { parseCommandArgs, substituteArgs } from "@oh-my-pi/pi-coding-agent/utils/command-args";
+import { prompt } from "@oh-my-pi/pi-utils";
 
 // ============================================================================
 // substituteArgs
@@ -230,52 +233,6 @@ describe("parseCommandArgs + substituteArgs integration", () => {
 });
 
 // ============================================================================
-// Hashline prompt helpers
-// ============================================================================
-
-describe("hashline prompt helpers", () => {
-	function createPromptTemplate(content: string): PromptTemplate {
-		return {
-			name: "test-template",
-			description: "Test template",
-			content,
-			source: "test",
-		};
-	}
-
-	function expandPrompt(content: string): string {
-		return expandPromptTemplate("/test-template", [createPromptTemplate(content)]);
-	}
-
-	test("href and hrefr should reuse anchors remembered from hline", () => {
-		const result = expandPrompt(
-			'{{hline 2 "const timeout = 5000;"}}\nquoted={{href 2}}\nraw={{hrefr 2}}\nlast={{hrefr}}',
-		);
-		const [line, quoted, raw, last] = result.split("\n");
-		const ref = line.split("|", 1)[0];
-
-		expect(line).toBe(`${ref}|const timeout = 5000;`);
-		expect(quoted).toBe(`quoted="${ref}"`);
-		expect(raw).toBe(`raw=${ref}`);
-		expect(last).toBe(`last=${ref}`);
-	});
-
-	test("href and hrefr should still support explicit content without hline state", () => {
-		const result = expandPrompt('quoted={{href 5 "\treturn clean;"}}\nraw={{hrefr 5 "\treturn clean;"}}');
-		const [quoted, raw] = result.split("\n");
-		const ref = raw.slice("raw=".length);
-
-		expect(quoted).toBe(`quoted="${ref}"`);
-		expect(ref).toMatch(/^5[a-z]{2}$/);
-	});
-
-	test("href should not reuse hline state across prompt renders", () => {
-		expect(expandPrompt('{{hline 1 "const x = 1;"}}\n{{hrefr}}')).toMatch(/^1[a-z]{2}\|const x = 1;\n1[a-z]{2}$/);
-		expect(() => expandPrompt("{{hrefr}}")).toThrow("previous {{hline}}");
-	});
-});
-
-// ============================================================================
 // expandSlashCommand + expandPromptTemplate fallback behavior
 // ============================================================================
 
@@ -371,5 +328,53 @@ describe("template expansion fallback", () => {
 	test("should append two fallback newlines for prompt template output even when template source ends with newline", () => {
 		const result = expandPrompt("/test-template sample", "Do something.\n");
 		expect(result).toBe("Do something.\n\nsample");
+	});
+});
+
+// ============================================================================
+// renderYieldSchema helper + subagent-system-prompt.md
+// ============================================================================
+
+describe("renderYieldSchema", () => {
+	// prompt-templates is imported for its Handlebars helper registration side-effect
+	// (jtdToTypeScript + renderYieldSchema); the render calls below rely on it.
+	const templatePath = path.resolve(import.meta.dir, "../src/prompts/system/subagent-system-prompt.md");
+
+	async function renderSubagentPrompt(outputSchema: unknown): Promise<string> {
+		const templateSource = await fs.readFile(templatePath, "utf-8");
+		return prompt.render(templateSource, { agent: "test-agent", outputSchema });
+	}
+
+	test("wraps a JTD properties schema inside result.data so the model matches the yield envelope", async () => {
+		const rendered = await renderSubagentPrompt({
+			properties: {
+				status: { enum: ["goal_complete", "plan_created"] },
+				plan_path: { type: "string" },
+				summary: { type: "string" },
+			},
+		});
+		expect(rendered).toContain('```ts\nresult: {\n  data: {\n    status: "goal_complete" | "plan_created";');
+		expect(rendered).toContain("    summary: string;\n  };\n}\n```");
+		// The old rendering advertised a bare interface with no `result.data` context.
+		// Guard against regressing to it — that phrasing is what caused the reported bug.
+		expect(rendered).not.toContain("Your result MUST match this TypeScript interface");
+	});
+
+	test("wraps a scalar schema on the same line as data so the model matches the yield envelope", async () => {
+		const rendered = await renderSubagentPrompt({ type: "string" });
+		expect(rendered).toContain("```ts\nresult: {\n  data: string;\n}\n```");
+	});
+
+	test("wraps an array-of-object schema without breaking the result.data envelope", async () => {
+		const rendered = await renderSubagentPrompt({
+			elements: { properties: { title: { type: "string" }, count: { type: "int32" } } },
+		});
+		expect(rendered).toContain("```ts\nresult: {\n  data: { title: string; count: number; }[];\n}\n```");
+	});
+
+	test("omits the schema section entirely when outputSchema is absent", async () => {
+		const rendered = await renderSubagentPrompt(undefined);
+		expect(rendered).not.toContain("result: {");
+		expect(rendered).not.toContain("Your terminal `yield` MUST use exactly this shape");
 	});
 });

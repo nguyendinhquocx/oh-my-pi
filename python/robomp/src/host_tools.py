@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 from collections.abc import Callable, Mapping
@@ -22,10 +23,10 @@ from omp_rpc import HostTool, HostToolContext, RpcCommandError, host_tool
 
 from robomp import persona
 from robomp.config import Settings
-from robomp.db import Database, issue_key
+from robomp.db import Database, IssueState, issue_key
 from robomp.git_ops import GitCommandError, HeadDriftError
 from robomp.github_backend import GitHubBackend
-from robomp.github_client import GitHubError, IssueInfo, RepoInfo
+from robomp.github_client import GitHubError, IssueInfo, PullRequestFileInfo, RepoInfo
 from robomp.sandbox import (
     GitTransport,
     Workspace,
@@ -42,17 +43,19 @@ from robomp.sandbox import (
 log = logging.getLogger(__name__)
 _PRE_PR_FIX_COMMAND = ("bun", "run", "fix")
 _PRE_PR_CHECK_COMMAND = ("bun", "check")
+_BUN_INSTALL_COMMAND = ("bun", "install", "--frozen-lockfile", "--ignore-scripts")
+_BUN_INSTALL_TIMEOUT_SECONDS = 300.0
 _REPO_COMMAND_SCRUBBED_ENV_KEYS: tuple[str, ...] = (
     "GITHUB_TOKEN",
     "GITHUB_WEBHOOK_SECRET",
     "ROBOMP_REPLAY_TOKEN",
     "ROBOMP_GH_PROXY_HMAC_KEY",
 )
+_NEEDS_INFO_LABEL = "needs-info"
 _AGENT_HOME = Path("/srv/agent-home")
 _PRE_PR_FIX_TIMEOUT_SECONDS = 600.0
 _PRE_PR_CHECK_TIMEOUT_SECONDS = 600.0
 _PRE_PR_CHECK_MAX_OUTPUT = 12_000
-_PRE_PR_FIX_COMMIT_SUBJECT = "style: bun run fix"
 
 
 @dataclass(slots=True)
@@ -109,6 +112,12 @@ class ToolBindings:
     # — the originating issue has already been classified and the PR
     # itself does not carry triage labels.
     inbound_is_pr: bool = False
+    # True only for incoming-PR review tasks. Review tools require it; mutating
+    # branch/PR publication tools reject when it is set.
+    review_mode: bool = False
+    # Current task is driven by an allowlist/OWNER maintainer directive that
+    # authorizes implementation. Gates first-PR creation on non-bug/doc issues.
+    impl_authorized: bool = False
     slot_uid: int | None = None
     # Set by the worker before launching omp. Carries the abort-task signal
     # back out to the worker; `None` for unit tests that exercise tools
@@ -128,6 +137,43 @@ def _run_coro(loop: asyncio.AbstractEventLoop, coro: Any) -> Any:
     """Block the agent thread until an async call completes on the worker loop."""
     future = asyncio.run_coroutine_threadsafe(coro, loop)
     return future.result()
+
+
+def _issue_needs_info(bindings: ToolBindings) -> bool:
+    row = bindings.db.get_issue(bindings.issue_key)
+    return row is not None and row.state == "needs_info"
+
+
+def _optional_label_error(exc: Exception) -> str:
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _remove_needs_info_label(bindings: ToolBindings) -> bool:
+    try:
+        _run_coro(
+            bindings.loop,
+            bindings.github.remove_issue_label(bindings.repo.full_name, bindings.issue.number, _NEEDS_INFO_LABEL),
+        )
+    except GitHubError as exc:
+        if exc.status == 404:
+            return True
+        log.warning("needs-info label cleanup failed", extra={"issue": bindings.issue_key, "err": str(exc)})
+        return False
+    except Exception as exc:  # noqa: BLE001 - best-effort optional label cleanup
+        log.warning(
+            "needs-info label cleanup failed",
+            extra={"issue": bindings.issue_key, "err": _optional_label_error(exc)},
+        )
+        return False
+    return True
+
+
+def _advance_needs_info(bindings: ToolBindings, state: IssueState) -> bool:
+    if not _issue_needs_info(bindings):
+        return False
+    label_cleared = _remove_needs_info_label(bindings)
+    bindings.db.set_issue_state(bindings.issue_key, state)
+    return label_cleared
 
 
 def _audit(
@@ -181,8 +227,12 @@ def _run_repo_command(
     cmd: list[str] | tuple[str, ...],
     *,
     timeout: float | None = None,
+    extra_env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a repo-local command with agent-equivalent permissions and env."""
+    env = _repo_command_env(bindings)
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
         list(cmd),
         cwd=str(bindings.workspace.repo_dir),
@@ -190,7 +240,7 @@ def _run_repo_command(
         capture_output=True,
         text=True,
         timeout=timeout,
-        env=_repo_command_env(bindings),
+        env=env,
         **_slot_subprocess_kwargs(bindings.slot_uid),
     )
 
@@ -239,6 +289,59 @@ def _format_process_output(stdout: Any, stderr: Any) -> str:
     )
 
 
+def ensure_workspace_dependencies(bindings: ToolBindings) -> None:
+    """Bootstrap ``node_modules`` so the agent can resolve workspace packages.
+
+    A per-issue worktree is a bare source checkout (``git worktree add`` off
+    the shared clone pool): it has the repo's ``package.json``/``bun.lock`` but
+    no ``node_modules``. With bun's ``hoisted`` linker the workspace links
+    (``@oh-my-pi/pi-*``) only exist after an install, so without one any
+    ``bun test``/``bun check`` the agent runs fails instantly with "Cannot find
+    package" — the agent then reports it could not verify. We install before
+    the agent starts, mirroring how the natives cache pre-populates ``.node``
+    artifacts. The links resolve into *this* worktree's ``packages/*`` (not the
+    orchestrator's read-only ``/work/pi``), so tests exercise the PR's edited
+    source.
+
+    ``--frozen-lockfile`` keeps the lockfile pristine (no spurious diff for the
+    agent to commit) and ``--ignore-scripts`` skips lifecycle scripts so an
+    untrusted PR's ``postinstall``/``prepare`` cannot execute as the slot and
+    the cached native build is not redone. Runs with the same scrubbed,
+    slot-owned env as the other repo-owned bun commands (``bun run fix`` /
+    ``bun check``).
+
+    Skips non-bun repos. Otherwise runs unconditionally on every launch
+    (including ``--continue`` resumes): a frozen install verifies an intact
+    tree in ~20ms and re-links anything missing, so a previous install that
+    timed out or crashed half-way self-heals instead of being skipped forever
+    on a mere ``node_modules/`` directory existing. Best-effort: any failure
+    (offline, or a PR that bumped deps so the frozen lockfile is stale) is
+    logged and swallowed — the agent can still install itself or report the gap.
+    """
+    repo_dir = bindings.workspace.repo_dir
+    if not (repo_dir / "package.json").is_file() or not (repo_dir / "bun.lock").is_file():
+        return
+    try:
+        proc = _run_repo_command(bindings, _BUN_INSTALL_COMMAND, timeout=_BUN_INSTALL_TIMEOUT_SECONDS)
+    except FileNotFoundError:
+        log.warning("bun_install bootstrap skipped: bun not on PATH", extra={"issue": bindings.issue_key})
+        return
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning("bun_install bootstrap failed", extra={"issue": bindings.issue_key, "err": str(exc)})
+        return
+    if proc.returncode != 0:
+        log.warning(
+            "bun_install bootstrap nonzero exit",
+            extra={
+                "issue": bindings.issue_key,
+                "code": proc.returncode,
+                "output": _format_process_output(proc.stdout, proc.stderr),
+            },
+        )
+        return
+    log.info("bun_install bootstrap ok", extra={"issue": bindings.issue_key})
+
+
 def _run_pre_publish_bun_fix(
     bindings: ToolBindings,
     args: Mapping[str, Any],
@@ -247,12 +350,18 @@ def _run_pre_publish_bun_fix(
     stage: str,
     skip_checks: bool = False,
 ) -> None:
-    """Run `bun run fix` then commit any working-tree diff as the bot.
+    """Run `bun run fix` then amend any working-tree diff into HEAD.
 
     Silently no-ops when the repository does not define a `scripts.fix`
-    entry. Anything the formatter touches gets folded into a fresh
-    `style: bun run fix` commit so the downstream cleanliness gate sees a
-    pristine worktree.
+    entry. Anything the formatter touches gets amended into the agent's HEAD
+    commit so the downstream cleanliness gate sees a pristine worktree
+    without littering PR history with standalone `style:` commits. Amending
+    an already-pushed HEAD is safe: the push transport uses
+    `--force-with-lease`, which exists precisely to recover from local
+    history rewrites. When there is no commit that may safely absorb the
+    diff — HEAD sits on `origin/<base>` (pre-existing formatter drift) or is
+    foreign-authored — the tool refuses with instructions instead of
+    guessing.
 
     `tool_name` is the host tool calling this (audit attribution).
     `stage` is the human-readable verb used in error wording — "open PR"
@@ -267,7 +376,7 @@ def _run_pre_publish_bun_fix(
     if not _has_bun_script(bindings.workspace.repo_dir, "fix"):
         return
     # Dirty-tree gate BEFORE the formatter so any pre-existing uncommitted
-    # edit isn't silently swept into the `style: bun run fix` commit by the
+    # edit isn't silently swept into the formatter amend by the
     # `git add -A` below. The agent owns the worktree end-to-end; any diff
     # not already in a commit is a workflow bug it must resolve before we
     # mutate the tree further.
@@ -278,8 +387,8 @@ def _run_pre_publish_bun_fix(
             f"refusing to {stage}: dirty worktree before `bun run fix`.\n  "
             f"{dirty}\n"
             "Commit (or `git stash`) every change before invoking the formatter — "
-            "anything left uncommitted would be folded into the `style: bun run fix` "
-            "commit and silently land in the PR."
+            "anything left uncommitted would be amended into your HEAD commit "
+            "and silently land in the PR."
         )
         _audit(bindings, tool_name, args, error=msg)
         _raise_command(msg)
@@ -322,28 +431,48 @@ def _run_pre_publish_bun_fix(
     if not status.stdout.strip():
         return
 
+    # The formatter produced a diff. Fold it into the agent's HEAD commit —
+    # but only when HEAD is a bot-authored commit not already on the base
+    # branch. Amending a commit `origin/<base>` contains would rewrite
+    # shared history; amending a foreign-authored commit would bury our
+    # diff in someone else's work.
+    base = bindings.repo.default_branch
+    ahead = _run_repo_command(bindings, ["git", "rev-list", "-n", "1", f"origin/{base}..HEAD"])
+    if ahead.returncode != 0 or not ahead.stdout.strip():
+        msg = (
+            f"refusing to {stage}: `bun run fix` changed files, but there is no commit of "
+            f"yours to fold them into — the checkout matches `origin/{base}`, so the "
+            f"formatter drift pre-exists on `{base}`. Inspect with `git status` / `git diff`; "
+            "either commit the formatter output yourself or discard it "
+            "(`git checkout -- . && git clean -fd`) and retry with `skip_checks=true`, "
+            "documenting the bypass."
+        )
+        _audit(bindings, tool_name, args, error=msg)
+        _raise_command(msg)
+    head_identity = _run_repo_command(bindings, ["git", "log", "-1", "--format=%an%x1f%ae", "HEAD"])
+    if head_identity.returncode != 0 or head_identity.stdout.strip("\n").split("\x1f") != [
+        bindings.author_name,
+        bindings.author_email,
+    ]:
+        author = head_identity.stdout.strip("\n").replace("\x1f", " <") + ">"
+        msg = (
+            f"refusing to {stage}: `bun run fix` changed files, but HEAD is authored by "
+            f"{author} — refusing to fold the formatter diff into a foreign commit. "
+            "Fix the identity first (`git commit --amend --reset-author --no-edit`) and retry."
+        )
+        _audit(bindings, tool_name, args, error=msg)
+        _raise_command(msg)
+
     add = _run_repo_command(bindings, ["git", "add", "-A"])
     if add.returncode != 0:
         err = (add.stderr or add.stdout).strip()
         msg = f"refusing to {stage}: `git add -A` failed after `bun run fix`: {err}"
         _audit(bindings, tool_name, args, error=msg)
         _raise_command(msg)
-    commit = _run_repo_command(
-        bindings,
-        [
-            "git",
-            "-c",
-            f"user.email={bindings.author_email}",
-            "-c",
-            f"user.name={bindings.author_name}",
-            "commit",
-            "-m",
-            _PRE_PR_FIX_COMMIT_SUBJECT,
-        ],
-    )
+    commit = _run_repo_command(bindings, ["git", "commit", "--amend", "--no-edit"])
     if commit.returncode != 0:
         err = (commit.stderr or commit.stdout).strip()
-        msg = f"refusing to {stage}: failed to commit `bun run fix` changes: {err}"
+        msg = f"refusing to {stage}: failed to amend `bun run fix` changes into HEAD: {err}"
         _audit(bindings, tool_name, args, error=msg)
         _raise_command(msg)
 
@@ -398,17 +527,14 @@ def _run_pre_publish_bun_check(
         _raise_command(msg)
 
 
-_AUTOCLOSE_INELIGIBLE_STATES: frozenset[str] = frozenset({"closed", "merged", "abandoned"})
+_AUTOCLOSE_INELIGIBLE_STATES: frozenset[str] = frozenset({"closed", "merged", "needs_info", "abandoned"})
 
 
 def _should_schedule_autoclose(bindings: ToolBindings, target_number: int) -> float | None:
     """Return the configured close window (hours) when this comment should
-    schedule an auto-close; ``None`` otherwise.
-
-    Conditions: feature enabled in `Settings`, the comment lands on the
-    originating issue (not a different number, not a PR thread), the issue is
-    classified as `question`, and the issue is not already in a terminal
-    state (closed/merged/abandoned).
+    schedule the question auto-close job: feature enabled, same issue,
+    classified as `question`, and the issue is not already in a terminal or
+    waiting-for-reporter state.
     """
     settings = bindings.settings
     if settings is None or not settings.question_autoclose_enabled:
@@ -513,7 +639,134 @@ def _build_post_comment(bindings: ToolBindings) -> HostTool[Any, Any]:
     )
 
 
+def _repair_message_escapes(message: str) -> str | None:
+    """Convert shell-literal ``\\n`` escapes in a commit message to newlines.
+
+    Agents regularly run ``git commit -m 'subject\\n\\nbody'`` with single
+    quotes, recording the two-character backslash-n sequence instead of a
+    newline — the message then renders as one line of ``\\n``-littered text on
+    GitHub. Escapes inside backtick code spans (`` `\\n` ``) are genuine
+    content and are preserved.
+
+    Returns the repaired message, or ``None`` when nothing needs repair.
+    """
+    if "\\n" not in message:
+        return None
+    parts = message.split("`")
+    changed = False
+    for i in range(0, len(parts), 2):  # even indexes sit outside code spans
+        fixed = parts[i].replace("\\r\\n", "\n").replace("\\n", "\n")
+        if fixed != parts[i]:
+            parts[i] = fixed
+            changed = True
+    return "`".join(parts) if changed else None
+
+
+def _repair_commit_message_escapes(bindings: ToolBindings, args: Mapping[str, Any], *, tool_name: str) -> None:
+    """Rewrite unpushed commits whose messages carry literal ``\\n`` escapes.
+
+    Rebuilds ``origin/<base>..HEAD`` with ``git commit-tree``, preserving
+    every tree, parent topology, identity, and date — only messages change.
+    Safe against already-pushed commits: the push transport uses
+    ``--force-with-lease``. Once a broken message is detected the repair is
+    mandatory — a git failure mid-rewrite refuses the push (the branch ref
+    itself only ever moves via the compare-and-swap ``update-ref`` at the
+    very end, so a refusal never leaves partial state).
+    """
+
+    def fail(step: str, proc: subprocess.CompletedProcess[str]) -> NoReturn:
+        err = (proc.stderr or proc.stdout).strip() or f"exit {proc.returncode}"
+        msg = (
+            f"refusing to push: commit messages contain literal `\\n` escapes and the "
+            f"automatic repair failed at `{step}`: {err}\n"
+            "Reword the affected commits yourself (`git rebase -i origin/"
+            + bindings.repo.default_branch
+            + "`, real newlines via `git commit -F <file>` or multiple `-m` flags) and retry."
+        )
+        _audit(bindings, tool_name, args, error=msg)
+        _raise_command(msg)
+
+    base = bindings.repo.default_branch
+    rev_list = _run_repo_command(bindings, ["git", "rev-list", "--reverse", f"origin/{base}..HEAD"])
+    if rev_list.returncode != 0:
+        return
+    shas = rev_list.stdout.split()
+    if not shas:
+        return
+    messages: dict[str, str] = {}
+    repaired: list[str] = []
+    for sha in shas:
+        show = _run_repo_command(bindings, ["git", "log", "-1", "--format=%B", sha])
+        if show.returncode != 0:
+            if repaired:
+                fail("git log", show)
+            return
+        message = show.stdout
+        fixed = _repair_message_escapes(message)
+        if fixed is not None:
+            message = fixed
+            repaired.append(sha)
+        messages[sha] = message
+    if not repaired:
+        return
+
+    needs_fix = set(repaired)
+    rewritten: dict[str, str] = {}
+    for sha in shas:
+        meta = _run_repo_command(
+            bindings,
+            ["git", "log", "-1", "--format=%T%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%cn%x1f%ce%x1f%cI", sha],
+        )
+        if meta.returncode != 0:
+            fail("git log", meta)
+        fields = meta.stdout.strip("\n").split("\x1f")
+        if len(fields) != 8:
+            fail("git log", meta)
+        tree, parents_raw, a_name, a_email, a_date, c_name, c_email, c_date = fields
+        parents_old = parents_raw.split()
+        parents_new = [rewritten.get(p, p) for p in parents_old]
+        if sha not in needs_fix and parents_new == parents_old:
+            rewritten[sha] = sha
+            continue
+        cmd = ["git", "commit-tree", tree]
+        for parent in parents_new:
+            cmd += ["-p", parent]
+        cmd += ["-m", messages[sha].rstrip("\n")]
+        made = _run_repo_command(
+            bindings,
+            cmd,
+            extra_env={
+                "GIT_AUTHOR_NAME": a_name,
+                "GIT_AUTHOR_EMAIL": a_email,
+                "GIT_AUTHOR_DATE": a_date,
+                "GIT_COMMITTER_NAME": c_name,
+                "GIT_COMMITTER_EMAIL": c_email,
+                "GIT_COMMITTER_DATE": c_date,
+            },
+        )
+        if made.returncode != 0 or not made.stdout.strip():
+            fail("git commit-tree", made)
+        rewritten[sha] = made.stdout.strip()
+
+    old_head, new_head = shas[-1], rewritten[shas[-1]]
+    update = _run_repo_command(
+        bindings,
+        ["git", "update-ref", "-m", "robomp: repaired commit message escapes", "HEAD", new_head, old_head],
+    )
+    if update.returncode != 0:
+        fail("git update-ref", update)
+    _audit(bindings, tool_name, args, result={"repaired_commit_messages": [sha[:12] for sha in repaired]})
+    log.info(
+        "repaired commit message escapes",
+        extra={"issue": bindings.issue_key, "commits": [sha[:12] for sha in repaired]},
+    )
+
+
 def _guarded_push_branch(bindings: ToolBindings, args: Mapping[str, Any], tool_name: str, branch: str) -> str:
+    if bindings.review_mode:
+        msg = "refusing to push: PR review worktrees are read-only."
+        _audit(bindings, tool_name, args, error=msg)
+        _raise_command(msg)
     if branch != bindings.workspace.branch:
         _raise_command(
             f"refusing to push: branch={branch!r} does not match workspace branch {bindings.workspace.branch!r}."
@@ -521,6 +774,9 @@ def _guarded_push_branch(bindings: ToolBindings, args: Mapping[str, Any], tool_n
     # Re-pin the configured identity right before push (cheap; idempotent).
     _run_repo_command(bindings, ["git", "config", "user.email", bindings.author_email])
     _run_repo_command(bindings, ["git", "config", "user.name", bindings.author_name])
+    # Cosmetic repair BEFORE the head snapshot: commits whose messages carry
+    # shell-literal `\n` escapes are rewritten in place (message-only).
+    _repair_commit_message_escapes(bindings, args, tool_name=tool_name)
     repo_dir_path = bindings.workspace.repo_dir
     head_proc = _run_repo_command(bindings, ["git", "rev-parse", "HEAD"])
     if head_proc.returncode != 0:
@@ -611,6 +867,11 @@ def _guarded_push_branch(bindings: ToolBindings, args: Mapping[str, Any], tool_n
 # ---------- gh_push_branch ----------
 def _build_push_branch(bindings: ToolBindings) -> HostTool[Any, Any]:
     def execute(args: dict[str, Any], _ctx: HostToolContext[Any]) -> str:
+        if bindings.review_mode:
+            msg = "refusing to push: PR review worktrees are read-only."
+            _audit(bindings, "gh_push_branch", args, error=msg)
+            _raise_command(msg)
+        _enforce_impl_authorization(bindings, "gh_push_branch", args, action="push branch")
         branch = str(args.get("branch") or bindings.workspace.branch)
         skip = bool(args.get("skip_checks", False))
         # Same gate as gh_open_pr — formatter + check before bytes leave the
@@ -648,6 +909,11 @@ def _build_push_branch(bindings: ToolBindings) -> HostTool[Any, Any]:
 # ---------- gh_open_pr ----------
 def _build_open_pr(bindings: ToolBindings) -> HostTool[Any, Any]:
     def execute(args: dict[str, Any], _ctx: HostToolContext[Any]) -> str:
+        if bindings.review_mode:
+            msg = "refusing to open PR: PR review tasks are read-only."
+            _audit(bindings, "gh_open_pr", args, error=msg)
+            _raise_command(msg)
+        _enforce_impl_authorization(bindings, "gh_open_pr", args, action="open PR")
         title = args.get("title")
         body = args.get("body")
         if not isinstance(title, str) or not title.strip():
@@ -676,6 +942,7 @@ def _build_open_pr(bindings: ToolBindings) -> HostTool[Any, Any]:
         # Make sure the branch is pushed (idempotent) using the same preflight as gh_push_branch.
         _guarded_push_branch(bindings, args, "gh_open_pr", bindings.workspace.branch)
         base = args.get("base") or bindings.repo.default_branch
+        was_needs_info = _issue_needs_info(bindings)
         try:
             pr = _run_coro(
                 bindings.loop,
@@ -693,6 +960,7 @@ def _build_open_pr(bindings: ToolBindings) -> HostTool[Any, Any]:
             _raise_command(f"GitHub rejected PR: {exc.status} {exc.message}")
         bindings.db.set_issue_pr(bindings.issue_key, pr.number)
         bindings.db.set_issue_state(bindings.issue_key, "opened")
+        needs_info_label_cleared = _remove_needs_info_label(bindings) if was_needs_info else False
         artifact = bindings.workspace.artifacts_dir / "pr.json"
         artifact.write_text(
             json.dumps(
@@ -707,7 +975,10 @@ def _build_open_pr(bindings: ToolBindings) -> HostTool[Any, Any]:
             ),
             encoding="utf-8",
         )
-        _audit(bindings, "gh_open_pr", args, result={"pr_number": pr.number, "url": pr.html_url})
+        result: dict[str, Any] = {"pr_number": pr.number, "url": pr.html_url}
+        if needs_info_label_cleared:
+            result["cleared_needs_info"] = True
+        _audit(bindings, "gh_open_pr", args, result=result)
         return f"opened #{pr.number}: {pr.html_url}"
 
     return host_tool(
@@ -821,7 +1092,10 @@ def _build_repro_record(bindings: ToolBindings) -> HostTool[Any, Any]:
         if _slot_permissions_active(bindings.slot_uid):
             assert bindings.slot_uid is not None
             os.chown(target, bindings.slot_uid, bindings.slot_uid)
-        _audit(bindings, "repro_record", args, result={"path": str(target.relative_to(bindings.workspace.root))})
+        result: dict[str, Any] = {"path": str(target.relative_to(bindings.workspace.root))}
+        if _advance_needs_info(bindings, "reproducing"):
+            result["cleared_needs_info"] = True
+        _audit(bindings, "repro_record", args, result=result)
         return "recorded"
 
     return host_tool(
@@ -867,9 +1141,26 @@ def _build_mark_unable(bindings: ToolBindings) -> HostTool[Any, Any]:
         except GitHubError as exc:
             _audit(bindings, "mark_unable_to_reproduce", args, error=str(exc))
             _raise_command(f"GitHub rejected comment: {exc.status} {exc.message}")
-        bindings.db.set_issue_state(bindings.issue_key, "abandoned")
-        _audit(bindings, "mark_unable_to_reproduce", args, result={"comment_id": comment.id})
-        return f"posted abandonment comment id={comment.id}"
+        result: dict[str, Any] = {"comment_id": comment.id, "state": "needs_info"}
+        try:
+            labels = _run_coro(
+                bindings.loop,
+                bindings.github.add_issue_labels(bindings.repo.full_name, bindings.issue.number, [_NEEDS_INFO_LABEL]),
+            )
+            result["labels"] = list(labels)
+        except GitHubError as exc:
+            # Some repos have not created the optional status label yet. The
+            # durable behavior is the non-terminal sqlite state plus the visible
+            # info-request comment, so label setup must not block resumption.
+            log.warning("needs-info label failed", extra={"issue": bindings.issue_key, "err": str(exc)})
+            result["label_error"] = f"{exc.status} {exc.message}"
+        except Exception as exc:  # noqa: BLE001 - best-effort optional label setup
+            error = _optional_label_error(exc)
+            log.warning("needs-info label failed", extra={"issue": bindings.issue_key, "err": error})
+            result["label_error"] = error
+        bindings.db.set_issue_state(bindings.issue_key, "needs_info")
+        _audit(bindings, "mark_unable_to_reproduce", args, result=result)
+        return f"posted needs-info comment id={comment.id}"
 
     return host_tool(
         name="mark_unable_to_reproduce",
@@ -966,9 +1257,336 @@ def _build_fetch_thread(bindings: ToolBindings) -> HostTool[Any, Any]:
 
 
 _PRIMARY_TYPES = ("bug", "enhancement", "question", "proposal", "documentation", "invalid", "duplicate")
+_AUTO_PR_CLASSIFICATIONS = frozenset({"bug", "documentation"})
 _PRIORITIES = ("prio:p0", "prio:p1", "prio:p2", "prio:p3")
 _FUNCTIONAL = ("agent", "tool", "tui", "cli", "prompting", "sdk", "auth", "setup", "ux", "providers")
 _PLATFORMS = ("platform:linux", "platform:macos", "platform:windows", "platform:wsl")
+_PR_RANKS = ("review:p0", "review:p1", "review:p2", "review:p3")
+_PR_TYPES = ("feat", "fix", "docs", "refactor", "perf", "test", "chore", "ci", "build")
+_CLOSING_ISSUE_RE = re.compile(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)", re.IGNORECASE)
+
+
+def _enforce_impl_authorization(
+    bindings: ToolBindings,
+    tool_name: str,
+    args: Mapping[str, Any],
+    *,
+    action: str,
+) -> None:
+    """Refuse first publish on issue classes that require maintainer authorization."""
+    if bindings.impl_authorized:
+        return
+    if bindings.db.has_authorized_impl_event(bindings.issue_key):
+        return
+    row = bindings.db.get_issue(bindings.issue_key)
+    if row is not None:
+        if row.pr_number is not None:
+            return
+        classification = row.classification
+        if classification in _AUTO_PR_CLASSIFICATIONS:
+            return
+    else:
+        classification = None
+    classification_phrase = f"classified `{classification}`" if classification else "not classified"
+    msg = (
+        f"refusing to {action}: issue #{bindings.issue.number} is {classification_phrase}; "
+        "a repo OWNER or allowlisted maintainer must @-mention you with an explicit go-ahead "
+        "before any branch/PR. Post your analysis with `gh_post_comment` and stop."
+    )
+    _audit(bindings, tool_name, args, error=msg)
+    _raise_command(msg)
+
+
+def _require_review_mode(bindings: ToolBindings, name: str, args: Mapping[str, Any]) -> None:
+    if bindings.review_mode:
+        return
+    msg = f"{name} is only available during incoming PR review tasks."
+    _audit(bindings, name, args, error=msg)
+    _raise_command(msg)
+
+
+def _format_pr_file(file: PullRequestFileInfo) -> str:
+    return f"- `{file.path}` ({file.status}, +{file.additions}/-{file.deletions})"
+
+
+def _build_fetch_pr(bindings: ToolBindings) -> HostTool[Any, Any]:
+    def execute(args: dict[str, Any], _ctx: HostToolContext[Any]) -> str:
+        _require_review_mode(bindings, "fetch_pr", args)
+        pr_number = bindings.default_comment_number
+        try:
+            pr = _run_coro(bindings.loop, bindings.github.get_pull_request(bindings.repo.full_name, pr_number))
+            files = _run_coro(bindings.loop, bindings.github.list_pr_files(bindings.repo.full_name, pr_number))
+        except GitHubError as exc:
+            _audit(bindings, "fetch_pr", args, error=str(exc))
+            _raise_command(f"GitHub fetch failed: {exc.status} {exc.message}")
+        linked = tuple(sorted({int(match.group(1)) for match in _CLOSING_ISSUE_RE.finditer(pr.body)}))
+        lines = [
+            f"# {pr.repo}#{pr.number} ({pr.state})",
+            f"title: {pr.title or '(untitled)'}",
+            f"author: @{pr.author}",
+            f"head: {pr.head_repo or pr.repo}:{pr.head_ref}",
+            f"base: {pr.base_ref}",
+            f"url: {pr.html_url}",
+            "",
+            "## Body",
+            pr.body.strip() or "(empty)",
+            "",
+            "## Linked issues",
+            ", ".join(f"#{n}" for n in linked) if linked else "(none found in PR body)",
+            "",
+            f"## Changed files ({len(files)})",
+        ]
+        lines.extend(_format_pr_file(file) for file in files)
+        rendered = "\n".join(lines)
+        _audit(bindings, "fetch_pr", args, result={"files": len(files), "linked_issues": list(linked)})
+        return rendered
+
+    return host_tool(
+        name="fetch_pr",
+        description=persona.host_tool_description("fetch_pr"),
+        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        execute=execute,
+    )
+
+
+def _build_classify_pr(bindings: ToolBindings) -> HostTool[Any, Any]:
+    def execute(args: dict[str, Any], _ctx: HostToolContext[Any]) -> str:
+        _require_review_mode(bindings, "classify_pr", args)
+        rank = args.get("rank")
+        if rank not in _PR_RANKS:
+            msg = f"classify_pr 'rank' must be one of {_PR_RANKS}; got {rank!r}."
+            _audit(bindings, "classify_pr", args, error=msg)
+            _raise_command(msg)
+        pr_type = args.get("type")
+        if pr_type not in _PR_TYPES:
+            msg = f"classify_pr 'type' must be one of {_PR_TYPES}; got {pr_type!r}."
+            _audit(bindings, "classify_pr", args, error=msg)
+            _raise_command(msg)
+        rationale = args.get("rationale")
+        if not isinstance(rationale, str) or not rationale.strip():
+            msg = "classify_pr requires a one-sentence 'rationale'."
+            _audit(bindings, "classify_pr", args, error=msg)
+            _raise_command(msg)
+
+        labels: list[str] = ["triaged", str(rank), str(pr_type)]
+        for area in args.get("area") or ():
+            if isinstance(area, str) and area in _FUNCTIONAL:
+                labels.append(area)
+        provider = args.get("provider")
+        if isinstance(provider, str) and provider.strip() and provider.startswith("provider:"):
+            labels.append("providers")
+            labels.append(provider)
+        try:
+            applied = _run_coro(
+                bindings.loop,
+                bindings.github.add_issue_labels(bindings.repo.full_name, bindings.default_comment_number, labels),
+            )
+        except GitHubError as exc:
+            _audit(bindings, "classify_pr", args, error=str(exc))
+            _raise_command(f"GitHub rejected labels: {exc.status} {exc.message}")
+        bindings.db.set_issue_classification(bindings.issue_key, str(rank))
+        _audit(
+            bindings,
+            "classify_pr",
+            args,
+            result={"rank": rank, "type": pr_type, "labels": list(applied), "rationale": rationale},
+        )
+        return f"classified PR as {rank}; labels applied: {', '.join(applied)}."
+
+    return host_tool(
+        name="classify_pr",
+        description=persona.host_tool_description("classify_pr"),
+        parameters={
+            "type": "object",
+            "properties": {
+                "rank": {
+                    "type": "string",
+                    "enum": list(_PR_RANKS),
+                    "description": persona.host_tool_parameter_description("classify_pr", "rank"),
+                },
+                "type": {
+                    "type": "string",
+                    "enum": list(_PR_TYPES),
+                    "description": persona.host_tool_parameter_description("classify_pr", "type"),
+                },
+                "area": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": list(_FUNCTIONAL)},
+                    "description": persona.host_tool_parameter_description("classify_pr", "area"),
+                },
+                "provider": {
+                    "type": "string",
+                    "description": persona.host_tool_parameter_description("classify_pr", "provider"),
+                },
+                "rationale": {
+                    "type": "string",
+                    "description": persona.host_tool_parameter_description("classify_pr", "rationale"),
+                },
+            },
+            "required": ["rank", "type", "rationale"],
+            "additionalProperties": False,
+        },
+        execute=execute,
+    )
+
+
+def _review_comment_to_payload(comment: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "path": comment.path,
+        "line": comment.line,
+        "side": comment.side,
+        "body": comment.body,
+    }
+    if comment.start_line is not None:
+        payload["start_line"] = comment.start_line
+    if comment.start_side is not None:
+        payload["start_side"] = comment.start_side
+    return payload
+
+
+def _build_pr_review_comment(bindings: ToolBindings) -> HostTool[Any, Any]:
+    def execute(args: dict[str, Any], _ctx: HostToolContext[Any]) -> str:
+        _require_review_mode(bindings, "pr_review_comment", args)
+        path = args.get("path")
+        line = args.get("line")
+        body = args.get("body")
+        if not isinstance(path, str) or not path.strip():
+            msg = "pr_review_comment requires a non-empty 'path'."
+            _audit(bindings, "pr_review_comment", args, error=msg)
+            _raise_command(msg)
+        if not isinstance(line, int) or line <= 0:
+            msg = "pr_review_comment requires a positive integer 'line'."
+            _audit(bindings, "pr_review_comment", args, error=msg)
+            _raise_command(msg)
+        if not isinstance(body, str) or not body.strip():
+            msg = "pr_review_comment requires a non-empty 'body'."
+            _audit(bindings, "pr_review_comment", args, error=msg)
+            _raise_command(msg)
+        side = str(args.get("side") or "RIGHT")
+        if side not in ("RIGHT", "LEFT"):
+            msg = "pr_review_comment 'side' must be RIGHT or LEFT."
+            _audit(bindings, "pr_review_comment", args, error=msg)
+            _raise_command(msg)
+        start_line = args.get("start_line")
+        if start_line is not None and (not isinstance(start_line, int) or start_line <= 0):
+            msg = "pr_review_comment 'start_line' must be a positive integer when provided."
+            _audit(bindings, "pr_review_comment", args, error=msg)
+            _raise_command(msg)
+        start_side_raw = args.get("start_side")
+        start_side = str(start_side_raw) if start_side_raw is not None else None
+        if start_side is not None and start_side not in ("RIGHT", "LEFT"):
+            msg = "pr_review_comment 'start_side' must be RIGHT or LEFT when provided."
+            _audit(bindings, "pr_review_comment", args, error=msg)
+            _raise_command(msg)
+        staged = bindings.db.stage_review_comment(
+            issue_key=bindings.issue_key,
+            path=path.strip(),
+            line=line,
+            side=side,
+            start_line=start_line,
+            start_side=start_side,
+            body=body.strip(),
+        )
+        count = len(bindings.db.list_staged_review_comments(bindings.issue_key))
+        _audit(bindings, "pr_review_comment", args, result={"id": staged.id, "staged": count})
+        return f"staged review comment #{staged.id}; staged_count={count}"
+
+    return host_tool(
+        name="pr_review_comment",
+        description=persona.host_tool_description("pr_review_comment"),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": persona.host_tool_parameter_description("pr_review_comment", "path"),
+                },
+                "line": {
+                    "type": "integer",
+                    "description": persona.host_tool_parameter_description("pr_review_comment", "line"),
+                },
+                "body": {
+                    "type": "string",
+                    "description": persona.host_tool_parameter_description("pr_review_comment", "body"),
+                },
+                "side": {
+                    "type": "string",
+                    "enum": ["RIGHT", "LEFT"],
+                    "default": "RIGHT",
+                    "description": persona.host_tool_parameter_description("pr_review_comment", "side"),
+                },
+                "start_line": {
+                    "type": "integer",
+                    "description": persona.host_tool_parameter_description("pr_review_comment", "start_line"),
+                },
+                "start_side": {
+                    "type": "string",
+                    "enum": ["RIGHT", "LEFT"],
+                    "description": persona.host_tool_parameter_description("pr_review_comment", "start_side"),
+                },
+            },
+            "required": ["path", "line", "body"],
+            "additionalProperties": False,
+        },
+        execute=execute,
+    )
+
+
+def _build_submit_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
+    def execute(args: dict[str, Any], _ctx: HostToolContext[Any]) -> str:
+        _require_review_mode(bindings, "submit_pr_review", args)
+        body = args.get("body")
+        if not isinstance(body, str) or not body.strip():
+            msg = "submit_pr_review requires a non-empty 'body'."
+            _audit(bindings, "submit_pr_review", args, error=msg)
+            _raise_command(msg)
+        staged = bindings.db.list_staged_review_comments(bindings.issue_key)
+        comments = [_review_comment_to_payload(comment) for comment in staged]
+        try:
+            review = _run_coro(
+                bindings.loop,
+                bindings.github.submit_pr_review(
+                    repo=bindings.repo.full_name,
+                    pr_number=bindings.default_comment_number,
+                    body=body.strip(),
+                    event="COMMENT",
+                    comments=comments,
+                ),
+            )
+        except GitHubError as exc:
+            _audit(bindings, "submit_pr_review", args, error=str(exc))
+            _raise_command(f"GitHub rejected PR review: {exc.status} {exc.message}")
+        cleared = bindings.db.clear_staged_review_comments(bindings.issue_key)
+        _audit(
+            bindings,
+            "submit_pr_review",
+            args,
+            result={"review_id": review.id, "comments": len(comments), "cleared": cleared, "event": "COMMENT"},
+        )
+        return f"submitted PR review id={review.id}; comments={len(comments)}"
+
+    return host_tool(
+        name="submit_pr_review",
+        description=persona.host_tool_description("submit_pr_review"),
+        parameters={
+            "type": "object",
+            "properties": {
+                "body": {
+                    "type": "string",
+                    "description": persona.host_tool_parameter_description("submit_pr_review", "body"),
+                },
+                "event": {
+                    "type": "string",
+                    "enum": ["COMMENT"],
+                    "default": "COMMENT",
+                    "description": persona.host_tool_parameter_description("submit_pr_review", "event"),
+                },
+            },
+            "required": ["body"],
+            "additionalProperties": False,
+        },
+        execute=execute,
+    )
 
 
 def _build_set_issue_labels(bindings: ToolBindings) -> HostTool[Any, Any]:
@@ -1093,20 +1711,6 @@ def _build_classify_issue(bindings: ToolBindings) -> HostTool[Any, Any]:
             labels.append(platform)
         labels.append("triaged")
 
-        try:
-            applied = _run_coro(
-                bindings.loop,
-                bindings.github.add_issue_labels(
-                    bindings.repo.full_name,
-                    bindings.issue.number,
-                    labels,
-                ),
-            )
-        except GitHubError as exc:
-            _audit(bindings, "classify_issue", args, error=str(exc))
-            _raise_command(f"GitHub rejected labels: {exc.status} {exc.message}")
-
-        bindings.db.set_issue_classification(bindings.issue_key, primary)
         renamed_to: str | None = None
         if branch_slug:
             try:
@@ -1128,6 +1732,21 @@ def _build_classify_issue(bindings: ToolBindings) -> HostTool[Any, Any]:
                 # refactor of that helper still surfaces the mismatch.
                 _raise_command("classify_issue internal: branch rename inconsistent.")
             bindings.db.set_issue_branch(bindings.issue_key, renamed_to)
+
+        try:
+            applied = _run_coro(
+                bindings.loop,
+                bindings.github.add_issue_labels(
+                    bindings.repo.full_name,
+                    bindings.issue.number,
+                    labels,
+                ),
+            )
+        except GitHubError as exc:
+            _audit(bindings, "classify_issue", args, error=str(exc))
+            _raise_command(f"GitHub rejected labels: {exc.status} {exc.message}")
+
+        bindings.db.set_issue_classification(bindings.issue_key, primary)
         _audit(
             bindings,
             "classify_issue",
@@ -1204,6 +1823,10 @@ def build(bindings: ToolBindings) -> tuple[HostTool[Any, Any], ...]:
     return (
         _build_classify_issue(bindings),
         _build_set_issue_labels(bindings),
+        _build_fetch_pr(bindings),
+        _build_classify_pr(bindings),
+        _build_pr_review_comment(bindings),
+        _build_submit_pr_review(bindings),
         _build_post_comment(bindings),
         _build_push_branch(bindings),
         _build_open_pr(bindings),

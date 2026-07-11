@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import {
+	readImageFromClipboard,
+	readMacFileUrlsFromClipboard,
+	readTextFromClipboard,
+} from "@oh-my-pi/pi-coding-agent/utils/clipboard";
 import * as native from "@oh-my-pi/pi-natives";
 import type { Subprocess } from "bun";
-import { readImageFromClipboard } from "../../src/utils/clipboard";
 
 type SpawnOptions = Bun.SpawnOptions.SpawnOptions<
 	Bun.SpawnOptions.Writable,
@@ -97,9 +101,10 @@ describe("readImageFromClipboard on WSL", () => {
 		expect(nativeSpy).not.toHaveBeenCalled();
 	});
 
-	it("falls back to the native bridge when PowerShell returns no payload", async () => {
+	it("falls back to the native bridge when PowerShell returns no payload and a display is present", async () => {
 		setPlatform("linux");
 		process.env.WSL_INTEROP = "/run/WSL/1_interop";
+		process.env.WAYLAND_DISPLAY = "wayland-0";
 
 		spyPowershell([], "");
 		const nativeSpy = vi.spyOn(native, "readImageFromClipboard").mockResolvedValue(null);
@@ -110,15 +115,28 @@ describe("readImageFromClipboard on WSL", () => {
 		expect(nativeSpy).toHaveBeenCalledTimes(1);
 	});
 
-	it("falls back to the native bridge when PowerShell exits non-zero", async () => {
+	it("falls back to the native bridge when PowerShell exits non-zero (with display)", async () => {
 		setPlatform("linux");
 		process.env.WSL_DISTRO_NAME = "Ubuntu";
+		process.env.DISPLAY = ":0";
 
 		spyPowershell([], "noise", 1);
 		const nativeSpy = vi.spyOn(native, "readImageFromClipboard").mockResolvedValue(null);
 
 		await readImageFromClipboard();
 		expect(nativeSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("returns null without invoking arboard on headless WSL when PowerShell yields nothing", async () => {
+		setPlatform("linux");
+		process.env.WSL_DISTRO_NAME = "Ubuntu";
+		// No DISPLAY / WAYLAND_DISPLAY — arboard would reject, so we must short-circuit.
+
+		spyPowershell([], "");
+		const nativeSpy = vi.spyOn(native, "readImageFromClipboard");
+
+		expect(await readImageFromClipboard()).toBeNull();
+		expect(nativeSpy).not.toHaveBeenCalled();
 	});
 });
 
@@ -131,6 +149,38 @@ describe("readImageFromClipboard dispatch", () => {
 		expect(await readImageFromClipboard()).toBeNull();
 		expect(spawnSpy).not.toHaveBeenCalled();
 		expect(nativeSpy).not.toHaveBeenCalled();
+	});
+
+	it("uses the PowerShell bridge on native Windows when arboard has no image payload", async () => {
+		setPlatform("win32");
+		const calls: SpawnCall[] = [];
+		spyPowershell(calls, RED_1X1_PNG_BASE64);
+		vi.spyOn(native, "readImageFromClipboard").mockResolvedValue(null);
+
+		const image = await readImageFromClipboard();
+
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.cmd[0]).toBe("powershell.exe");
+		expect(image?.mimeType).toBe("image/png");
+		expect(Array.from(image!.data.subarray(0, 8))).toEqual([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+		expect(calls[0]?.cmd).toContain("-Sta");
+	});
+
+	it("falls back to PowerShell when native Windows image conversion fails", async () => {
+		setPlatform("win32");
+		const calls: SpawnCall[] = [];
+		spyPowershell(calls, RED_1X1_PNG_BASE64);
+		vi.spyOn(native, "readImageFromClipboard").mockRejectedValue(
+			new Error("The clipboard image could not be converted to the appropriate format."),
+		);
+
+		const image = await readImageFromClipboard();
+
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.cmd[0]).toBe("powershell.exe");
+		expect(calls[0]?.cmd).toContain("-Sta");
+		expect(image?.mimeType).toBe("image/png");
+		expect(Array.from(image!.data.subarray(0, 8))).toEqual([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 	});
 
 	it("delegates straight to the native bridge on non-WSL linux with a display", async () => {
@@ -154,5 +204,100 @@ describe("readImageFromClipboard dispatch", () => {
 		expect(await readImageFromClipboard()).toBeNull();
 		expect(spawnSpy).not.toHaveBeenCalled();
 		expect(nativeSpy).not.toHaveBeenCalled();
+	});
+});
+
+describe("readMacFileUrlsFromClipboard", () => {
+	it("returns an empty list on non-darwin platforms without spawning osascript", async () => {
+		setPlatform("linux");
+		const spawnSpy = vi.spyOn(Bun, "spawn");
+
+		expect(await readMacFileUrlsFromClipboard()).toEqual([]);
+		expect(spawnSpy).not.toHaveBeenCalled();
+	});
+
+	it("splits osascript output into one path per non-empty line on darwin", async () => {
+		setPlatform("darwin");
+		const calls: SpawnCall[] = [];
+		spyPowershell(calls, "/Users/me/Pictures/photo.png\n/Users/me/Pictures/clip.jpg\n\n");
+
+		const paths = await readMacFileUrlsFromClipboard();
+
+		expect(paths).toEqual(["/Users/me/Pictures/photo.png", "/Users/me/Pictures/clip.jpg"]);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.cmd).toEqual(["osascript", "-"]);
+		// AppleScript payload is piped as stdin; the fix uses Bun.spawn with a
+		// Buffer so the child receives it without blocking the event loop.
+		const stdin = calls[0]?.options.stdin;
+		expect(Buffer.isBuffer(stdin)).toBe(true);
+		expect((stdin as Buffer).toString("utf8")).toContain("«class furl»");
+	});
+
+	it("returns an empty list when osascript exits non-zero (e.g. binary missing)", async () => {
+		setPlatform("darwin");
+		spyPowershell([], "", 127);
+
+		expect(await readMacFileUrlsFromClipboard()).toEqual([]);
+	});
+});
+
+describe("readTextFromClipboard", () => {
+	it("returns pbpaste stdout on darwin without touching execSync", async () => {
+		setPlatform("darwin");
+		const calls: SpawnCall[] = [];
+		spyPowershell(calls, "hello from pbpaste");
+
+		expect(await readTextFromClipboard()).toBe("hello from pbpaste");
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.cmd).toEqual(["pbpaste"]);
+	});
+
+	it("returns an empty string when the subprocess exits non-zero", async () => {
+		setPlatform("darwin");
+		spyPowershell([], "", 1);
+
+		expect(await readTextFromClipboard()).toBe("");
+	});
+
+	it("keeps the event loop responsive while the clipboard tool runs (#4235)", async () => {
+		setPlatform("darwin");
+
+		// Simulate a slow pbpaste: its stdout stream only emits after a real
+		// setTimeout, so the event loop must be free during the read. Under the
+		// pre-fix execSync path, this would spin the child synchronously and
+		// starve every setInterval tick.
+		const DELAY_MS = 80;
+		const slowProc = {
+			pid: 1,
+			stdout: new ReadableStream<Uint8Array>({
+				async start(controller) {
+					await Bun.sleep(DELAY_MS);
+					controller.enqueue(new TextEncoder().encode("payload"));
+					controller.close();
+				},
+			}),
+			stderr: streamOf(""),
+			exitCode: 0,
+			exited: (async () => {
+				await Bun.sleep(DELAY_MS);
+				return 0;
+			})(),
+			kill: () => true,
+		} as unknown as Subprocess;
+		vi.spyOn(Bun, "spawn").mockReturnValue(slowProc);
+
+		let ticks = 0;
+		const timer = setInterval(() => {
+			ticks += 1;
+		}, 10);
+		try {
+			const text = await readTextFromClipboard();
+			expect(text).toBe("payload");
+		} finally {
+			clearInterval(timer);
+		}
+		// If the read blocked the loop, ticks would stay at 0. A yielding
+		// implementation fires several ticks in the ~80ms window.
+		expect(ticks).toBeGreaterThanOrEqual(2);
 	});
 });

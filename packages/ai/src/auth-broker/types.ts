@@ -6,7 +6,12 @@
  * credential expires or a 401 surfaces on a supposedly-fresh credential.
  */
 
-import type { AuthCredential, AuthCredentialSnapshot, AuthCredentialSnapshotEntry } from "../auth-storage";
+import type {
+	AuthCredential,
+	AuthCredentialSnapshot,
+	AuthCredentialSnapshotEntry,
+	StoredCredentialBlock,
+} from "../auth-storage";
 import type { UsageReport } from "../usage";
 
 /** GET /v1/healthz response body. */
@@ -22,8 +27,11 @@ export interface RefresherSchedule {
 	nextSweepInMs: number;
 }
 
+export type CredentialBlockSnapshot = Omit<StoredCredentialBlock, "credentialId">;
+
 export type SnapshotEntry = AuthCredentialSnapshotEntry & {
 	rotatesInMs: number | null;
+	blocks?: CredentialBlockSnapshot[];
 };
 
 /** GET /v1/snapshot response body. */
@@ -54,6 +62,19 @@ export interface CredentialDisableResponse {
 	ok: boolean;
 }
 
+/** POST /v1/credential/:id/block request body. */
+export type CredentialBlockRequest = CredentialBlockSnapshot;
+
+/** POST /v1/credential/:id/block response body. */
+export interface CredentialBlockResponse {
+	ok: boolean;
+}
+
+/** DELETE /v1/credential/:id/blocks response body. */
+export interface CredentialBlocksDeleteResponse {
+	ok: boolean;
+}
+
 /**
  * POST /v1/credential request body. The OAuth `refresh` must be the *real*
  * refresh token (not the sentinel) — the broker is the canonical writer.
@@ -69,6 +90,40 @@ export interface CredentialUploadResponse {
 }
 
 /**
+ * SSE event kinds emitted on `GET /v1/snapshot/stream`. The same value is set
+ * as the SSE `event:` name (load-bearing for clients) **and** embedded as a
+ * `kind` field inside the JSON body so a Zod discriminated union can validate
+ * the payload without consulting the line metadata.
+ */
+export type SnapshotStreamEventKind = "snapshot" | "entry" | "removed";
+
+/** Initial frame emitted on connect — the full {@link SnapshotResponse}. */
+export interface SnapshotStreamSnapshotEvent extends SnapshotResponse {
+	kind: "snapshot";
+}
+
+/** Single credential added/changed (upsert or refresh). */
+export interface SnapshotStreamEntryEvent {
+	kind: "entry";
+	generation: number;
+	serverNowMs: number;
+	refresher: RefresherSchedule;
+	entry: SnapshotEntry;
+}
+
+/** Single credential disabled/deleted. */
+export interface SnapshotStreamRemovedEvent {
+	kind: "removed";
+	generation: number;
+	serverNowMs: number;
+	refresher: RefresherSchedule;
+	id: number;
+}
+
+/** Discriminated union of every event the snapshot stream emits. */
+export type SnapshotStreamEvent = SnapshotStreamSnapshotEvent | SnapshotStreamEntryEvent | SnapshotStreamRemovedEvent;
+
+/**
  * Default bearer-protected route prefix. The broker exposes `/v1/healthz`
  * unauthenticated for liveness probes; everything else requires a bearer.
  */
@@ -82,3 +137,15 @@ export const DEFAULT_REFRESH_SKEW_MS = 5 * 60_000;
 
 /** Default broker refresh-loop cadence. */
 export const DEFAULT_REFRESH_INTERVAL_MS = 60_000;
+
+/** Default freshness window for the encrypted local broker snapshot cache. */
+export const DEFAULT_SNAPSHOT_CACHE_TTL_MS = 60 * 60_000;
+
+/** Keepalive cadence for `GET /v1/snapshot/stream` SSE comments. */
+export const DEFAULT_STREAM_KEEPALIVE_MS = 20_000;
+
+/**
+ * Bun.serve `idleTimeout` (seconds) used by the broker. Default Bun idle
+ * timeout (10s) would close long-lived SSE connections between keepalives.
+ */
+export const DEFAULT_SERVER_IDLE_TIMEOUT_S = 255;

@@ -1,13 +1,13 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
-import { Effort } from "@oh-my-pi/pi-ai";
-import { enrichModelThinking } from "@oh-my-pi/pi-ai/model-thinking";
-import { hookFetch } from "@oh-my-pi/pi-utils";
-import { streamSimple } from "../src/stream";
-import type { Context, Model } from "../src/types";
+import { describe, expect, it } from "bun:test";
+import { Effort, type FetchImpl } from "@oh-my-pi/pi-ai";
+import { streamSimple } from "@oh-my-pi/pi-ai/stream";
+import type { Context, Model } from "@oh-my-pi/pi-ai/types";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
 interface GeminiCliThinkingConfig {
 	thinkingLevel?: string;
 	thinkingBudget?: number;
+	includeThoughts?: boolean;
 }
 
 interface CapturedRequestBody {
@@ -19,7 +19,7 @@ interface CapturedRequestBody {
 }
 
 function createModel(id: string): Model<"google-gemini-cli"> {
-	return enrichModelThinking({
+	return buildModel({
 		id,
 		name: id,
 		api: "google-gemini-cli",
@@ -44,19 +44,22 @@ function extractThinking(bodyText: string | undefined): GeminiCliThinkingConfig 
 }
 
 describe("google-gemini-cli Gemini 3.x thinking mapping", () => {
-	afterEach(() => {
-		vi.restoreAllMocks();
-	});
+	const createFetchMock =
+		(capture: (body: string | undefined) => void): FetchImpl =>
+		(_input, init) => {
+			capture(typeof init?.body === "string" ? init.body : undefined);
+			return Promise.resolve(new Response('{"error":{"message":"bad request"}}', { status: 400 }));
+		};
 	it("uses thinkingLevel for gemini-3.1-pro-preview when the effort is supported", async () => {
 		let requestBody: string | undefined;
-		using _hook = hookFetch((_input, init) => {
-			requestBody = typeof init?.body === "string" ? init.body : undefined;
-			return new Response('{"error":{"message":"bad request"}}', { status: 400 });
+		const fetchMock = createFetchMock(body => {
+			requestBody = body;
 		});
 
 		const stream = streamSimple(createModel("gemini-3.1-pro-preview"), context, {
 			apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
 			reasoning: Effort.High,
+			fetch: fetchMock,
 		});
 		await stream.result();
 
@@ -65,17 +68,36 @@ describe("google-gemini-cli Gemini 3.x thinking mapping", () => {
 		expect(thinking?.thinkingBudget).toBeUndefined();
 	});
 
+	it("keeps Cloud Code Assist reasoning enabled when only summaries are hidden", async () => {
+		let requestBody: string | undefined;
+		const fetchMock = createFetchMock(body => {
+			requestBody = body;
+		});
+
+		const stream = streamSimple(createModel("gemini-3.1-pro-preview"), context, {
+			apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
+			reasoning: Effort.High,
+			hideThinkingSummary: true,
+			fetch: fetchMock,
+		});
+		await stream.result();
+
+		const thinking = extractThinking(requestBody);
+		expect(thinking?.includeThoughts).toBe(false);
+		expect(thinking?.thinkingLevel).toBe("HIGH");
+	});
+
 	it("rejects unsupported gemini-3.1-pro-preview efforts instead of promoting them", () => {
 		let requestBody: string | undefined;
-		using _hook = hookFetch((_input, init) => {
-			requestBody = typeof init?.body === "string" ? init.body : undefined;
-			return new Response('{"error":{"message":"bad request"}}', { status: 400 });
+		const fetchMock = createFetchMock(body => {
+			requestBody = body;
 		});
 
 		expect(() =>
 			streamSimple(createModel("gemini-3.1-pro-preview"), context, {
 				apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
 				reasoning: Effort.Medium,
+				fetch: fetchMock,
 			}),
 		).toThrow(/Supported efforts: low, high/);
 		expect(requestBody).toBeUndefined();
@@ -83,14 +105,14 @@ describe("google-gemini-cli Gemini 3.x thinking mapping", () => {
 
 	it("uses thinkingLevel for gemini-3.1-flash-preview", async () => {
 		let requestBody: string | undefined;
-		using _hook = hookFetch((_input, init) => {
-			requestBody = typeof init?.body === "string" ? init.body : undefined;
-			return new Response('{"error":{"message":"bad request"}}', { status: 400 });
+		const fetchMock = createFetchMock(body => {
+			requestBody = body;
 		});
 
 		const stream = streamSimple(createModel("gemini-3.1-flash-preview"), context, {
 			apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
 			reasoning: Effort.Medium,
+			fetch: fetchMock,
 		});
 		await stream.result();
 
@@ -101,14 +123,14 @@ describe("google-gemini-cli Gemini 3.x thinking mapping", () => {
 
 	it("keeps thinkingBudget for gemini-2.5-pro", async () => {
 		let requestBody: string | undefined;
-		using _hook = hookFetch((_input, init) => {
-			requestBody = typeof init?.body === "string" ? init.body : undefined;
-			return new Response('{"error":{"message":"bad request"}}', { status: 400 });
+		const fetchMock = createFetchMock(body => {
+			requestBody = body;
 		});
 
 		const stream = streamSimple(createModel("gemini-2.5-pro"), context, {
 			apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
 			reasoning: Effort.Medium,
+			fetch: fetchMock,
 		});
 		await stream.result();
 

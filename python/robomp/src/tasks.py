@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import Mapping
-from typing import Any
+from collections.abc import Callable, Mapping
+from typing import Any, TypeVar
 
 from robomp import persona
 from robomp.config import Settings
@@ -22,6 +23,44 @@ from robomp.sandbox import GitTransport, SandboxManager
 from robomp.worker import DirectiveInfo, TaskInputs, ThreadMessage, run_task
 
 log = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
+
+
+async def _run_workspace_op(func: Callable[..., _T], /, **kwargs: object) -> _T:
+    """Offload a blocking sandbox workspace op to a worker thread, uncancellably.
+
+    Workspace setup/teardown (git clone/fetch, worktree add/remove, chown) is
+    blocking, so it runs off the event loop via a thread. Unlike a bare
+    ``await asyncio.to_thread(...)``, cancelling the awaiting coroutine here does
+    NOT detach the still-running thread: the thread holds the per-repo lock and
+    owns the slot mid-setup, and ``_run_event``'s ``finally`` reaps/releases that
+    slot on cancellation. If the await detached, the reaped slot could be reused
+    while the thread is still touching it. So on cancellation we drain the thread
+    to completion before propagating, gating the caller's ``finally`` behind the
+    thread. The inner subprocesses are timeout-bounded, so completion is assured.
+    """
+    inner = asyncio.ensure_future(asyncio.to_thread(func, **kwargs))
+    try:
+        return await asyncio.shield(inner)
+    except asyncio.CancelledError:
+        # A repeated cancel can interrupt even a shielded await, so loop until
+        # the thread is actually done; swallow the inner's own outcome and
+        # re-raise the cancellation the caller expects.
+        while not inner.done():
+            try:
+                await asyncio.shield(inner)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        if not inner.cancelled() and inner.exception() is not None:
+            log.warning(
+                "workspace op %s raised during caller cancellation",
+                getattr(func, "__name__", func),
+                exc_info=inner.exception(),
+            )
+        raise
 
 
 def _comment_from_payload(payload: Mapping[str, Any]) -> CommentInfo:
@@ -54,7 +93,12 @@ def _directive_from_payload(payload: Mapping[str, Any]) -> DirectiveInfo | None:
                 k, v = entry
                 if isinstance(k, str) and isinstance(v, str):
                     pragmas.append((k, v))
-    return DirectiveInfo(body=body, author=author, pragmas=tuple(pragmas))
+    return DirectiveInfo(
+        body=body,
+        author=author,
+        pragmas=tuple(pragmas),
+        authorizes_impl=bool(raw.get("authorizes_impl")),
+    )
 
 
 async def _fetch_thread(
@@ -150,7 +194,13 @@ async def _attach_thread(
     if directive is None:
         return None
     thread = await _fetch_thread(github, repo, number, is_pr=is_pr)
-    return DirectiveInfo(body=directive.body, author=directive.author, thread=thread, pragmas=directive.pragmas)
+    return DirectiveInfo(
+        body=directive.body,
+        author=directive.author,
+        thread=thread,
+        pragmas=directive.pragmas,
+        authorizes_impl=directive.authorizes_impl,
+    )
 
 
 async def _resolve_repo_and_issue(
@@ -256,7 +306,8 @@ async def triage_issue(
             return
     db.upsert_issue(key=key, repo=repo.full_name, number=issue.number, state="reproducing")
     clone_url = repo.clone_url
-    workspace = sandbox.ensure_workspace(
+    workspace = await _run_workspace_op(
+        sandbox.ensure_workspace,
         repo=repo.full_name,
         number=issue.number,
         title=issue.title,
@@ -290,6 +341,84 @@ async def triage_issue(
     await run_task(task_kind="triage_issue", inputs=inputs)
 
 
+async def review_pr(
+    *,
+    settings: Settings,
+    db: Database,
+    github: GitHubBackend,
+    sandbox: SandboxManager,
+    git_transport: GitTransport,
+    payload: Mapping[str, Any],
+    delivery_id: str,
+    attempts: int = 0,
+    slot_uid: int | None = None,
+) -> None:
+    pr_node = payload.get("pull_request") or {}
+    pr_number = int(pr_node.get("number") or 0)
+    repo_payload = payload.get("repository") or {}
+    repo_full = str(repo_payload.get("full_name") or "")
+    if pr_number <= 0 or not repo_full:
+        log.info("skip: review_pr missing repo/number")
+        return
+    try:
+        repo = await github.get_repo(repo_full)
+        issue = await github.get_issue(repo_full, pr_number)
+        pr = await github.get_pull_request(repo_full, pr_number)
+    except GitHubError as exc:
+        log.warning("review_pr fetch failed", extra={"repo": repo_full, "pr": pr_number, "err": str(exc)})
+        return
+
+    labels = {label.lower() for label in issue.labels}
+    key = issue_key(repo.full_name, pr_number)
+    review_labeled = "triaged" in labels or any(label.startswith("review:") for label in labels)
+    if db.has_successful_tool_call(key, "submit_pr_review"):
+        log.info("skip: PR review already submitted", extra={"repo": repo_full, "pr": pr_number})
+        return
+    if review_labeled:
+        log.info(
+            "review labels present without submitted review; retrying",
+            extra={"repo": repo_full, "pr": pr_number, "labels": sorted(labels)},
+        )
+
+    db.upsert_issue(key=key, repo=repo.full_name, number=pr_number, state="reviewing", pr_number=pr_number)
+    workspace = await _run_workspace_op(
+        sandbox.ensure_workspace,
+        repo=repo.full_name,
+        number=pr_number,
+        title=issue.title,
+        clone_url=repo.clone_url,
+        default_branch=repo.default_branch,
+        pr_head=pr_number,
+        author_name=settings.resolved_author_name,
+        author_email=settings.git_author_email,
+        slot_uid=slot_uid,
+    )
+    db.upsert_issue(
+        key=key,
+        repo=repo.full_name,
+        number=pr_number,
+        state="reviewing",
+        branch=workspace.branch,
+        session_dir=str(workspace.session_dir),
+        pr_number=pr_number,
+    )
+    inputs = TaskInputs(
+        settings=settings,
+        db=db,
+        github=github,
+        git_transport=git_transport,
+        repo=repo,
+        issue=issue,
+        workspace=workspace,
+        delivery_id=delivery_id,
+        attempts=attempts,
+        slot_uid=slot_uid,
+        natives_cache=sandbox.natives_cache,
+    )
+    await run_task(task_kind="review_pr", inputs=inputs, pr_number=pr_number, pr=pr)
+    return
+
+
 async def handle_comment(
     *,
     settings: Settings,
@@ -318,7 +447,8 @@ async def handle_comment(
         # first and executes the directive in the same RPC turn.
         log.info("directive bootstrap", extra={"key": key, "author": directive.author})
         db.upsert_issue(key=key, repo=repo.full_name, number=issue.number, state="reproducing")
-        workspace = sandbox.ensure_workspace(
+        workspace = await _run_workspace_op(
+            sandbox.ensure_workspace,
             repo=repo.full_name,
             number=issue.number,
             title=issue.title,
@@ -368,9 +498,10 @@ async def handle_comment(
         # Maintainer reopen: tear down stale workspace, reset state, branch
         # afresh from default. The old branch may have been merged/deleted.
         log.info("directive reopen", extra={"key": key, "from_state": existing.state, "author": directive.author})
-        sandbox.remove_workspace(repo=repo.full_name, number=issue.number)
+        await _run_workspace_op(sandbox.remove_workspace, repo=repo.full_name, number=issue.number)
         db.upsert_issue(key=key, repo=repo.full_name, number=issue.number, state="reproducing")
-        workspace = sandbox.ensure_workspace(
+        workspace = await _run_workspace_op(
+            sandbox.ensure_workspace,
             repo=repo.full_name,
             number=issue.number,
             title=issue.title,
@@ -405,7 +536,8 @@ async def handle_comment(
         await run_task(task_kind="handle_comment", inputs=inputs, comment=comment, directive=directive)
         return
 
-    workspace = sandbox.ensure_workspace(
+    workspace = await _run_workspace_op(
+        sandbox.ensure_workspace,
         repo=repo.full_name,
         number=issue.number,
         title=issue.title,
@@ -479,7 +611,8 @@ async def handle_review(
         log.warning("review fetch failed", extra={"err": str(exc)})
         return
     clone_url = repo.clone_url
-    workspace = sandbox.ensure_workspace(
+    workspace = await _run_workspace_op(
+        sandbox.ensure_workspace,
         repo=repo.full_name,
         number=issue.number,
         title=issue.title,
@@ -566,6 +699,9 @@ async def handle_pr_conversation(
         if pr_info is None or not _can_handle_pr_directly(settings=settings, repo_full=repo_full, pr=pr_info):
             return
     directive = _directive_from_payload(payload)
+    if issue_row is not None and issue_row.state == "reviewing":
+        log.info("skip: incoming PR conversation unsupported", extra={"key": issue_row.key, "pr": pr_number})
+        return
     if issue_row is not None and issue_row.state in ("merged", "closed", "abandoned"):
         if directive is None:
             log.info("skip: pr-conversation on finalized issue", extra={"key": issue_row.key, "state": issue_row.state})
@@ -586,7 +722,7 @@ async def handle_pr_conversation(
             "directive reopen (pr)",
             extra={"key": issue_row.key, "from_state": issue_row.state, "author": directive.author},
         )
-        sandbox.remove_workspace(repo=issue_row.repo, number=issue_row.number)
+        await _run_workspace_op(sandbox.remove_workspace, repo=issue_row.repo, number=issue_row.number)
         db.upsert_issue(key=issue_row.key, repo=issue_row.repo, number=issue_row.number, state="reproducing")
         issue_row = db.get_issue(issue_row.key) or issue_row
     # Bare @mention with no request body — the route stashes an empty
@@ -622,7 +758,8 @@ async def handle_pr_conversation(
         if existing_branch is None and not (directive and issue_row.state == "reproducing"):
             log.info("skip: pr-conversation PR missing branch mapping", extra={"repo": repo_full, "pr": pr_number})
             return
-    workspace = sandbox.ensure_workspace(
+    workspace = await _run_workspace_op(
+        sandbox.ensure_workspace,
         repo=repo.full_name,
         number=issue.number,
         title=issue.title,
@@ -666,8 +803,19 @@ async def handle_pr_conversation(
         slot_uid=slot_uid,
         natives_cache=sandbox.natives_cache,
     )
-    directive = await _attach_thread(github, directive, repo_full, pr_number, is_pr=True)
-    await run_task(task_kind="handle_comment", inputs=inputs, comment=comment, pr_number=pr_number, directive=directive)
+    thread: tuple[ThreadMessage, ...] = ()
+    if directive is None:
+        thread = await _fetch_thread(github, repo_full, pr_number, is_pr=True)
+    else:
+        directive = await _attach_thread(github, directive, repo_full, pr_number, is_pr=True)
+    await run_task(
+        task_kind="handle_comment",
+        inputs=inputs,
+        comment=comment,
+        pr_number=pr_number,
+        directive=directive,
+        thread=thread,
+    )
 
 
 async def cleanup_workspace(
@@ -695,7 +843,7 @@ async def cleanup_workspace(
         issue_row = db.get_issue(issue_key(repo_full, number))
     if issue_row is None:
         return
-    sandbox.remove_workspace(repo=issue_row.repo, number=issue_row.number)
+    await _run_workspace_op(sandbox.remove_workspace, repo=issue_row.repo, number=issue_row.number)
     db.set_issue_state(issue_row.key, target_state)
     log.info("cleanup", extra={"key": issue_row.key, "state": target_state})
 
@@ -705,5 +853,6 @@ __all__ = [
     "handle_comment",
     "handle_pr_conversation",
     "handle_review",
+    "review_pr",
     "triage_issue",
 ]

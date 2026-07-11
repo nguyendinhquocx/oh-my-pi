@@ -10,8 +10,10 @@
  */
 
 import { logger } from "@oh-my-pi/pi-utils";
+import { type } from "arktype";
 import { resolvePromptCacheKey } from "../auth-gateway/http";
-import type { AuthGatewayParsedRequest as ParsedRequest } from "../auth-gateway/types";
+import type { AuthGatewayStreamControl, AuthGatewayParsedRequest as ParsedRequest } from "../auth-gateway/types";
+import * as AIError from "../error";
 import type {
 	AssistantMessage,
 	AssistantMessageEventStream,
@@ -31,13 +33,21 @@ import {
 	type OpenAIResponsesTool,
 	openaiResponsesRequestSchema,
 } from "./openai-responses-server-schema";
+import { encodeTextSignatureV1, parseTextSignature } from "./openai-shared";
 
 export type { ParsedRequest };
 
 // ─── narrow guards ──────────────────────────────────────────────────────────
 
 function isReasoningEffort(value: unknown): value is NonNullable<ParsedRequest["options"]["reasoning"]> {
-	return value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh";
+	return (
+		value === "minimal" ||
+		value === "low" ||
+		value === "medium" ||
+		value === "high" ||
+		value === "xhigh" ||
+		value === "max"
+	);
 }
 
 function isServiceTier(value: unknown): value is NonNullable<ParsedRequest["options"]["serviceTier"]> {
@@ -50,6 +60,20 @@ function isObj(v: unknown): v is Record<string, unknown> {
 
 function asString(v: unknown): string | undefined {
 	return typeof v === "string" ? v : undefined;
+}
+
+type AssistantItemPhase = "commentary" | "final_answer";
+type MessageSignature = { id: string; phase?: AssistantItemPhase };
+
+function parseAssistantItemPhase(value: unknown): AssistantItemPhase | undefined {
+	return value === "commentary" || value === "final_answer" ? value : undefined;
+}
+
+function messageTextSignature(id: unknown, phase: unknown): string | undefined {
+	const parsedPhase = parseAssistantItemPhase(phase);
+	if (typeof id === "string" && id.length > 0) return encodeTextSignatureV1(id, parsedPhase);
+	if (!parsedPhase) return undefined;
+	return encodeTextSignatureV1(makeMsgId(), parsedPhase);
 }
 
 // ─── id helpers ─────────────────────────────────────────────────────────────
@@ -145,20 +169,27 @@ type OutputBlockUnion =
 	| { type: "text"; text: string }
 	| { type: "refusal"; refusal: string };
 
-function outputTextOf(blocks: OpenAIResponsesOutputContent[] | string | undefined): TextContent[] {
-	if (typeof blocks === "string") return blocks.length > 0 ? [{ type: "text", text: blocks }] : [];
+function outputTextOf(
+	blocks: OpenAIResponsesOutputContent[] | string | undefined,
+	message?: { id?: unknown; phase?: unknown },
+): TextContent[] {
+	const textSignature = messageTextSignature(message?.id, message?.phase);
+	const textContent = (text: string): TextContent =>
+		textSignature ? { type: "text", text, textSignature } : { type: "text", text };
+	if (typeof blocks === "string") return blocks.length > 0 ? [textContent(blocks)] : [];
 	if (!blocks) return [];
-	const out: TextContent[] = [];
+	const parts: string[] = [];
 	for (const raw of blocks) {
 		const block = raw as OutputBlockUnion;
 		if (block.type === "output_text" || block.type === "text") {
-			out.push({ type: "text", text: block.text });
+			parts.push(block.text);
 		} else if (block.type === "refusal") {
 			// Preserve the refusal reason so history replay still carries it.
-			out.push({ type: "text", text: `[refusal: ${block.refusal}]` });
+			parts.push(`[refusal: ${block.refusal}]`);
 		}
 	}
-	return out;
+	const text = parts.join("");
+	return text.length > 0 ? [textContent(text)] : [];
 }
 
 // The schema accepts a much wider tool_choice union than the SDK type so the
@@ -263,11 +294,10 @@ export function parseRequest(body: unknown, headers?: Headers): ParsedRequest {
 	// client signals a cache identity outside the body — see the
 	// `resolvePromptCacheKey` call further down.
 
-	const parsed = openaiResponsesRequestSchema.safeParse(body);
-	if (!parsed.success) {
-		throw new Error(`openai-responses: ${parsed.error.message}`);
+	const data = openaiResponsesRequestSchema(body);
+	if (data instanceof type.errors) {
+		throw new AIError.ValidationError(`openai-responses: ${data.summary}`);
 	}
-	const data = parsed.data;
 
 	const now = Date.now();
 	const messages: Message[] = [];
@@ -287,6 +317,8 @@ export function parseRequest(body: unknown, headers?: Headers): ParsedRequest {
 				const msg = item as {
 					role?: string;
 					content?: OpenAIResponsesInputContent[] | OpenAIResponsesOutputContent[] | string;
+					id?: unknown;
+					phase?: unknown;
 				};
 				switch (msg.role) {
 					case "system": {
@@ -302,7 +334,10 @@ export function parseRequest(body: unknown, headers?: Headers): ParsedRequest {
 						break;
 					}
 					case "assistant": {
-						const parts = outputTextOf(msg.content as OpenAIResponsesOutputContent[] | string | undefined);
+						const parts = outputTextOf(msg.content as OpenAIResponsesOutputContent[] | string | undefined, {
+							id: msg.id,
+							phase: msg.phase,
+						});
 						messages.push({
 							role: "assistant",
 							content: parts,
@@ -345,7 +380,9 @@ export function parseRequest(body: unknown, headers?: Headers): ParsedRequest {
 					const parsedArgs: unknown = JSON.parse(argsRaw);
 					args = isObj(parsedArgs) ? parsedArgs : {};
 				} catch {
-					throw new Error(`openai-responses: function_call ${call.call_id} has invalid JSON arguments`);
+					throw new AIError.ValidationError(
+						`openai-responses: function_call ${call.call_id} has invalid JSON arguments`,
+					);
 				}
 				const toolCall: ToolCall = {
 					type: "toolCall",
@@ -360,7 +397,7 @@ export function parseRequest(body: unknown, headers?: Headers): ParsedRequest {
 			if (effectiveType === "custom_tool_call") {
 				const call = item as { id?: string; call_id: string; name: string; input: string };
 				// Custom tools carry a raw input string. We stash it in `arguments.input`
-				// matching pi-ai's openai-responses-shared convention, and tag the call
+				// matching pi-ai's openai-shared convention, and tag the call
 				// with `customWireName` so encoders re-emit it as `custom_tool_call`.
 				const toolCall: ToolCall = {
 					type: "toolCall",
@@ -500,6 +537,7 @@ type MessageOutputItem = {
 	role: "assistant";
 	status: "completed";
 	content: Array<{ type: "output_text"; text: string; annotations: never[] }>;
+	phase?: AssistantItemPhase;
 };
 
 type FunctionCallOutputItem = {
@@ -528,6 +566,10 @@ function responseStatusForStopReason(message: AssistantMessage): ResponseStatus 
 	if (message.stopReason === "length") return "incomplete";
 	if (message.stopReason === "error" || message.stopReason === "aborted") return "failed";
 	return "completed";
+}
+
+function incompleteDetailsForStatus(status: ResponseStatus): { reason: "max_output_tokens" } | null {
+	return status === "incomplete" ? { reason: "max_output_tokens" } : null;
 }
 
 function buildReasoningItem(part: ThinkingContent): ReasoningOutputItem {
@@ -574,29 +616,49 @@ function reasoningItemId(part: ThinkingContent): string {
 }
 
 /**
+ * pi-ai responses providers mint composite `"{call_id}|{item_id}"` tool-call
+ * ids ({@link encodeResponsesToolCallId}). Only the call_id half belongs on
+ * the wire: third-party clients validate the `call_id` charset
+ * (`^[a-zA-Z0-9_-]+$`) or echo it to other backends, and `|` fails both.
+ */
+function wireCallId(id: string): string {
+	const sep = id.indexOf("|");
+	return sep >= 0 ? id.slice(0, sep) : id;
+}
+
+/**
  * Walk the assistant content array and group consecutive TextContent into a
  * single message item; each ThinkingContent / ToolCall is its own item.
  */
 function buildOutputItems(message: AssistantMessage): OutputItem[] {
 	const out: OutputItem[] = [];
 	let pendingMessage: MessageOutputItem | null = null;
+	let pendingMessageSignature: { id: string; phase?: AssistantItemPhase } | undefined;
 	const flushMessage = () => {
 		if (pendingMessage) {
 			out.push(pendingMessage);
 			pendingMessage = null;
+			pendingMessageSignature = undefined;
 		}
 	};
 
 	for (const part of message.content) {
 		if (part.type === "text") {
+			const signature = parseTextSignature(part.textSignature);
+			const sameSignature =
+				!pendingMessage ||
+				(pendingMessageSignature?.id === signature?.id && pendingMessageSignature?.phase === signature?.phase);
+			if (!sameSignature) flushMessage();
 			if (!pendingMessage) {
 				pendingMessage = {
 					type: "message",
-					id: makeMsgId(),
+					id: signature?.id ?? makeMsgId(),
 					role: "assistant",
 					status: "completed",
 					content: [],
+					...(signature?.phase ? { phase: signature.phase } : {}),
 				};
+				pendingMessageSignature = signature;
 			}
 			pendingMessage.content.push({ type: "output_text", text: part.text, annotations: [] });
 		} else if (part.type === "thinking") {
@@ -605,11 +667,12 @@ function buildOutputItems(message: AssistantMessage): OutputItem[] {
 		} else if (part.type === "toolCall") {
 			flushMessage();
 			if (part.customWireName) {
-				const rawInput = typeof part.arguments?.input === "string" ? (part.arguments.input as string) : "";
+				const input = part.arguments?.input;
+				const rawInput = typeof input === "string" ? input : "";
 				out.push({
 					type: "custom_tool_call",
 					id: part.thoughtSignature ?? makeCustomCallId(),
-					call_id: part.id,
+					call_id: wireCallId(part.id),
 					name: part.customWireName,
 					input: rawInput,
 					status: "completed",
@@ -618,7 +681,7 @@ function buildOutputItems(message: AssistantMessage): OutputItem[] {
 				out.push({
 					type: "function_call",
 					id: part.thoughtSignature ?? makeFuncCallId(),
-					call_id: part.id,
+					call_id: wireCallId(part.id),
 					name: part.name,
 					arguments: JSON.stringify(part.arguments ?? {}),
 					status: "completed",
@@ -659,7 +722,7 @@ function buildResponseEnvelope(
 		model: requestedModelId,
 		output: items,
 		usage,
-		...(status === "incomplete" ? { incomplete_details: { reason: "max_output_tokens" } } : {}),
+		incomplete_details: incompleteDetailsForStatus(status),
 		...(status === "failed" ? { error: { message: message.errorMessage ?? "response failed" } } : {}),
 	};
 }
@@ -687,6 +750,7 @@ interface OpenMessage {
 	contentIndex: number;
 	currentPartText: string;
 	content: Array<{ type: "output_text"; text: string; annotations: never[] }>;
+	signature?: MessageSignature;
 }
 interface OpenReasoning {
 	kind: "reasoning";
@@ -698,6 +762,7 @@ interface OpenFunctionCall {
 	kind: "function_call";
 	itemId: string;
 	outputIndex: number;
+	contentIndex: number;
 	callId: string;
 	name: string;
 	argsText: string;
@@ -713,23 +778,35 @@ function sseEvent(name: string, data: unknown): string {
 export function encodeStream(
 	events: AssistantMessageEventStream,
 	requestedModelId: string,
+	_options?: ParsedRequest["options"],
+	control?: AuthGatewayStreamControl,
 ): ReadableStream<Uint8Array> {
 	const encoder = new TextEncoder();
 	const responseId = makeRespId();
 	let sequenceNumber = 0;
+	let cancelled = control?.signal?.aborted === true;
+	const markCancelled = () => {
+		cancelled = true;
+	};
+	control?.signal?.addEventListener("abort", markCancelled, { once: true });
 	const seq = () => sequenceNumber++;
 
 	return new ReadableStream<Uint8Array>({
 		async start(controller) {
 			const emit = (name: string, data: Record<string, unknown>) => {
-				controller.enqueue(encoder.encode(sseEvent(name, { type: name, sequence_number: seq(), ...data })));
+				if (!cancelled)
+					controller.enqueue(encoder.encode(sseEvent(name, { type: name, sequence_number: seq(), ...data })));
 			};
-			const emitDone = () => controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+			const emitDone = () => {
+				if (!cancelled) controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+			};
 
 			let createdAt = Math.floor(Date.now() / 1000);
 			let outputIndex = 0;
 			const state: { open: OpenItem | null } = { open: null };
+			const openFunctionCalls = new Map<number, OpenFunctionCall>();
 			const finishedItems: OutputItem[] = [];
+			const allocateOutputIndex = (): number => outputIndex++;
 
 			const responseSnapshot = (status: ResponseStatus, output: OutputItem[] | []) => ({
 				id: responseId,
@@ -739,31 +816,36 @@ export function encodeStream(
 				model: requestedModelId,
 				output,
 				usage: null,
+				incomplete_details: incompleteDetailsForStatus(status),
 			});
 
-			const openMessage = (): OpenMessage => {
-				const itemId = makeMsgId();
+			const openMessage = (signature?: MessageSignature): OpenMessage => {
+				const itemOutputIndex = allocateOutputIndex();
+				const itemId = signature?.id ?? makeMsgId();
 				const item = {
 					type: "message" as const,
 					id: itemId,
-					status: "in_progress",
+					status: "in_progress" as const,
 					role: "assistant" as const,
 					content: [] as Array<{ type: "output_text"; text: string; annotations: never[] }>,
+					...(signature?.phase ? { phase: signature.phase } : {}),
 				};
-				emit("response.output_item.added", { output_index: outputIndex, item });
+				emit("response.output_item.added", { output_index: itemOutputIndex, item });
 				const next: OpenMessage = {
 					kind: "message",
 					itemId,
-					outputIndex,
+					outputIndex: itemOutputIndex,
 					contentIndex: 0,
 					currentPartText: "",
 					content: [],
+					...(signature ? { signature } : {}),
 				};
 				state.open = next;
 				return next;
 			};
 
 			const openReasoning = (partial: AssistantMessage, contentIndex: number): OpenReasoning => {
+				const itemOutputIndex = allocateOutputIndex();
 				const part = partial.content[contentIndex];
 				const itemId = part && part.type === "thinking" ? reasoningItemId(part) : makeReasoningId();
 				const item = {
@@ -771,22 +853,23 @@ export function encodeStream(
 					id: itemId,
 					summary: [] as Array<{ type: "summary_text"; text: string }>,
 				};
-				emit("response.output_item.added", { output_index: outputIndex, item });
+				emit("response.output_item.added", { output_index: itemOutputIndex, item });
 				// Open the summary part. Real OpenAI streams summary text in the
 				// canonical `reasoning_summary_*` lifecycle; pi-ai's own decoder
 				// reads `summary[].text` from the eventual `output_item.done`.
 				emit("response.reasoning_summary_part.added", {
 					item_id: itemId,
-					output_index: outputIndex,
+					output_index: itemOutputIndex,
 					summary_index: 0,
 					part: { type: "summary_text", text: "" },
 				});
-				const next: OpenReasoning = { kind: "reasoning", itemId, outputIndex, reasoningText: "" };
+				const next: OpenReasoning = { kind: "reasoning", itemId, outputIndex: itemOutputIndex, reasoningText: "" };
 				state.open = next;
 				return next;
 			};
 
 			const openToolCall = (partial: AssistantMessage, contentIndex: number): OpenFunctionCall => {
+				const itemOutputIndex = allocateOutputIndex();
 				const part = partial.content[contentIndex];
 				const tc = part && part.type === "toolCall" ? part : undefined;
 				const customWireName: string | undefined =
@@ -795,7 +878,7 @@ export function encodeStream(
 						: undefined;
 				const isCustom = customWireName !== undefined;
 				const itemId = tc?.thoughtSignature ?? (isCustom ? makeCustomCallId() : makeFuncCallId());
-				const callId = tc?.id ?? "";
+				const callId = wireCallId(tc?.id ?? "");
 				const name = customWireName ?? tc?.name ?? "";
 				const item = isCustom
 					? {
@@ -814,38 +897,79 @@ export function encodeStream(
 							arguments: "",
 							status: "in_progress",
 						};
-				emit("response.output_item.added", { output_index: outputIndex, item });
+				emit("response.output_item.added", { output_index: itemOutputIndex, item });
 				const next: OpenFunctionCall = {
 					kind: "function_call",
 					itemId,
-					outputIndex,
+					outputIndex: itemOutputIndex,
+					contentIndex,
 					callId,
 					name,
 					argsText: "",
 					...(isCustom ? { customWireName } : {}),
 				};
+				openFunctionCalls.set(contentIndex, next);
 				state.open = next;
 				return next;
+			};
+
+			const closeFunctionCall = (call: OpenFunctionCall): void => {
+				const text = call.argsText ?? "";
+				if (call.customWireName) {
+					const item = {
+						type: "custom_tool_call",
+						id: call.itemId,
+						call_id: call.callId ?? "",
+						name: call.customWireName,
+						input: text,
+						status: "completed",
+					};
+					emit("response.output_item.done", { output_index: call.outputIndex, item });
+					finishedItems.push({
+						type: "custom_tool_call",
+						id: call.itemId,
+						call_id: call.callId ?? "",
+						name: call.customWireName,
+						input: text,
+						status: "completed",
+					});
+				} else {
+					const item = {
+						type: "function_call",
+						id: call.itemId,
+						call_id: call.callId ?? "",
+						name: call.name ?? "",
+						arguments: text,
+						status: "completed",
+					};
+					emit("response.output_item.done", { output_index: call.outputIndex, item });
+					finishedItems.push({
+						type: "function_call",
+						id: call.itemId,
+						call_id: call.callId ?? "",
+						name: call.name ?? "",
+						arguments: text,
+						status: "completed",
+					});
+				}
+				openFunctionCalls.delete(call.contentIndex);
+				if (state.open === call) state.open = null;
 			};
 
 			const closeOpen = () => {
 				if (!state.open) return;
 				if (state.open.kind === "message") {
 					const item = {
-						type: "message",
+						type: "message" as const,
 						id: state.open.itemId,
-						status: "completed",
-						role: "assistant",
+						status: "completed" as const,
+						role: "assistant" as const,
 						content: state.open.content,
+						...(state.open.signature?.phase ? { phase: state.open.signature.phase } : {}),
 					};
 					emit("response.output_item.done", { output_index: state.open.outputIndex, item });
-					finishedItems.push({
-						type: "message",
-						id: state.open.itemId,
-						role: "assistant",
-						status: "completed",
-						content: state.open.content,
-					});
+					finishedItems.push(item);
+					state.open = null;
 				} else if (state.open.kind === "reasoning") {
 					const summary = [{ type: "summary_text" as const, text: state.open.reasoningText ?? "" }];
 					const item = {
@@ -859,102 +983,76 @@ export function encodeStream(
 						id: state.open.itemId,
 						summary,
 					});
+					state.open = null;
 				} else {
-					const text = state.open.argsText ?? "";
-					if (state.open.customWireName) {
-						const item = {
-							type: "custom_tool_call",
-							id: state.open.itemId,
-							call_id: state.open.callId ?? "",
-							name: state.open.customWireName,
-							input: text,
-							status: "completed",
-						};
-						emit("response.output_item.done", { output_index: state.open.outputIndex, item });
-						finishedItems.push({
-							type: "custom_tool_call",
-							id: state.open.itemId,
-							call_id: state.open.callId ?? "",
-							name: state.open.customWireName,
-							input: text,
-							status: "completed",
-						});
-					} else {
-						const item = {
-							type: "function_call",
-							id: state.open.itemId,
-							call_id: state.open.callId ?? "",
-							name: state.open.name ?? "",
-							arguments: text,
-							status: "completed",
-						};
-						emit("response.output_item.done", { output_index: state.open.outputIndex, item });
-						finishedItems.push({
-							type: "function_call",
-							id: state.open.itemId,
-							call_id: state.open.callId ?? "",
-							name: state.open.name ?? "",
-							arguments: text,
-							status: "completed",
-						});
-					}
+					closeFunctionCall(state.open);
 				}
-				outputIndex++;
-				state.open = null;
 			};
 
-			try {
-				let finalMessage: AssistantMessage | null = null;
-				let failureMessage: AssistantMessage | null = null;
+			const closeOpenFunctionCalls = (): void => {
+				for (const call of [...openFunctionCalls.values()]) {
+					closeFunctionCall(call);
+				}
+			};
 
+			const functionCallForEvent = (contentIndex: number): OpenFunctionCall | undefined => {
+				const byIndex = openFunctionCalls.get(contentIndex);
+				if (byIndex) return byIndex;
+				return state.open?.kind === "function_call" ? state.open : undefined;
+			};
+			let finalMessage: AssistantMessage | undefined;
+			let failureMessage: AssistantMessage | undefined;
+			try {
+				if (cancelled) {
+					controller.close();
+					return;
+				}
 				for await (const ev of events) {
+					if (cancelled) return;
 					switch (ev.type) {
 						case "start": {
 							createdAt = Math.floor((ev.partial.timestamp || Date.now()) / 1000);
 							// response.created — initial envelope.
-							controller.enqueue(
-								encoder.encode(
-									sseEvent("response.created", {
-										type: "response.created",
-										sequence_number: seq(),
-										response: responseSnapshot("in_progress", []),
-									}),
-								),
-							);
+							emit("response.created", { response: responseSnapshot("in_progress", []) });
 							// response.in_progress — mirrors real OpenAI; some clients gate
 							// on it before reading items.
-							controller.enqueue(
-								encoder.encode(
-									sseEvent("response.in_progress", {
-										type: "response.in_progress",
-										sequence_number: seq(),
-										response: responseSnapshot("in_progress", []),
-									}),
-								),
-							);
+							emit("response.in_progress", { response: responseSnapshot("in_progress", []) });
 							break;
 						}
 						case "text_start": {
 							let cur: OpenMessage;
+							const textBlock = ev.partial.content[ev.contentIndex];
+							const signature =
+								textBlock?.type === "text" ? parseTextSignature(textBlock.textSignature) : undefined;
 							if (state.open && state.open.kind === "message") {
-								// continue same message item, new content part
-								cur = state.open;
-								cur.currentPartText = "";
+								const sameSignature =
+									(!signature && !state.open.signature) ||
+									(signature !== undefined &&
+										state.open.signature?.id === signature.id &&
+										state.open.signature.phase === signature.phase);
+								if (sameSignature) {
+									// Continue same message item, new content part.
+									cur = state.open;
+									cur.currentPartText = "";
+								} else {
+									closeOpen();
+									cur = openMessage(signature);
+								}
 							} else {
-								if (state.open) closeOpen();
-								cur = openMessage();
+								if (state.open && state.open.kind !== "function_call") closeOpen();
+								cur = openMessage(signature);
 							}
-							const part = { type: "output_text", text: "", annotations: [] as never[] };
+							const contentPart = { type: "output_text", text: "", annotations: [] as never[] };
 							emit("response.content_part.added", {
 								item_id: cur.itemId,
 								output_index: cur.outputIndex,
 								content_index: cur.contentIndex,
-								part,
+								part: contentPart,
 							});
 							break;
 						}
 						case "text_delta": {
-							if (!state.open || state.open.kind !== "message") break;
+							if (state.open?.kind !== "message") break;
 							const cur: OpenMessage = state.open;
 							cur.currentPartText += ev.delta;
 							emit("response.output_text.delta", {
@@ -970,7 +1068,7 @@ export function encodeStream(
 							break;
 						}
 						case "text_end": {
-							if (!state.open || state.open.kind !== "message") break;
+							if (state.open?.kind !== "message") break;
 							const cur: OpenMessage = state.open;
 							const text = ev.content ?? cur.currentPartText;
 							emit("response.output_text.done", {
@@ -992,12 +1090,12 @@ export function encodeStream(
 							break;
 						}
 						case "thinking_start": {
-							if (state.open) closeOpen();
+							if (state.open && state.open.kind !== "function_call") closeOpen();
 							openReasoning(ev.partial, ev.contentIndex);
 							break;
 						}
 						case "thinking_delta": {
-							if (!state.open || state.open.kind !== "reasoning") break;
+							if (state.open?.kind !== "reasoning") break;
 							const cur: OpenReasoning = state.open;
 							cur.reasoningText += ev.delta;
 							emit("response.reasoning_summary_text.delta", {
@@ -1009,7 +1107,7 @@ export function encodeStream(
 							break;
 						}
 						case "thinking_end": {
-							if (!state.open || state.open.kind !== "reasoning") break;
+							if (state.open?.kind !== "reasoning") break;
 							const cur: OpenReasoning = state.open;
 							const text = ev.content ?? cur.reasoningText;
 							cur.reasoningText = text;
@@ -1029,13 +1127,13 @@ export function encodeStream(
 							break;
 						}
 						case "toolcall_start": {
-							if (state.open) closeOpen();
+							if (state.open && state.open.kind !== "function_call") closeOpen();
 							openToolCall(ev.partial, ev.contentIndex);
 							break;
 						}
 						case "toolcall_delta": {
-							if (!state.open || state.open.kind !== "function_call") break;
-							const cur: OpenFunctionCall = state.open;
+							const cur = functionCallForEvent(ev.contentIndex);
+							if (!cur) break;
 							cur.argsText += ev.delta;
 							if (cur.customWireName) {
 								emit("response.custom_tool_call_input.delta", {
@@ -1053,8 +1151,8 @@ export function encodeStream(
 							break;
 						}
 						case "toolcall_end": {
-							if (!state.open || state.open.kind !== "function_call") break;
-							const cur: OpenFunctionCall = state.open;
+							const cur = functionCallForEvent(ev.contentIndex);
+							if (!cur) break;
 							// Promote possibly-late info from the canonical ToolCall.
 							const tc = ev.toolCall;
 							if (tc.customWireName && !cur.customWireName) cur.customWireName = tc.customWireName;
@@ -1087,7 +1185,7 @@ export function encodeStream(
 									name: cur.name,
 								});
 							}
-							closeOpen();
+							closeFunctionCall(cur);
 							break;
 						}
 						case "done": {
@@ -1102,6 +1200,7 @@ export function encodeStream(
 				}
 
 				if (failureMessage) {
+					closeOpenFunctionCalls();
 					if (state.open) closeOpen();
 					controller.enqueue(
 						encoder.encode(
@@ -1120,6 +1219,7 @@ export function encodeStream(
 					return;
 				}
 
+				closeOpenFunctionCalls();
 				if (state.open) closeOpen();
 				const message = finalMessage ?? ((await events.result().catch(() => null)) as AssistantMessage | null);
 
@@ -1147,7 +1247,7 @@ export function encodeStream(
 								model: requestedModelId,
 								output: items,
 								usage,
-								...(status === "incomplete" ? { incomplete_details: { reason: "max_output_tokens" } } : {}),
+								incomplete_details: incompleteDetailsForStatus(status),
 								...(status === "failed"
 									? { error: { message: message?.errorMessage ?? "response failed" } }
 									: {}),
@@ -1158,26 +1258,36 @@ export function encodeStream(
 				emitDone();
 				controller.close();
 			} catch (err) {
-				controller.enqueue(
-					encoder.encode(
-						sseEvent("response.failed", {
-							type: "response.failed",
-							sequence_number: seq(),
-							response: {
-								id: responseId,
-								object: "response",
-								created_at: Math.floor(Date.now() / 1000),
-								status: "failed",
-								model: requestedModelId,
-								output: [],
-								error: { message: err instanceof Error ? err.message : String(err) },
-							},
-						}),
-					),
-				);
-				emitDone();
-				controller.close();
+				if (!cancelled) {
+					controller.enqueue(
+						encoder.encode(
+							sseEvent("response.failed", {
+								type: "response.failed",
+								sequence_number: seq(),
+								response: {
+									id: responseId,
+									object: "response",
+									created_at: Math.floor(Date.now() / 1000),
+									status: "failed",
+									model: requestedModelId,
+									output: [],
+									error: { message: err instanceof Error ? err.message : String(err) },
+									incomplete_details: null,
+								},
+							}),
+						),
+					);
+					emitDone();
+					controller.close();
+				}
+			} finally {
+				control?.signal?.removeEventListener("abort", markCancelled);
 			}
+		},
+		cancel(reason) {
+			cancelled = true;
+			control?.signal?.removeEventListener("abort", markCancelled);
+			control?.onCancel?.(reason);
 		},
 	});
 }

@@ -1,9 +1,10 @@
 import { beforeAll, describe, expect, test, vi } from "bun:test";
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
-import { buildSessionContext } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { Container } from "@oh-my-pi/pi-tui";
+import { buildSessionContext, type SessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
+import { type Component, Container } from "@oh-my-pi/pi-tui";
 
 function renderLastLine(container: Container, width = 120): string {
 	const last = container.children[container.children.length - 1];
@@ -11,17 +12,71 @@ function renderLastLine(container: Container, width = 120): string {
 	return last.render(width).join("\n");
 }
 
+function renderContainer(container: Container, width = 120): string {
+	return container.render(width).join("\n");
+}
+
+function createInitialRenderHarness(): { ctx: InteractiveModeContext; helpers: UiHelpers } {
+	let helpers: UiHelpers;
+	const ctx = {
+		chatContainer: new Container(),
+		pendingMessagesContainer: new Container(),
+		pendingBashComponents: [],
+		pendingPythonComponents: [],
+		pendingTools: new Map(),
+		ui: { requestRender: vi.fn() },
+		present: (content: Component | readonly Component[]) => {
+			const items = Array.isArray(content) ? content : [content];
+			for (const item of items) ctx.chatContainer.addChild(item);
+			ctx.ui.requestRender();
+		},
+		sessionManager: {
+			buildSessionContext: () => buildSessionContext([]),
+			getEntries: () => [],
+		},
+		statusLine: { invalidate: vi.fn() },
+		updateEditorBorderColor: vi.fn(),
+		renderSessionContext: (
+			context: SessionContext,
+			options?: { updateFooter?: boolean; populateHistory?: boolean },
+		) => helpers.renderSessionContext(context, options),
+		addMessageToChat: (message: AgentMessage) => helpers.addMessageToChat(message),
+		settings: { get: () => false },
+		session: {
+			retryAttempt: 0,
+			getToolByName: () => undefined,
+			buildTranscriptSessionContext: () => buildSessionContext([]),
+			sessionManager: {
+				buildSessionContext: () => buildSessionContext([]),
+				getEntries: () => [],
+			},
+		},
+		get viewSession() {
+			return (this as typeof ctx).session;
+		},
+		clearTransientSessionUi: () => {},
+		toolOutputExpanded: false,
+		hideThinkingBlock: false,
+	} as unknown as InteractiveModeContext;
+	helpers = new UiHelpers(ctx);
+	return { ctx, helpers };
+}
+
 describe("InteractiveMode.showStatus", () => {
-	beforeAll(() => {
+	beforeAll(async () => {
 		// showStatus uses the global theme instance
-		initTheme();
+		await initTheme();
 	});
 
 	test("coalesces immediately-sequential status messages", () => {
 		const ctx = {
 			chatContainer: new Container(),
 			ui: { requestRender: vi.fn() },
-			isBackgrounded: false,
+			present: (content: Component | readonly Component[]) => {
+				const items = Array.isArray(content) ? content : [content];
+				for (const item of items) ctx.chatContainer.addChild(item);
+				ctx.ui.requestRender();
+			},
 			lastStatusSpacer: undefined,
 			lastStatusText: undefined,
 		} as unknown as InteractiveModeContext;
@@ -42,7 +97,11 @@ describe("InteractiveMode.showStatus", () => {
 		const ctx = {
 			chatContainer: new Container(),
 			ui: { requestRender: vi.fn() },
-			isBackgrounded: false,
+			present: (content: Component | readonly Component[]) => {
+				const items = Array.isArray(content) ? content : [content];
+				for (const item of items) ctx.chatContainer.addChild(item);
+				ctx.ui.requestRender();
+			},
 			lastStatusSpacer: undefined,
 			lastStatusText: undefined,
 		} as unknown as InteractiveModeContext;
@@ -59,6 +118,15 @@ describe("InteractiveMode.showStatus", () => {
 		// adds spacer + text
 		expect(ctx.chatContainer.children).toHaveLength(5);
 		expect(renderLastLine(ctx.chatContainer)).toContain("STATUS_TWO");
+	});
+
+	test("preserves startup notifications while rendering the initial transcript", () => {
+		const { ctx, helpers } = createInitialRenderHarness();
+
+		helpers.showWarning("startup notification probe");
+		helpers.renderInitialMessages({ preserveExistingChat: true });
+
+		expect(renderContainer(ctx.chatContainer)).toContain("startup notification probe");
 	});
 
 	test("preserves optimistic user signatures when rebuilding transcript state", () => {

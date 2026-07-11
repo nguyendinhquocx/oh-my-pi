@@ -10,8 +10,9 @@ import * as path from "node:path";
 import type { ToolCallContext } from "@oh-my-pi/pi-agent-core";
 import type { Ellipsis } from "@oh-my-pi/pi-natives";
 import type { Component } from "@oh-my-pi/pi-tui";
-import { replaceTabs, truncateToWidth } from "@oh-my-pi/pi-tui";
+import { getKeybindings, replaceTabs, truncateToWidth } from "@oh-my-pi/pi-tui";
 import { pluralize } from "@oh-my-pi/pi-utils";
+import { formatKeyHints, type KeyId } from "../config/keybindings";
 import { settings } from "../config/settings";
 import type { Theme } from "../modes/theme/theme";
 import { Hasher } from "../tui/utils";
@@ -73,10 +74,20 @@ export const TRUNCATE_LENGTHS = {
 	LINE: 110,
 	/** Very short (task previews, badges) */
 	SHORT: 40,
+	/** Idle recap status line (~40-word LLM reply) */
+	RECAP: 280,
 } as const;
 
-/** Standard expand hint text */
-export const EXPAND_HINT = "(Ctrl+O for more)";
+/** Keybinding action that toggles tool-output expansion. */
+const EXPAND_ACTION = "app.tools.expand";
+/** Fallback key when no binding is resolvable (e.g. outside an interactive session). */
+const DEFAULT_EXPAND_KEY: KeyId = "ctrl+o";
+
+/** Human-readable key currently bound to tool-output expansion, e.g. `Ctrl+O`. */
+export function expandKeyHint(): string {
+	const keys = getKeybindings().getKeys(EXPAND_ACTION);
+	return formatKeyHints(keys.length > 0 ? keys : [DEFAULT_EXPAND_KEY]);
+}
 
 // =============================================================================
 // Text Truncation Utilities
@@ -88,6 +99,17 @@ export const EXPAND_HINT = "(Ctrl+O for more)";
 export function getPreviewLines(text: string, maxLines: number, maxLineLen: number, ellipsis?: Ellipsis): string[] {
 	const lines = text.split("\n").filter(l => l.trim());
 	return lines.slice(0, maxLines).map(l => truncateToWidth(l.trim(), maxLineLen, ellipsis));
+}
+
+/**
+ * Collapse a possibly multi-line string into a single line, then truncate it to
+ * `maxWidth` display cells. {@link truncateToWidth} alone caps width but
+ * newlines are zero-width, so multi-line content (markdown briefs, tool args,
+ * provider errors) would otherwise spill a single status row across several
+ * visual lines. Whitespace runs collapse to one space, so tabs are handled too.
+ */
+export function previewLine(text: string, maxWidth: number, ellipsis?: Ellipsis): string {
+	return truncateToWidth(text.replace(/\s+/g, " ").trim(), maxWidth, ellipsis);
 }
 
 // =============================================================================
@@ -124,6 +146,8 @@ export function formatStatusIcon(status: ToolUIStatus, theme: Theme, spinnerFram
 	switch (status) {
 		case "success":
 			return theme.styledSymbol("status.success", "success");
+		case "done":
+			return theme.styledSymbol("status.done", "success");
 		case "error":
 			return theme.styledSymbol("status.error", "error");
 		case "warning":
@@ -150,7 +174,7 @@ export function formatStatusIcon(status: ToolUIStatus, theme: Theme, spinnerFram
 export function formatExpandHint(theme: Theme, expanded?: boolean, hasMore?: boolean): string {
 	if (expanded) return "";
 	if (hasMore === false) return "";
-	return theme.fg("dim", wrapBrackets(EXPAND_HINT, theme));
+	return theme.fg("dim", wrapBrackets(`${expandKeyHint()}: Expand`, theme));
 }
 
 /**
@@ -171,13 +195,74 @@ export function formatMoreItems(remaining: number, itemType: string): string {
 	return `… ${safeRemaining} more ${pluralize(itemType, safeRemaining)}`;
 }
 
+/**
+ * Collapsed command/code previews render a tail window sized from the live
+ * viewport: terminal rows minus a reserve for the rest of the block (frame,
+ * Output section, stats line) and the editor/status area below the
+ * transcript. This keeps a volatile streaming block from growing past the
+ * viewport and stranding its top, while letting tall terminals show more.
+ */
+const PREVIEW_WINDOW_RESERVED_ROWS = 20;
+/** Floor so tiny or unknown viewports still show a useful window. */
+const PREVIEW_WINDOW_MIN_LINES = 6;
+/** Assumed viewport when rows are unknown (non-TTY, tests). */
+const PREVIEW_WINDOW_FALLBACK_ROWS = 30;
+
+/** Tail-window height for collapsed command/code previews. */
+export function previewWindowRows(): number {
+	const rows = process.stdout.rows || PREVIEW_WINDOW_FALLBACK_ROWS;
+	return Math.max(PREVIEW_WINDOW_MIN_LINES, rows - PREVIEW_WINDOW_RESERVED_ROWS);
+}
+
+/**
+ * Cap a pre-rendered command preview to a viewport-sized tail window: the end
+ * of the command stays visible (it is the live edge while args stream) behind
+ * an "… N earlier lines" marker on top. The same window applies while
+ * streaming and after completion so the block never jumps; only `expanded`
+ * (ctrl+o) uncaps it.
+ *
+ * `prefix` (raw, e.g. a dim tree gutter) is prepended to the marker line so
+ * nested previews stay aligned. `expandHint: false` drops the "ctrl+o: Expand"
+ * suffix for callers that cap even inside the expanded view (task recent
+ * output), where the hint would point the wrong way.
+ */
+export function capPreviewLines(
+	lines: string[],
+	theme: Theme,
+	options: { max?: number; expanded?: boolean; prefix?: string; expandHint?: boolean } = {},
+): string[] {
+	if (options.expanded) return lines;
+	const max = options.max ?? previewWindowRows();
+	if (lines.length <= max) return lines;
+	const visible = max <= 1 ? [] : lines.slice(lines.length - (max - 1));
+	const hidden = lines.length - visible.length;
+	const hint = options.expandHint === false ? "" : formatExpandHint(theme, false, true);
+	const marker = `… ${hidden} earlier ${pluralize("line", hidden)}${hint ? ` ${hint}` : ""}`;
+	return [`${options.prefix ?? ""}${theme.fg("dim", marker)}`, ...visible];
+}
+
 export function formatMeta(meta: string[], theme: Theme): string {
 	return meta.length > 0 ? ` ${theme.fg("muted", meta.join(theme.sep.dot))}` : "";
 }
 
-export function formatErrorMessage(message: string | undefined, theme: Theme): string {
+function sanitizeErrorText(message: string | undefined): string {
 	const clean = (message ?? "").replace(/^Error:\s*/, "").trim();
-	return `${theme.styledSymbol("status.error", "error")} ${theme.fg("error", `Error: ${clean || "Unknown error"}`)}`;
+	return clean ? replaceTabs(truncateToWidth(clean, TRUNCATE_LENGTHS.LINE)) : "Unknown error";
+}
+
+export function formatErrorMessage(message: string | undefined, theme: Theme): string {
+	return `${theme.styledSymbol("status.error", "error")} ${theme.fg("error", `Error: ${sanitizeErrorText(message)}`)}`;
+}
+
+/**
+ * Error message rendered as a subordinate detail line beneath a status header
+ * that already carries the error icon (e.g. `✘ Write: <path>`). The header's
+ * icon already signals failure, so this omits the redundant error symbol and
+ * "Error:" prefix that `formatErrorMessage` adds for standalone single-line
+ * errors, indenting two columns to sit under the header title instead.
+ */
+export function formatErrorDetail(message: string | undefined, theme: Theme): string {
+	return `  ${theme.fg("error", sanitizeErrorText(message))}`;
 }
 
 export function formatEmptyMessage(message: string, theme: Theme): string {
@@ -206,7 +291,7 @@ export function formatCodeFrameLine(
 // Tool UI Helpers
 // =============================================================================
 
-export type ToolUIStatus = "success" | "error" | "warning" | "info" | "pending" | "running" | "aborted";
+export type ToolUIStatus = "success" | "done" | "error" | "warning" | "info" | "pending" | "running" | "aborted";
 export type ToolUIColor = "success" | "error" | "warning" | "accent" | "muted";
 
 export interface ToolUITitleOptions {
@@ -268,6 +353,7 @@ export function formatDiagnostics(
 	expanded: boolean,
 	theme: Theme,
 	getLangIcon: (filePath: string) => string,
+	options?: { title?: string },
 ): string {
 	if (diag.messages.length === 0) return "";
 
@@ -299,7 +385,8 @@ export function formatDiagnostics(
 		? theme.styledSymbol("status.error", "error")
 		: theme.styledSymbol("status.warning", "warning");
 	const summary = sanitizeDiagnosticDisplayText(diag.summary);
-	let output = `\n\n${headerIcon} ${theme.fg("toolTitle", "Diagnostics")} ${theme.fg("dim", `(${summary})`)}`;
+	const summaryTag = summary ? ` ${theme.fg("dim", `(${summary})`)}` : "";
+	let output = `\n\n${headerIcon} ${theme.fg("toolTitle", options?.title ?? "Diagnostics")}${summaryTag}`;
 
 	const maxDiags = expanded ? diag.messages.length : 5;
 	let diagsShown = 0;
@@ -447,7 +534,7 @@ function parseDiffSegments(lines: string[]): DiffSegment[] {
 
 	for (const line of lines) {
 		const isChange = line.startsWith("+") || line.startsWith("-");
-		const isEllipsis = line.trimStart().startsWith("...");
+		const isEllipsis = line.trimStart().startsWith("...") || line.trim().length === 0;
 
 		if (isEllipsis) {
 			if (current) segments.push(current);
@@ -469,7 +556,22 @@ export function truncateDiffByHunk(
 	diffText: string,
 	maxHunks: number,
 	maxLines: number,
+	options?: { fromTail?: boolean },
 ): { text: string; hiddenHunks: number; hiddenLines: number } {
+	if (options?.fromTail) {
+		// Streaming previews want to track the tail of the diff as new hunks
+		// arrive. Reversing the line buffer reuses the head-mode logic without
+		// duplicating the segment-budget bookkeeping: hunk runs survive
+		// reversal (a continuous `+`/`-` block stays contiguous) and so do the
+		// per-line `+`/`-` markers, so getDiffStats yields identical counts.
+		const reversed = (diffText ?? "").split("\n").reverse().join("\n");
+		const result = truncateDiffByHunk(reversed, maxHunks, maxLines);
+		return {
+			text: result.text.split("\n").reverse().join("\n"),
+			hiddenHunks: result.hiddenHunks,
+			hiddenLines: result.hiddenLines,
+		};
+	}
 	const lines = diffText ? diffText.split("\n") : [];
 	const totalStats = getDiffStats(diffText);
 
@@ -539,7 +641,7 @@ export function truncateDiffByHunk(
 					const half = Math.ceil(allowedLines / 2);
 					if (seg.lines.length > allowedLines) {
 						kept.push(...seg.lines.slice(0, half));
-						kept.push(seg.lines[0].replace(/^(\s*\d*\s*).*/, "$1..."));
+						kept.push("");
 						kept.push(...seg.lines.slice(-half));
 					} else {
 						kept.push(...seg.lines);
@@ -567,10 +669,16 @@ export function truncateDiffByHunk(
 // Path Utilities
 // =============================================================================
 
-export function shortenPath(filePath: string, homeDir?: string): string {
+export function shortenPath(filePath: unknown, homeDir?: string): string {
+	if (typeof filePath !== "string") {
+		return "";
+	}
 	const home = homeDir ?? os.homedir();
 	if (home && filePath.startsWith(home)) {
-		return `~${filePath.slice(home.length)}`;
+		const suffix = filePath.slice(home.length);
+		if (suffix === "" || suffix.startsWith(path.posix.sep) || suffix.startsWith(path.win32.sep)) {
+			return `~${suffix.replaceAll(path.win32.sep, path.posix.sep)}`;
+		}
 	}
 	return filePath;
 }
@@ -607,6 +715,9 @@ export function formatScreenshot(opts: {
 	} else {
 		lines.push(`Format: ${opts.resized.mimeType} (${(opts.resized.buffer.length / 1024).toFixed(2)} KB)`);
 		lines.push(`Dimensions: ${opts.resized.width}x${opts.resized.height}`);
+	}
+	if (opts.resized.decodeFailed) {
+		lines.push("Resize: image decoder failed; using original image bytes");
 	}
 	const dimensionNote = formatDimensionNote(opts.resized);
 	if (dimensionNote) {
@@ -661,36 +772,6 @@ export function capParseErrors(
 // =============================================================================
 
 /**
- * Group `rawLines` by blank-line separators, mirroring the historical search /
- * ast-grep / ast-edit renderer behavior: if any blank line is present, splits on
- * runs of blank lines; otherwise collapses non-empty lines into a single group.
- */
-export function splitGroupsByBlankLine(rawLines: string[]): string[][] {
-	const hasSeparators = rawLines.some(line => line.trim().length === 0);
-	const groups: string[][] = [];
-	if (hasSeparators) {
-		let current: string[] = [];
-		for (const line of rawLines) {
-			if (line.trim().length === 0) {
-				if (current.length > 0) {
-					groups.push(current);
-					current = [];
-				}
-				continue;
-			}
-			current.push(line);
-		}
-		if (current.length > 0) groups.push(current);
-	} else {
-		const nonEmpty = rawLines.filter(line => line.trim().length > 0);
-		if (nonEmpty.length > 0) {
-			groups.push(nonEmpty);
-		}
-	}
-	return groups;
-}
-
-/**
  * Standard width+expand keyed render cache used by every search-style tool
  * renderer. `compute` re-runs only when the cache key changes; the returned
  * Component is the canonical `{ render, invalidate }` pair.
@@ -698,21 +779,82 @@ export function splitGroupsByBlankLine(rawLines: string[]): string[][] {
 export function createCachedComponent(
 	getExpanded: () => boolean,
 	compute: (width: number, expanded: boolean) => string[],
+	options: { paddingX?: number } = {},
 ): Component {
 	let cached: { key: bigint; lines: string[] } | undefined;
 	return {
-		render(width: number): string[] {
+		render(width: number): readonly string[] {
 			const expanded = getExpanded();
 			const key = new Hasher().bool(expanded).u32(width).digest();
 			if (cached?.key === key) return cached.lines;
-			const lines = compute(width, expanded);
-			cached = { key, lines };
-			return lines;
+			const paddingX = Math.max(0, options.paddingX ?? 0);
+			const innerWidth = Math.max(1, width - paddingX * 2);
+			const lines = compute(innerWidth, expanded);
+			const pad = paddingX === 0 ? "" : " ".repeat(paddingX);
+			const paddedLines = paddingX === 0 ? lines : lines.map(line => `${pad}${line}${pad}`);
+			cached = { key, lines: paddedLines };
+			return paddedLines;
 		},
 		invalidate() {
 			cached = undefined;
 		},
 	};
+}
+
+/**
+ * Single-slot memo for an expensive rendered string (syntax highlighting, diff
+ * coloring) keyed by the exact inputs that shape the bytes: theme instance,
+ * expanded state, a caller-chosen salt (path/language), and the source content.
+ * Field-wise comparison instead of a concatenated key string: a cache hit costs
+ * one string value-compare (engines short-circuit on length) and a miss never
+ * allocates a key. Comparing the {@link Theme} by reference is sound because
+ * theme switches replace the instance wholesale (`setTheme`/`previewTheme`/
+ * `setSymbolPreset` in modes/theme/theme.ts) — themes are never mutated in
+ * place.
+ */
+export interface RenderedStringCache {
+	theme: Theme | null;
+	expanded: boolean;
+	salt: string;
+	content: string;
+	value: string;
+}
+
+export function createRenderedStringCache(): RenderedStringCache {
+	return { theme: null, expanded: false, salt: "", content: "", value: "" };
+}
+
+/** Drop the memo so the next lookup re-renders (e.g. the render function identity changed). */
+export function invalidateRenderedStringCache(cache: RenderedStringCache): void {
+	cache.theme = null;
+}
+
+export function cachedRenderedString(
+	cache: RenderedStringCache | undefined,
+	theme: Theme,
+	expanded: boolean,
+	salt: string,
+	content: string,
+	render: () => string,
+): string {
+	if (
+		cache !== undefined &&
+		cache.theme === theme &&
+		cache.expanded === expanded &&
+		cache.salt === salt &&
+		cache.content === content
+	) {
+		return cache.value;
+	}
+	const value = render();
+	if (cache !== undefined) {
+		cache.theme = theme;
+		cache.expanded = expanded;
+		cache.salt = salt;
+		cache.content = content;
+		cache.value = value;
+	}
+	return value;
 }
 
 /**

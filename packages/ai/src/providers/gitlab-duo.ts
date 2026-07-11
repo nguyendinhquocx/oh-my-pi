@@ -1,5 +1,7 @@
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import * as AIError from "../error";
 import { ANTHROPIC_THINKING, mapAnthropicToolChoice } from "../stream";
-import type { Api, Context, FetchImpl, Model, SimpleStreamOptions } from "../types";
+import type { Api, Context, FetchImpl, Model, ModelSpec, SimpleStreamOptions } from "../types";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { createProviderErrorMessage } from "./error-message";
 import type { OpenAICompletionsOptions } from "./openai-completions";
@@ -145,23 +147,25 @@ export function getModelMapping(modelId: string): GitLabModelMapping | undefined
 }
 
 export function getGitLabDuoModels(): Model<Api>[] {
-	return Object.entries(MODEL_MAPPINGS).map(([id, mapping]) => ({
-		id,
-		name: mapping.name,
-		api:
-			mapping.provider === "anthropic"
-				? "anthropic-messages"
-				: mapping.openaiApiType === "responses"
-					? "openai-responses"
-					: "openai-completions",
-		provider: "gitlab-duo",
-		baseUrl: mapping.provider === "anthropic" ? ANTHROPIC_PROXY_URL : OPENAI_PROXY_URL,
-		reasoning: mapping.reasoning,
-		input: [...mapping.input],
-		cost: { ...mapping.cost },
-		contextWindow: mapping.contextWindow,
-		maxTokens: mapping.maxTokens,
-	}));
+	return Object.entries(MODEL_MAPPINGS).map(([id, mapping]) =>
+		buildModel({
+			id,
+			name: mapping.name,
+			api:
+				mapping.provider === "anthropic"
+					? "anthropic-messages"
+					: mapping.openaiApiType === "responses"
+						? "openai-responses"
+						: "openai-completions",
+			provider: "gitlab-duo",
+			baseUrl: mapping.provider === "anthropic" ? ANTHROPIC_PROXY_URL : OPENAI_PROXY_URL,
+			reasoning: mapping.reasoning,
+			input: [...mapping.input],
+			cost: { ...mapping.cost },
+			contextWindow: mapping.contextWindow,
+			maxTokens: mapping.maxTokens,
+		} as ModelSpec<Api>),
+	);
 }
 
 interface DirectAccessToken {
@@ -195,17 +199,29 @@ async function getDirectAccessToken(
 	if (!response.ok) {
 		const detail = await response.text();
 		if (response.status === 403) {
-			throw new Error(`GitLab Duo access denied. Ensure Duo is enabled for this account. ${detail}`);
+			throw new AIError.ProviderResponseError(
+				`GitLab Duo access denied. Ensure Duo is enabled for this account. ${detail}`,
+				{ provider: "gitlab-duo", kind: "runtime" },
+			);
 		}
-		throw new Error(`Failed to get GitLab Duo direct access token: ${response.status} ${detail}`);
+		throw new AIError.GitLabDuoApiError(
+			`Failed to get GitLab Duo direct access token: ${response.status} ${detail}`,
+			response.status,
+		);
 	}
 
 	const payload = (await response.json()) as { token?: string; headers?: Record<string, string> };
 	if (!payload.token || typeof payload.token !== "string") {
-		throw new Error("GitLab Duo direct access response missing token");
+		throw new AIError.ProviderResponseError("GitLab Duo direct access response missing token", {
+			provider: "gitlab-duo",
+			kind: "envelope",
+		});
 	}
 	if (!payload.headers || typeof payload.headers !== "object") {
-		throw new Error("GitLab Duo direct access response missing headers");
+		throw new AIError.ProviderResponseError("GitLab Duo direct access response missing headers", {
+			provider: "gitlab-duo",
+			kind: "envelope",
+		});
 	}
 
 	const token: DirectAccessToken = {
@@ -234,16 +250,20 @@ export function streamGitLabDuo(
 
 	(async () => {
 		try {
-			if (!options?.apiKey) {
-				throw new Error("Missing GitLab access token. Run /login gitlab-duo or set GITLAB_TOKEN.");
+			const apiKey = typeof options?.apiKey === "string" ? options.apiKey : undefined;
+			if (!apiKey || !options) {
+				throw new AIError.MissingApiKeyError(
+					undefined,
+					"Missing GitLab access token. Run /login gitlab-duo or set GITLAB_TOKEN.",
+				);
 			}
 
 			const mapping = getModelMapping(model.id);
 			if (!mapping) {
-				throw new Error(`Unsupported GitLab Duo model: ${model.id}`);
+				throw new AIError.ConfigurationError(`Unsupported GitLab Duo model: ${model.id}`);
 			}
 
-			const directAccess = await getDirectAccessToken(options.apiKey, options.fetch);
+			const directAccess = await getDirectAccessToken(apiKey, options.fetch);
 			const headers = {
 				...directAccess.headers,
 				...options.headers,
@@ -254,12 +274,13 @@ export function streamGitLabDuo(
 			const inner =
 				mapping.provider === "anthropic"
 					? streamAnthropic(
-							{
+							buildModel({
 								...model,
 								id: mapping.model,
 								api: "anthropic-messages",
 								baseUrl: ANTHROPIC_PROXY_URL,
-							} as Model<"anthropic-messages">,
+								compat: model.compatConfig,
+							} as ModelSpec<"anthropic-messages">),
 							context,
 							{
 								apiKey: directAccess.token,
@@ -270,7 +291,7 @@ export function streamGitLabDuo(
 								minP: options.minP,
 								presencePenalty: options.presencePenalty,
 								repetitionPenalty: options.repetitionPenalty,
-								maxTokens: options.maxTokens ?? Math.min(model.maxTokens, 32000),
+								maxTokens: options.maxTokens ?? model.maxTokens ?? undefined,
 								signal: options.signal,
 								cacheRetention: options.cacheRetention,
 								headers,
@@ -292,12 +313,13 @@ export function streamGitLabDuo(
 						)
 					: mapping.openaiApiType === "responses"
 						? streamOpenAIResponses(
-								{
+								buildModel({
 									...model,
 									id: mapping.model,
 									api: "openai-responses",
 									baseUrl: OPENAI_PROXY_URL,
-								} as Model<"openai-responses">,
+									compat: model.compatConfig,
+								} as ModelSpec<"openai-responses">),
 								context,
 								{
 									apiKey: directAccess.token,
@@ -307,7 +329,7 @@ export function streamGitLabDuo(
 									minP: options.minP,
 									presencePenalty: options.presencePenalty,
 									repetitionPenalty: options.repetitionPenalty,
-									maxTokens: options.maxTokens ?? model.maxTokens,
+									maxTokens: options.maxTokens ?? model.maxTokens ?? undefined,
 									signal: options.signal,
 									cacheRetention: options.cacheRetention,
 									headers,
@@ -324,12 +346,13 @@ export function streamGitLabDuo(
 								} satisfies OpenAIResponsesOptions,
 							)
 						: streamOpenAICompletions(
-								{
+								buildModel({
 									...model,
 									id: mapping.model,
 									api: "openai-completions",
 									baseUrl: OPENAI_PROXY_URL,
-								} as Model<"openai-completions">,
+									compat: model.compatConfig,
+								} as ModelSpec<"openai-completions">),
 								context,
 								{
 									apiKey: directAccess.token,
@@ -339,7 +362,7 @@ export function streamGitLabDuo(
 									minP: options.minP,
 									presencePenalty: options.presencePenalty,
 									repetitionPenalty: options.repetitionPenalty,
-									maxTokens: options.maxTokens ?? model.maxTokens,
+									maxTokens: options.maxTokens ?? model.maxTokens ?? undefined,
 									signal: options.signal,
 									cacheRetention: options.cacheRetention,
 									headers,

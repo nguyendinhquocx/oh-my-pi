@@ -1,7 +1,8 @@
 import * as os from "node:os";
 import * as path from "node:path";
-import { enrichModelThinking } from "@oh-my-pi/pi-ai/model-thinking";
 import type { Model } from "@oh-my-pi/pi-ai/types";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 
 export async function withEnv(
@@ -54,8 +55,11 @@ export async function waitForDelayOrAbort(delayMs: number, signal: AbortSignal |
 	}
 }
 
-export function createCodexModel(id: string): Model<"openai-codex-responses"> {
-	return enrichModelThinking({
+export function createCodexModel(
+	id: string,
+	spec?: Partial<ModelSpec<"openai-codex-responses">>,
+): Model<"openai-codex-responses"> {
+	return buildModel({
 		id,
 		name: id,
 		api: "openai-codex-responses",
@@ -66,6 +70,7 @@ export function createCodexModel(id: string): Model<"openai-codex-responses"> {
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 272000,
 		maxTokens: 128000,
+		...spec,
 	});
 }
 

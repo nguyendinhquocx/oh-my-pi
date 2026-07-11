@@ -4,13 +4,13 @@
  * Calls Brave's web search REST API and maps results into the unified
  * SearchResponse shape used by the web search tool.
  */
-import { getEnvApiKey } from "@oh-my-pi/pi-ai";
+import { type AuthStorage, type FetchImpl, getEnvApiKey } from "@oh-my-pi/pi-ai";
 import type { SearchResponse, SearchSource } from "../../../web/search/types";
 import { SearchProviderError } from "../../../web/search/types";
 import { clampNumResults, dateToAgeSeconds } from "../utils";
 import type { SearchParams } from "./base";
 import { SearchProvider } from "./base";
-import { classifyProviderHttpError, isApiKeyAvailable, withHardTimeout } from "./utils";
+import { classifyProviderHttpError, withHardTimeout } from "./utils";
 
 const BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search";
 const DEFAULT_NUM_RESULTS = 10;
@@ -28,6 +28,7 @@ export interface BraveSearchParams {
 	num_results?: number;
 	recency?: "day" | "week" | "month" | "year";
 	signal?: AbortSignal;
+	fetch?: FetchImpl;
 }
 
 interface BraveSearchResult {
@@ -80,7 +81,8 @@ async function callBraveSearch(
 		url.searchParams.set("freshness", RECENCY_MAP[params.recency]);
 	}
 
-	const response = await fetch(url, {
+	const fetchImpl = params.fetch ?? fetch;
+	const response = await fetchImpl(url, {
 		headers: {
 			Accept: "application/json",
 			"X-Subscription-Token": apiKey,
@@ -134,8 +136,8 @@ export class BraveProvider extends SearchProvider {
 	readonly id = "brave";
 	readonly label = "Brave";
 
-	isAvailable() {
-		return isApiKeyAvailable(findApiKey);
+	isAvailable(_authStorage: AuthStorage): boolean {
+		return !!findApiKey();
 	}
 
 	search(params: SearchParams): Promise<SearchResponse> {
@@ -144,6 +146,7 @@ export class BraveProvider extends SearchProvider {
 			num_results: params.numSearchResults ?? params.limit,
 			recency: params.recency,
 			signal: params.signal,
+			fetch: params.fetch,
 		});
 	}
 }

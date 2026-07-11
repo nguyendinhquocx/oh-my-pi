@@ -3,54 +3,45 @@
  *
  * Single tool supporting Anthropic, Perplexity, Exa, Brave, Jina, Kimi, Gemini, Codex, Tavily, Kagi, Z.AI, SearXNG, and Synthetic
  * providers with provider-specific parameters exposed conditionally.
- *
  */
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
+import type { AuthStorage } from "@oh-my-pi/pi-ai";
 import { prompt } from "@oh-my-pi/pi-utils";
-import * as z from "zod/v4";
+import { type } from "arktype";
+import { settings } from "../../config/settings";
 import type { CustomTool, CustomToolContext, RenderResultOptions } from "../../extensibility/custom-tools/types";
 import type { Theme } from "../../modes/theme/theme";
 import webSearchSystemPrompt from "../../prompts/system/web-search.md" with { type: "text" };
 import webSearchDescription from "../../prompts/tools/web-search.md" with { type: "text" };
+import { discoverAuthStorage } from "../../sdk";
 import type { ToolSession } from "../../tools";
 import { formatAge } from "../../tools/render-utils";
 import { throwIfAborted } from "../../tools/tool-errors";
-import { getSearchProvider, getSearchProviderLabel, resolveProviderChain, type SearchProvider } from "./provider";
+import {
+	formatSearchProviderFailure,
+	formatSearchProviderFailures,
+	getSearchProvider,
+	resolveProviderChain,
+	type SearchProvider,
+} from "./provider";
 import { renderSearchCall, renderSearchResult, type SearchRenderDetails } from "./render";
 import type { SearchProviderId, SearchResponse } from "./types";
 import { SearchProviderError } from "./types";
 
 /** Web search tool parameters schema */
-export const webSearchSchema = z.object({
-	query: z.string().describe("search query"),
-	recency: z.enum(["day", "week", "month", "year"]).describe("recency filter").optional(),
-	limit: z.number().describe("max results").optional(),
-	max_tokens: z.number().describe("max output tokens").optional(),
-	temperature: z.number().describe("sampling temperature").optional(),
-	num_search_results: z.number().describe("number of search results").optional(),
+export const webSearchSchema = type({
+	query: "string",
+	recency: "'day' | 'week' | 'month' | 'year'?",
+	limit: "number?",
+	max_tokens: "number?",
+	temperature: "number?",
+	num_search_results: "number?",
 });
 
-export type SearchToolParams = z.infer<typeof webSearchSchema>;
+export type SearchToolParams = typeof webSearchSchema.infer;
 
 export interface SearchQueryParams extends SearchToolParams {
 	provider?: SearchProviderId | "auto";
-}
-
-function formatProviderError(error: unknown, provider: SearchProvider): string {
-	if (error instanceof SearchProviderError) {
-		if (error.provider === "anthropic" && error.status === 404) {
-			return "Anthropic web search returned 404 (model or endpoint not found).";
-		}
-		if (error.status === 401 || error.status === 403) {
-			if (error.provider === "zai") {
-				return error.message;
-			}
-			return `${getSearchProviderLabel(error.provider)} authorization failed (${error.status}). Check API key or base URL.`;
-		}
-		return error.message;
-	}
-	if (error instanceof Error) return error.message;
-	return `Unknown error from ${provider.label}`;
 }
 
 /** Truncate text for tool output */
@@ -114,18 +105,42 @@ function formatForLLM(response: SearchResponse): string {
 	return parts.join("\n");
 }
 
+function hasRenderableSearchContent(response: SearchResponse): boolean {
+	if (response.answer?.trim()) return true;
+	if (response.sources.length > 0) return true;
+	if (response.citations?.length) return true;
+	if (response.relatedQuestions?.some(question => question.trim())) return true;
+	if (response.searchQueries?.some(query => query.trim())) return true;
+	return false;
+}
+
+interface ExecuteSearchOptions {
+	authStorage: AuthStorage;
+	sessionId?: string;
+	signal?: AbortSignal;
+}
+
 /** Execute web search */
 async function executeSearch(
 	_toolCallId: string,
 	params: SearchQueryParams,
-	signal?: AbortSignal,
+	options: ExecuteSearchOptions,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: SearchRenderDetails }> {
-	const providers =
-		params.provider && params.provider !== "auto"
-			? await getSearchProvider(params.provider).then(provider =>
-					provider.isAvailable() ? [provider] : resolveProviderChain("auto"),
-				)
-			: await resolveProviderChain();
+	const { authStorage, sessionId, signal } = options;
+	const explicitProvider = params.provider;
+	let providers: SearchProvider[];
+	if (explicitProvider && explicitProvider !== "auto") {
+		const provider = await getSearchProvider(explicitProvider);
+		providers = (await provider.isExplicitlyAvailable(authStorage))
+			? [provider]
+			: await resolveProviderChain(authStorage, "auto");
+	} else if (explicitProvider === "auto") {
+		// Explicit `--provider auto` bypasses the configured preferred provider
+		// for this invocation; exclusions still apply.
+		providers = await resolveProviderChain(authStorage, "auto");
+	} else {
+		providers = await resolveProviderChain(authStorage);
+	}
 	if (providers.length === 0) {
 		const message = "No web search provider configured.";
 		return {
@@ -134,13 +149,30 @@ async function executeSearch(
 		};
 	}
 
+	// Invariant across providers; read once and tolerate an uninitialized
+	// Settings singleton (e.g. `omp q ...` CLI path, unit tests) so the
+	// provider-fallback loop never aborts before any provider runs.
+	let antigravityEndpointMode: "auto" | "production" | "sandbox" | undefined;
+	try {
+		antigravityEndpointMode = settings.get("providers.antigravityEndpoint");
+	} catch {
+		antigravityEndpointMode = undefined;
+	}
+
+	let geminiModel: string | undefined;
+	try {
+		geminiModel = settings.get("providers.webSearchGeminiModel");
+	} catch {
+		geminiModel = undefined;
+	}
+
 	const failures: Array<{ provider: SearchProvider; error: unknown }> = [];
 	let lastProvider = providers[0];
 	for (const provider of providers) {
 		lastProvider = provider;
 		try {
 			const response = await provider.search({
-				query: params.query.replace(/202\d/g, String(new Date().getFullYear())), // LUL
+				query: params.query,
 				limit: params.limit,
 				recency: params.recency,
 				systemPrompt: webSearchSystemPrompt,
@@ -148,7 +180,15 @@ async function executeSearch(
 				numSearchResults: params.num_search_results,
 				temperature: params.temperature,
 				signal,
+				authStorage,
+				sessionId,
+				antigravityEndpointMode,
+				geminiModel,
 			});
+
+			if (!hasRenderableSearchContent(response)) {
+				throw new SearchProviderError(provider.id, `${provider.label} returned no renderable search content.`, 204);
+			}
 
 			const text = formatForLLM(response);
 
@@ -169,18 +209,10 @@ async function executeSearch(
 
 	const lastFailure = failures[failures.length - 1];
 	const baseMessage = lastFailure
-		? formatProviderError(lastFailure.error, lastFailure.provider)
+		? formatSearchProviderFailure(lastFailure.error, lastFailure.provider)
 		: `Unknown error from ${lastProvider.label}`;
 	const message =
-		providers.length > 1
-			? `All web search providers failed: ${failures
-					.map(f =>
-						f.error instanceof SearchProviderError
-							? f.error.message
-							: `${f.provider.id}: ${formatProviderError(f.error, f.provider)}`,
-					)
-					.join("; ")}`
-			: baseMessage;
+		providers.length > 1 ? `All web search providers failed: ${formatSearchProviderFailures(failures)}` : baseMessage;
 
 	return {
 		content: [{ type: "text" as const, text: `Error: ${message}` }],
@@ -190,21 +222,39 @@ async function executeSearch(
 
 /**
  * Execute a web search query for CLI/testing workflows.
+ *
+ * `authStorage` may be omitted; in that case we discover one via the standard
+ * factory (`discoverAuthStorage`), which honours `OMP_AUTH_BROKER_URL` and
+ * otherwise opens the local SQLite credential store.
  */
 export async function runSearchQuery(
 	params: SearchQueryParams,
+	options: { authStorage?: AuthStorage; sessionId?: string; signal?: AbortSignal } = {},
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: SearchRenderDetails }> {
-	return executeSearch("cli-web-search", params);
+	const createdAuthStorage = options.authStorage ? undefined : await discoverAuthStorage();
+	const authStorage = options.authStorage ?? createdAuthStorage;
+	if (!authStorage) {
+		throw new Error("Failed to initialize authentication storage");
+	}
+	try {
+		return await executeSearch("cli-web-search", params, {
+			authStorage,
+			sessionId: options.sessionId,
+			signal: options.signal,
+		});
+	} finally {
+		createdAuthStorage?.close();
+	}
 }
 
 /**
  * Web search tool implementation.
  *
- * Supports Anthropic, Perplexity, Exa, Brave, Jina, Kimi, Gemini, Codex, Z.AI, SearXNG, and Synthetic providers with automatic fallback.
- * Session is accepted for interface consistency but not used.
+ * Supports the configured web-search provider chain with automatic fallback.
  */
 export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRenderDetails> {
 	readonly name = "web_search";
+	readonly approval = "read" as const;
 	readonly label = "Web Search";
 	readonly description: string;
 	readonly parameters = webSearchSchema;
@@ -212,7 +262,10 @@ export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRe
 	readonly loadMode = "discoverable";
 	readonly summary = "Search the web for up-to-date information";
 
-	constructor(_session: ToolSession) {
+	#session: ToolSession;
+
+	constructor(session: ToolSession) {
+		this.#session = session;
 		this.description = prompt.render(webSearchDescription);
 	}
 
@@ -223,7 +276,9 @@ export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRe
 		_onUpdate?: AgentToolUpdateCallback<SearchRenderDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<SearchRenderDetails>> {
-		return executeSearch(_toolCallId, params, signal);
+		const authStorage = this.#session.authStorage ?? (await discoverAuthStorage());
+		const sessionId = this.#session.getSessionId?.() ?? undefined;
+		return executeSearch(_toolCallId, params, { authStorage, sessionId, signal });
 	}
 }
 
@@ -234,22 +289,25 @@ export const webSearchCustomTool: CustomTool<typeof webSearchSchema, SearchRende
 	description: prompt.render(webSearchDescription),
 	parameters: webSearchSchema,
 
+	approval: "read",
 	async execute(
 		toolCallId: string,
 		params: SearchToolParams,
 		_onUpdate,
-		_ctx: CustomToolContext,
+		ctx: CustomToolContext,
 		signal?: AbortSignal,
 	) {
-		return executeSearch(toolCallId, params, signal);
+		const authStorage = ctx.modelRegistry?.authStorage ?? (await discoverAuthStorage());
+		const sessionId = ctx.sessionManager.getSessionId();
+		return executeSearch(toolCallId, params, { authStorage, sessionId, signal });
 	},
 
 	renderCall(args: SearchToolParams, options: RenderResultOptions, theme: Theme) {
 		return renderSearchCall(args, options, theme);
 	},
 
-	renderResult(result, options: RenderResultOptions, theme: Theme) {
-		return renderSearchResult(result, options, theme);
+	renderResult(result, options: RenderResultOptions, theme: Theme, args) {
+		return renderSearchResult(result, options, theme, args);
 	},
 };
 
@@ -257,6 +315,6 @@ export function getSearchTools(): CustomTool<any, any>[] {
 	return [webSearchCustomTool];
 }
 
-export { getSearchProvider, setPreferredSearchProvider } from "./provider";
+export { getSearchProvider, setExcludedSearchProviders, setPreferredSearchProvider } from "./provider";
 export type { SearchProviderId as SearchProvider, SearchResponse } from "./types";
-export { isSearchProviderPreference } from "./types";
+export { isSearchProviderId, isSearchProviderPreference } from "./types";

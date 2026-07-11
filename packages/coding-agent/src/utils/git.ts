@@ -1,7 +1,8 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { $which, hasFsCode, isEnoent, Snowflake } from "@oh-my-pi/pi-utils";
+import { $which, hasFsCode, isEisdir, isEnoent, isEnotdir, Snowflake } from "@oh-my-pi/pi-utils";
+import type { Subprocess } from "bun";
 import {
 	parseDiffHunks as parseCommitDiffHunks,
 	parseFileDiffs,
@@ -27,6 +28,7 @@ export interface GitRepository {
 	gitEntryPath: string;
 	headPath: string;
 	repoRoot: string;
+	isReftable?: boolean;
 }
 
 export interface GitStatusSummary {
@@ -44,6 +46,10 @@ export interface StageHunksOptions {
 	readonly diffCached?: boolean;
 	readonly rawDiff?: string;
 	readonly signal?: AbortSignal;
+}
+export interface HunkSelectionValidationError {
+	readonly path: string;
+	readonly message: string;
 }
 
 export interface DiffOptions {
@@ -69,8 +75,20 @@ export interface StatusOptions {
 	readonly z?: boolean;
 }
 
+export interface CommitAuthor {
+	readonly date?: string;
+	readonly email: string;
+	readonly name: string;
+}
+
+export interface CommitDetails {
+	readonly author: CommitAuthor;
+	readonly message: string;
+}
+
 export interface CommitOptions {
 	readonly allowEmpty?: boolean;
+	readonly author?: CommitAuthor;
 	readonly files?: readonly string[];
 	readonly signal?: AbortSignal;
 }
@@ -86,6 +104,8 @@ export interface PatchOptions {
 	readonly cached?: boolean;
 	readonly check?: boolean;
 	readonly env?: Record<string, string | undefined>;
+	readonly reverse?: boolean;
+	readonly threeWay?: boolean;
 	readonly signal?: AbortSignal;
 }
 
@@ -97,10 +117,18 @@ export interface RestoreOptions {
 	readonly worktree?: boolean;
 }
 
+export interface FetchOptions {
+	readonly signal?: AbortSignal;
+	/** Deadline for the network transfer. Defaults to {@link GIT_NETWORK_TIMEOUT_MS}. */
+	readonly timeoutMs?: number;
+}
+
 export interface CloneOptions {
 	readonly ref?: string;
 	readonly sha?: string;
 	readonly signal?: AbortSignal;
+	/** Deadline for the network transfer. Defaults to {@link GIT_NETWORK_TIMEOUT_MS}. */
+	readonly timeoutMs?: number;
 }
 
 interface GitHeadBase extends GitRepository {
@@ -156,13 +184,185 @@ const SHORT_LIVED_GIT_CONFIG: readonly (readonly [key: string, value: string])[]
 	["core.fsmonitor", "false"],
 	["core.untrackedCache", "false"],
 ];
-const REMOTE_ALREADY_EXISTS = /remote .* already exists/i;
+const AMBIENT_GIT_ENV = {
+	GIT_DIR: undefined,
+	GIT_COMMON_DIR: undefined,
+	GIT_WORK_TREE: undefined,
+	GIT_INDEX_FILE: undefined,
+	GIT_OBJECT_DIRECTORY: undefined,
+	GIT_ALTERNATE_OBJECT_DIRECTORIES: undefined,
+} satisfies Record<string, undefined>;
+
+const GIT_NON_INTERACTIVE_ENV = {
+	GIT_ASKPASS: "true",
+	GIT_EDITOR: "true",
+	GIT_TERMINAL_PROMPT: "0",
+	SSH_ASKPASS: "/usr/bin/false",
+} satisfies Record<string, string>;
+const GH_NON_INTERACTIVE_ENV = {
+	...GIT_NON_INTERACTIVE_ENV,
+	GH_PROMPT_DISABLED: "1",
+} satisfies Record<string, string>;
+
+/** Default deadline for git and gh subprocesses spawned by the coding agent. */
+export const GIT_COMMAND_TIMEOUT_MS = 5 * 60 * 1000;
+/**
+ * Default deadline for git subprocesses that perform network transfers
+ * (`clone`/`fetch`). Large-repo transfers legitimately outlive
+ * {@link GIT_COMMAND_TIMEOUT_MS}, so they get a wider deadline; local plumbing
+ * commands keep the short one.
+ */
+export const GIT_NETWORK_TIMEOUT_MS = 30 * 60 * 1000;
+/** Maximum captured stdout or stderr bytes retained from git and gh subprocesses. */
+export const GIT_COMMAND_OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024;
+
+const GIT_COMMAND_TIMEOUT_EXIT_CODE = 124;
+const GIT_OUTPUT_TRUNCATED_MARKER = "\n[git subprocess output truncated after 8 MiB]\n";
+const GIT_COMMAND_TERMINATE_GRACE_MS = 5_000;
+
+type CommandName = "git" | "gh";
+
+function resolveTimeoutMs(timeoutMs: number | undefined, fallback: number = GIT_COMMAND_TIMEOUT_MS): number {
+	if (timeoutMs === undefined) return fallback;
+	if (!Number.isFinite(timeoutMs) || timeoutMs < 0) return fallback;
+	return Math.trunc(timeoutMs);
+}
+
+function resolveOutputLimit(maxOutputBytes: number | undefined): number {
+	if (maxOutputBytes === undefined) return GIT_COMMAND_OUTPUT_LIMIT_BYTES;
+	if (!Number.isFinite(maxOutputBytes) || maxOutputBytes < 0) return GIT_COMMAND_OUTPUT_LIMIT_BYTES;
+	return Math.trunc(maxOutputBytes);
+}
+
+function formatCommandLabel(command: CommandName, args: readonly string[]): string {
+	return `${command} ${args.join(" ")}`.trim();
+}
+
+async function waitForChildExit(child: Subprocess, timeoutMs: number): Promise<boolean> {
+	if (timeoutMs <= 0) return false;
+	const timeout = Promise.withResolvers<false>();
+	const timer = setTimeout(() => timeout.resolve(false), timeoutMs);
+	timer.unref?.();
+	try {
+		return await Promise.race([
+			child.exited.then(
+				() => true,
+				() => true,
+			),
+			timeout.promise,
+		]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+async function terminateTimedOutChild(child: Subprocess): Promise<void> {
+	child.kill("SIGTERM");
+	if (await waitForChildExit(child, GIT_COMMAND_TERMINATE_GRACE_MS)) return;
+	child.kill("SIGKILL");
+	await waitForChildExit(child, GIT_COMMAND_TERMINATE_GRACE_MS);
+}
+
+async function waitForExitWithTimeout(
+	child: Subprocess,
+	commandLabel: string,
+	timeoutMs: number,
+): Promise<{ exitCode: number | null; timedOut: false } | { timedOut: true; stderr: string }> {
+	if (timeoutMs === 0) {
+		await terminateTimedOutChild(child);
+		return { timedOut: true, stderr: `${commandLabel} timed out after 0ms` };
+	}
+	const timeout = Promise.withResolvers<"timeout">();
+	const timer = setTimeout(() => timeout.resolve("timeout"), timeoutMs);
+	timer.unref?.();
+	try {
+		const result = await Promise.race([
+			child.exited.then(exitCode => ({ kind: "exit" as const, exitCode })),
+			timeout.promise.then(() => ({ kind: "timeout" as const })),
+		]);
+		if (result.kind === "exit") {
+			return { timedOut: false, exitCode: result.exitCode };
+		}
+		await terminateTimedOutChild(child);
+		return { timedOut: true, stderr: `${commandLabel} timed out after ${timeoutMs}ms` };
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+async function readCappedText(stream: ReadableStream<Uint8Array>, maxBytes: number): Promise<string> {
+	const reader = stream.getReader();
+	const decoder = new TextDecoder();
+	const chunks: string[] = [];
+	let remaining = maxBytes;
+	let truncated = false;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			if (!truncated && value.length <= remaining) {
+				chunks.push(decoder.decode(value, { stream: true }));
+				remaining -= value.length;
+				continue;
+			}
+			if (!truncated && remaining > 0) {
+				chunks.push(decoder.decode(value.subarray(0, remaining), { stream: true }));
+				remaining = 0;
+			}
+			truncated = true;
+		}
+		chunks.push(decoder.decode());
+		if (truncated) chunks.push(GIT_OUTPUT_TRUNCATED_MARKER);
+		return chunks.join("");
+	} finally {
+		reader.releaseLock();
+	}
+}
+
+async function cancelOutput(stream: ReadableStream<Uint8Array>): Promise<void> {
+	try {
+		await stream.cancel();
+	} catch {
+		// Best-effort cleanup after a timeout; the subprocess has already been signaled.
+	}
+}
+
+async function collectSubprocessResult(
+	command: CommandName,
+	args: readonly string[],
+	child: Subprocess,
+	options: Pick<CommandOptions, "maxOutputBytes" | "timeoutMs"> = {},
+): Promise<GitCommandResult> {
+	const stdoutStream = child.stdout;
+	const stderrStream = child.stderr;
+	if (!(stdoutStream instanceof ReadableStream) || !(stderrStream instanceof ReadableStream)) {
+		throw new Error(`Failed to capture ${command} command output.`);
+	}
+	const maxOutputBytes = resolveOutputLimit(options.maxOutputBytes);
+	const stdoutPromise = readCappedText(stdoutStream, maxOutputBytes);
+	const stderrPromise = readCappedText(stderrStream, maxOutputBytes);
+	const exit = await waitForExitWithTimeout(
+		child,
+		formatCommandLabel(command, args),
+		resolveTimeoutMs(options.timeoutMs),
+	);
+	if (exit.timedOut) {
+		void stdoutPromise.catch(() => undefined);
+		void stderrPromise.catch(() => undefined);
+		await Promise.all([cancelOutput(stdoutStream), cancelOutput(stderrStream)]);
+		return { exitCode: GIT_COMMAND_TIMEOUT_EXIT_CODE, stdout: "", stderr: exit.stderr };
+	}
+	const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
+	return { exitCode: exit.exitCode ?? 0, stdout, stderr };
+}
 
 interface CommandOptions {
 	readonly env?: Record<string, string | undefined>;
+	readonly maxOutputBytes?: number;
 	readonly readOnly?: boolean;
 	readonly signal?: AbortSignal;
 	readonly stdin?: string | Uint8Array | ArrayBuffer | SharedArrayBuffer;
+	readonly timeoutMs?: number;
 }
 
 function normalizeStdin(input: CommandOptions["stdin"]): "ignore" | Uint8Array {
@@ -170,6 +370,16 @@ function normalizeStdin(input: CommandOptions["stdin"]): "ignore" | Uint8Array {
 	if (typeof input === "string") return new TextEncoder().encode(input);
 	if (input instanceof Uint8Array) return input;
 	return new Uint8Array(input);
+}
+
+function buildGitEnv(overrides?: Record<string, string | undefined>): Record<string, string | undefined> {
+	return {
+		...process.env,
+		GIT_OPTIONAL_LOCKS: "0",
+		...AMBIENT_GIT_ENV,
+		...overrides,
+		...GIT_NON_INTERACTIVE_ENV,
+	};
 }
 
 function ensureAvailable(): void {
@@ -189,15 +399,11 @@ function formatCommandFailure(
 	return `git ${args.join(" ")} failed with exit code ${result.exitCode}`;
 }
 
-async function runCommand(
-	cwd: string,
-	args: readonly string[],
-	options: CommandOptions = {},
-): Promise<GitCommandResult> {
+async function git(cwd: string, args: readonly string[], options: CommandOptions = {}): Promise<GitCommandResult> {
 	const commandArgs = withShortLivedGitConfig(options.readOnly ? withNoOptionalLocks(args) : [...args]);
 	const child = Bun.spawn(["git", ...commandArgs], {
 		cwd,
-		env: options.env ? { ...process.env, GIT_OPTIONAL_LOCKS: "0", ...options.env } : undefined,
+		env: buildGitEnv(options.env),
 		signal: options.signal,
 		stdin: normalizeStdin(options.stdin),
 		stdout: "pipe",
@@ -205,17 +411,7 @@ async function runCommand(
 		windowsHide: true,
 	});
 
-	if (!child.stdout || !child.stderr) {
-		throw new Error("Failed to capture git command output.");
-	}
-
-	const [stdout, stderr, exitCode] = await Promise.all([
-		new Response(child.stdout).text(),
-		new Response(child.stderr).text(),
-		child.exited,
-	]);
-
-	return { exitCode: exitCode ?? 0, stdout, stderr };
+	return await collectSubprocessResult("git", commandArgs, child, options);
 }
 
 function withNoOptionalLocks(args: readonly string[]): string[] {
@@ -248,7 +444,7 @@ async function runChecked(
 	options: CommandOptions = {},
 ): Promise<GitCommandResult> {
 	ensureAvailable();
-	const result = await runCommand(cwd, args, options);
+	const result = await git(cwd, args, options);
 	if (result.exitCode !== 0) {
 		throw new GitCommandError(args, result);
 	}
@@ -269,7 +465,7 @@ async function tryText(
 	options: CommandOptions = {},
 ): Promise<string | undefined> {
 	ensureAvailable();
-	const result = await runCommand(cwd, args, options);
+	const result = await git(cwd, args, options);
 	if (result.exitCode !== 0) return undefined;
 	return result.stdout;
 }
@@ -358,6 +554,8 @@ function buildApplyArgs(patchPath: string, options: PatchOptions): string[] {
 	const args = ["apply"];
 	if (options.check) args.push("--check");
 	if (options.cached) args.push("--cached");
+	if (options.reverse) args.push("--reverse");
+	if (options.threeWay) args.push("--3way");
 	args.push("--binary", patchPath);
 	return args;
 }
@@ -375,7 +573,8 @@ async function writeTempPatch(content: string): Promise<string> {
 type EntryType = "directory" | "file";
 
 function shouldRetry(err: unknown, n: number) {
-	if (isEnoent(err) || hasFsCode(err, "ENFILE") || hasFsCode(err, "EMFILE")) return false;
+	if (isEnoent(err) || isEisdir(err) || isEnotdir(err) || hasFsCode(err, "ENFILE") || hasFsCode(err, "EMFILE"))
+		return false;
 	if (hasFsCode(err, "EINTR")) return n < EINTR_MAX_RETRIES;
 	if (n > EINTR_MAX_RETRIES) throw err;
 	throw err;
@@ -476,6 +675,31 @@ async function resolveCommonDir(gitDir: string): Promise<string> {
 	if (!relative) return gitDir;
 	return path.resolve(gitDir, relative);
 }
+function isLinkedWorktree(repository: GitRepository): boolean {
+	return (
+		repository.gitDir !== repository.commonDir &&
+		getEntryTypeSync(path.join(repository.gitDir, "commondir")) === "file"
+	);
+}
+
+async function isLinkedWorktreeAsync(repository: GitRepository): Promise<boolean> {
+	return (
+		repository.gitDir !== repository.commonDir &&
+		(await getEntryType(path.join(repository.gitDir, "commondir"))) === "file"
+	);
+}
+
+function primaryRootFromRepositorySync(repository: GitRepository): string {
+	if (path.basename(repository.commonDir) === ".git") return path.dirname(repository.commonDir);
+	if (isLinkedWorktree(repository)) return repository.commonDir;
+	return repository.repoRoot;
+}
+
+async function primaryRootFromRepository(repository: GitRepository): Promise<string> {
+	if (path.basename(repository.commonDir) === ".git") return path.dirname(repository.commonDir);
+	if (await isLinkedWorktreeAsync(repository)) return repository.commonDir;
+	return repository.repoRoot;
+}
 
 function resolveRepoFromEntrySync(repoRoot: string, gitEntryPath: string, entryType: EntryType): GitRepository | null {
 	const gitDir = resolveGitDirSync(gitEntryPath, entryType);
@@ -560,7 +784,178 @@ function parsePackedRefs(content: string | null, targetRef: string): string | nu
 	return null;
 }
 
+function stripGitConfigComments(line: string): string {
+	let clean = "";
+	let inQuotes = false;
+	for (let i = 0; i < line.length; i++) {
+		const char = line[i];
+		if (char === '"') {
+			inQuotes = !inQuotes;
+			clean += char;
+		} else if (!inQuotes && (char === ";" || char === "#")) {
+			break;
+		} else {
+			clean += char;
+		}
+	}
+	return clean.trim();
+}
+
+function parseGitConfigHasReftable(content: string): boolean {
+	let inExtensions = false;
+	for (const line of content.split("\n")) {
+		const trimmed = stripGitConfigComments(line);
+		if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+			const section = trimmed.slice(1, -1).trim().toLowerCase();
+			inExtensions = section === "extensions";
+		} else if (inExtensions) {
+			const eqIndex = trimmed.indexOf("=");
+			if (eqIndex !== -1) {
+				const key = trimmed.slice(0, eqIndex).trim().toLowerCase();
+				let value = trimmed.slice(eqIndex + 1).trim();
+				if (key === "refstorage") {
+					if (value.startsWith('"') && value.endsWith('"')) {
+						value = value.slice(1, -1).trim();
+					}
+					const lowerValue = value.toLowerCase();
+					if (lowerValue === "reftable" || lowerValue.startsWith("reftable:")) {
+						return true;
+					}
+				}
+			}
+		}
+	}
+	return false;
+}
+
+function isReftableRepoSync(repository: GitRepository): boolean {
+	if (repository.isReftable !== undefined) return repository.isReftable;
+	const configPath = path.join(repository.commonDir, "config");
+	const content = readOptionalTextSync(configPath);
+	repository.isReftable = content ? parseGitConfigHasReftable(content) : false;
+	return repository.isReftable;
+}
+
+async function isReftableRepo(repository: GitRepository): Promise<boolean> {
+	if (repository.isReftable !== undefined) return repository.isReftable;
+	const configPath = path.join(repository.commonDir, "config");
+	const content = await readOptionalText(configPath);
+	repository.isReftable = content ? parseGitConfigHasReftable(content) : false;
+	return repository.isReftable;
+}
+
+async function resolveHeadStateReftable(repository: GitRepository, signal?: AbortSignal): Promise<GitHeadState | null> {
+	throwIfAborted(signal);
+	const symResult = await git(repository.repoRoot, ["symbolic-ref", "HEAD"], { readOnly: true, signal }).catch(err => {
+		if (signal?.aborted || (err instanceof Error && (err.name === "AbortError" || err.name === "ToolAbortError"))) {
+			throw err;
+		}
+		return null;
+	});
+	throwIfAborted(signal);
+	const revResult = await git(repository.repoRoot, ["rev-parse", "--verify", "HEAD"], {
+		readOnly: true,
+		signal,
+	}).catch(err => {
+		if (signal?.aborted || (err instanceof Error && (err.name === "AbortError" || err.name === "ToolAbortError"))) {
+			throw err;
+		}
+		return null;
+	});
+	const commit = revResult && revResult.exitCode === 0 ? revResult.stdout.trim() || null : null;
+
+	if (symResult && symResult.exitCode === 0) {
+		const ref = symResult.stdout.trim();
+		const branchName = ref.startsWith(LOCAL_BRANCH_PREFIX) ? ref.slice(LOCAL_BRANCH_PREFIX.length) : null;
+		return {
+			...repository,
+			kind: "ref",
+			ref,
+			branchName,
+			commit,
+			headContent: `${HEAD_REF_PREFIX} ${ref}`,
+		};
+	}
+
+	return {
+		...repository,
+		kind: "detached",
+		commit,
+		headContent: commit || "",
+	};
+}
+
+function resolveHeadStateReftableSync(repository: GitRepository): GitHeadState | null {
+	ensureAvailable();
+	const symArgs = withShortLivedGitConfig(withNoOptionalLocks(["symbolic-ref", "HEAD"]));
+	const symResult = Bun.spawnSync(["git", ...symArgs], {
+		cwd: repository.repoRoot,
+		env: buildGitEnv(),
+		stdout: "pipe",
+		stderr: "pipe",
+		windowsHide: true,
+	});
+
+	const revArgs = withShortLivedGitConfig(withNoOptionalLocks(["rev-parse", "--verify", "HEAD"]));
+	const revResult = Bun.spawnSync(["git", ...revArgs], {
+		cwd: repository.repoRoot,
+		env: buildGitEnv(),
+		stdout: "pipe",
+		stderr: "pipe",
+		windowsHide: true,
+	});
+	const commit = revResult.exitCode === 0 ? new TextDecoder().decode(revResult.stdout).trim() || null : null;
+
+	if (symResult.exitCode === 0) {
+		const ref = new TextDecoder().decode(symResult.stdout).trim();
+		const branchName = ref.startsWith(LOCAL_BRANCH_PREFIX) ? ref.slice(LOCAL_BRANCH_PREFIX.length) : null;
+		return {
+			...repository,
+			kind: "ref",
+			ref,
+			branchName,
+			commit,
+			headContent: `${HEAD_REF_PREFIX} ${ref}`,
+		};
+	}
+
+	return {
+		...repository,
+		kind: "detached",
+		commit,
+		headContent: commit || "",
+	};
+}
+
 function readRefSync(repository: GitRepository, targetRef: string): string | null {
+	if (isReftableRepoSync(repository)) {
+		ensureAvailable();
+		const symArgs = withShortLivedGitConfig(withNoOptionalLocks(["symbolic-ref", targetRef]));
+		const symResult = Bun.spawnSync(["git", ...symArgs], {
+			cwd: repository.repoRoot,
+			env: buildGitEnv(),
+			stdout: "pipe",
+			stderr: "pipe",
+			windowsHide: true,
+		});
+		if (symResult.exitCode === 0) {
+			const stdoutText = new TextDecoder().decode(symResult.stdout).trim();
+			return `${HEAD_REF_PREFIX} ${stdoutText}`;
+		}
+		const revArgs = withShortLivedGitConfig(withNoOptionalLocks(["rev-parse", "--verify", targetRef]));
+		const revResult = Bun.spawnSync(["git", ...revArgs], {
+			cwd: repository.repoRoot,
+			env: buildGitEnv(),
+			stdout: "pipe",
+			stderr: "pipe",
+			windowsHide: true,
+		});
+		if (revResult.exitCode === 0) {
+			return new TextDecoder().decode(revResult.stdout).trim() || null;
+		}
+		return null;
+	}
+
 	for (const dir of getRefLookupDirs(repository)) {
 		const value = normalizeRefValue(readOptionalTextSync(path.join(dir, targetRef)));
 		if (value) return value;
@@ -572,7 +967,42 @@ function readRefSync(repository: GitRepository, targetRef: string): string | nul
 	return null;
 }
 
-async function readRef(repository: GitRepository, targetRef: string): Promise<string | null> {
+async function readRef(repository: GitRepository, targetRef: string, signal?: AbortSignal): Promise<string | null> {
+	if (await isReftableRepo(repository)) {
+		throwIfAborted(signal);
+		const symResult = await git(repository.repoRoot, ["symbolic-ref", targetRef], { readOnly: true, signal }).catch(
+			err => {
+				if (
+					signal?.aborted ||
+					(err instanceof Error && (err.name === "AbortError" || err.name === "ToolAbortError"))
+				) {
+					throw err;
+				}
+				return null;
+			},
+		);
+		if (symResult && symResult.exitCode === 0) {
+			return `${HEAD_REF_PREFIX} ${symResult.stdout.trim()}`;
+		}
+		throwIfAborted(signal);
+		const revResult = await git(repository.repoRoot, ["rev-parse", "--verify", targetRef], {
+			readOnly: true,
+			signal,
+		}).catch(err => {
+			if (
+				signal?.aborted ||
+				(err instanceof Error && (err.name === "AbortError" || err.name === "ToolAbortError"))
+			) {
+				throw err;
+			}
+			return null;
+		});
+		if (revResult && revResult.exitCode === 0) {
+			return revResult.stdout.trim() || null;
+		}
+		return null;
+	}
+
 	for (const dir of getRefLookupDirs(repository)) {
 		const value = normalizeRefValue(await readOptionalText(path.join(dir, targetRef)));
 		if (value) return value;
@@ -682,6 +1112,43 @@ function selectHunks(file: FileHunks, selector: HunkSelection["hunks"]): FileHun
 	return file.hunks;
 }
 
+export function createHunkSelectionValidator(
+	rawDiff: string,
+): (selections: readonly HunkSelection[]) => HunkSelectionValidationError[] {
+	const fileDiffMap = new Map(parseFileDiffs(rawDiff).map(entry => [entry.filename, entry]));
+	return selections => validateHunkSelectionsFromMap(fileDiffMap, selections);
+}
+
+function validateHunkSelectionsFromMap(
+	fileDiffMap: ReadonlyMap<string, FileDiff>,
+	selections: readonly HunkSelection[],
+): HunkSelectionValidationError[] {
+	const errors: HunkSelectionValidationError[] = [];
+
+	for (const selection of selections) {
+		const fileDiff = fileDiffMap.get(selection.path);
+		if (!fileDiff) continue;
+		if (selection.hunks.type === "all") continue;
+		if (fileDiff.isBinary) {
+			errors.push({ path: selection.path, message: `Cannot select hunks for binary file ${selection.path}` });
+			continue;
+		}
+		const selected = selectHunks(parseFileHunks(fileDiff), selection.hunks);
+		if (selected.length === 0) {
+			errors.push({ path: selection.path, message: `No hunks selected for ${selection.path}` });
+		}
+	}
+
+	return errors;
+}
+
+export function validateHunkSelections(
+	rawDiff: string,
+	selections: readonly HunkSelection[],
+): HunkSelectionValidationError[] {
+	return createHunkSelectionValidator(rawDiff)(selections);
+}
+
 function parseStatusPorcelain(text: string): GitStatusSummary {
 	let staged = 0;
 	let unstaged = 0;
@@ -709,7 +1176,7 @@ export const diff = Object.assign(
 	async function diff(cwd: string, options: DiffOptions = {}): Promise<string> {
 		const args = buildDiffArgs(options);
 		if (options.allowFailure) {
-			return (await runCommand(cwd, args, { env: options.env, readOnly: true, signal: options.signal })).stdout;
+			return (await git(cwd, args, { env: options.env, readOnly: true, signal: options.signal })).stdout;
 		}
 		return runText(cwd, args, { env: options.env, readOnly: true, signal: options.signal });
 	},
@@ -741,7 +1208,7 @@ export const diff = Object.assign(
 			if (options.cached) args.push("--cached");
 			args.push("--quiet");
 			if (options.files?.length) args.push("--", ...options.files);
-			const result = await runCommand(cwd, args, { readOnly: true, signal: options.signal });
+			const result = await git(cwd, args, { readOnly: true, signal: options.signal });
 			if (result.exitCode === 0) return false;
 			if (result.exitCode === 1) return true;
 			throw new GitCommandError(args, result);
@@ -757,7 +1224,7 @@ export const diff = Object.assign(
 			if (options.binary) args.push("--binary");
 			args.push(base, headRef);
 			if (options.allowFailure) {
-				return (await runCommand(cwd, args, { readOnly: true, signal: options.signal })).stdout;
+				return (await git(cwd, args, { readOnly: true, signal: options.signal })).stdout;
 			}
 			return runText(cwd, args, { readOnly: true, signal: options.signal });
 		},
@@ -789,7 +1256,7 @@ export const status = Object.assign(
 	{
 		/** Parsed status counts (staged, unstaged, untracked). */
 		async summary(cwd: string, signal?: AbortSignal): Promise<GitStatusSummary | null> {
-			const result = await runCommand(cwd, ["status", "--porcelain"], { readOnly: true, signal });
+			const result = await git(cwd, ["status", "--porcelain"], { readOnly: true, signal });
 			if (result.exitCode !== 0) return null;
 			return parseStatusPorcelain(result.stdout);
 		},
@@ -856,14 +1323,23 @@ export const stage = {
 /** Create a commit with the given message (passed via stdin). */
 export async function commit(cwd: string, message: string, options: CommitOptions = {}): Promise<GitCommandResult> {
 	const args = ["commit", "-F", "-"];
+	if (options.author) {
+		args.push(`--author=${options.author.name} <${options.author.email}>`);
+		if (options.author.date) args.push(`--date=${options.author.date}`);
+	}
 	if (options.allowEmpty) args.push("--allow-empty");
 	if (options.files?.length) args.push("--", ...options.files);
 	return runChecked(cwd, args, { signal: options.signal, stdin: message });
 }
 
-/** Push the current branch. */
+/** Push the current branch (branch-scoped: never follows tags). */
 export async function push(cwd: string, options: PushOptions = {}): Promise<void> {
-	const args = ["push"];
+	// `--no-follow-tags` overrides a user's `push.followTags = true`, which
+	// would otherwise ride every reachable annotated tag along with the
+	// branch — rejected refs ("permission denied") on remotes the user
+	// cannot tag (e.g. PR-head forks), failing the call after the branch
+	// itself already updated. Tool pushes push exactly the named refspec.
+	const args = ["push", "--no-follow-tags"];
 	if (options.forceWithLease) args.push("--force-with-lease");
 	if (options.remote) args.push(options.remote);
 	if (options.refspec) args.push(options.refspec);
@@ -875,15 +1351,18 @@ export async function checkout(cwd: string, ref: string, signal?: AbortSignal): 
 	await runEffect(cwd, ["checkout", ref], { signal });
 }
 
-/** Fetch a specific refspec from a remote. */
+/** Fetch a specific refspec from a remote. Network transfer: defaults to the {@link GIT_NETWORK_TIMEOUT_MS} deadline. */
 export async function fetch(
 	cwd: string,
 	remote: string,
 	source: string,
 	target: string,
-	signal?: AbortSignal,
+	options: FetchOptions = {},
 ): Promise<void> {
-	await runEffect(cwd, ["fetch", remote, `+${source}:${target}`], { signal });
+	await runEffect(cwd, ["fetch", remote, `+${source}:${target}`], {
+		signal: options.signal,
+		timeoutMs: resolveTimeoutMs(options.timeoutMs, GIT_NETWORK_TIMEOUT_MS),
+	});
 }
 
 /** Read a tree-ish into the index. */
@@ -924,6 +1403,19 @@ export const show = Object.assign(
 	},
 );
 
+/** Read commit message and author metadata for replay/rewrite flows. */
+export async function commitDetails(cwd: string, revision: string, signal?: AbortSignal): Promise<CommitDetails> {
+	const raw = await runText(cwd, ["show", "-s", "--format=%an%x00%ae%x00%aI%x00%B", revision], {
+		readOnly: true,
+		signal,
+	});
+	const [name = "", email = "", date = "", ...messageParts] = raw.split("\0");
+	return {
+		author: { date, email, name },
+		message: messageParts.join("\0").replace(/\n$/, ""),
+	};
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // API: log
 // ════════════════════════════════════════════════════════════════════════════
@@ -941,6 +1433,13 @@ export const log = {
 	},
 };
 
+export const revList = {
+	/** Commits in `base..head`, oldest first. */
+	async range(cwd: string, base: string, head: string, signal?: AbortSignal): Promise<string[]> {
+		return splitLines(await runText(cwd, ["rev-list", "--reverse", `${base}..${head}`], { readOnly: true, signal }));
+	},
+};
+
 // ════════════════════════════════════════════════════════════════════════════
 // API: branch
 // ════════════════════════════════════════════════════════════════════════════
@@ -950,7 +1449,7 @@ export const branch = {
 	async current(cwd: string, signal?: AbortSignal): Promise<string | null> {
 		const headState = await resolveHead(cwd);
 		if (headState?.kind === "ref") return headState.branchName ?? headState.ref;
-		const result = await runCommand(cwd, ["symbolic-ref", "--short", "HEAD"], { readOnly: true, signal });
+		const result = await git(cwd, ["symbolic-ref", "--short", "HEAD"], { readOnly: true, signal });
 		if (result.exitCode !== 0) return null;
 		return result.stdout.trim() || null;
 	},
@@ -960,13 +1459,13 @@ export const branch = {
 		const repository = await resolveRepository(cwd);
 		if (repository) {
 			for (const refPath of DEFAULT_BRANCH_REFS) {
-				const target = await readRef(repository, refPath);
+				const target = await readRef(repository, refPath, signal);
 				const branchName = parseDefaultBranchRef(refPath, target);
 				if (branchName) return branchName;
 			}
 		}
 		for (const remoteRef of ["origin/HEAD", "upstream/HEAD"]) {
-			const result = await runCommand(cwd, ["rev-parse", "--abbrev-ref", remoteRef], { readOnly: true, signal });
+			const result = await git(cwd, ["rev-parse", "--abbrev-ref", remoteRef], { readOnly: true, signal });
 			if (result.exitCode !== 0) continue;
 			const branchName = stripRemotePrefix(result.stdout.trim());
 			if (branchName) return branchName;
@@ -995,7 +1494,7 @@ export const branch = {
 		name: string,
 		options: { force?: boolean; signal?: AbortSignal } = {},
 	): Promise<boolean> {
-		const result = await runCommand(cwd, ["branch", options.force === false ? "-d" : "-D", name], {
+		const result = await git(cwd, ["branch", options.force === false ? "-d" : "-D", name], {
 			signal: options.signal,
 		});
 		return result.exitCode === 0;
@@ -1038,12 +1537,12 @@ export const remote = {
 	 * needs to resolve, not paper over.
 	 */
 	async add(cwd: string, name: string, url: string, signal?: AbortSignal): Promise<void> {
-		const result = await runCommand(cwd, ["remote", "add", name, url], { signal });
+		const result = await git(cwd, ["remote", "add", name, url], { signal });
 		if (result.exitCode === 0) return;
-		if (REMOTE_ALREADY_EXISTS.test(result.stderr)) {
-			const existing = await remote.url(cwd, name, signal);
+		const existing = await remote.url(cwd, name, signal);
+		if (existing !== undefined) {
 			if (existing === url) return;
-			throw new ToolError(`remote ${name} already exists with URL ${existing ?? "(unset)"}, expected ${url}`);
+			throw new ToolError(`remote ${name} already exists with URL ${existing}, expected ${url}`);
 		}
 		throw new GitCommandError(["remote", "add", name, url], result);
 	},
@@ -1058,8 +1557,8 @@ export const ref = {
 	async exists(cwd: string, refName: string, signal?: AbortSignal): Promise<boolean> {
 		if (refName === "HEAD") return (await head.sha(cwd, signal)) !== null;
 		const repository = await resolveRepository(cwd);
-		if (repository && refName.startsWith("refs/")) return (await readRef(repository, refName)) !== null;
-		const result = await runCommand(cwd, ["show-ref", "--verify", "--quiet", refName], { readOnly: true, signal });
+		if (repository && refName.startsWith("refs/")) return (await readRef(repository, refName, signal)) !== null;
+		const result = await git(cwd, ["show-ref", "--verify", "--quiet", refName], { readOnly: true, signal });
 		return result.exitCode === 0;
 	},
 
@@ -1067,8 +1566,8 @@ export const ref = {
 	async resolve(cwd: string, refName: string, signal?: AbortSignal): Promise<string | null> {
 		if (refName === "HEAD") return head.sha(cwd, signal);
 		const repository = await resolveRepository(cwd);
-		if (repository && refName.startsWith("refs/")) return readRef(repository, refName);
-		const result = await runCommand(cwd, ["rev-parse", refName], { readOnly: true, signal });
+		if (repository && refName.startsWith("refs/")) return readRef(repository, refName, signal);
+		const result = await git(cwd, ["rev-parse", refName], { readOnly: true, signal });
 		if (result.exitCode !== 0) return null;
 		return result.stdout.trim() || null;
 	},
@@ -1150,7 +1649,7 @@ export const worktree = {
 		const args = ["worktree", "remove"];
 		if (options.force ?? true) args.push("-f");
 		args.push(worktreePath);
-		const result = await runCommand(cwd, args, { signal: options.signal });
+		const result = await git(cwd, args, { signal: options.signal });
 		return result.exitCode === 0;
 	},
 
@@ -1186,7 +1685,7 @@ export const patch = {
 
 	/** Check if a patch file can be applied cleanly. */
 	async canApply(cwd: string, patchPath: string, options: Omit<PatchOptions, "check"> = {}): Promise<boolean> {
-		const result = await runCommand(cwd, buildApplyArgs(patchPath, { ...options, check: true }), {
+		const result = await git(cwd, buildApplyArgs(patchPath, { ...options, check: true }), {
 			env: options.env,
 			readOnly: true,
 			signal: options.signal,
@@ -1226,6 +1725,26 @@ export const cherryPick = Object.assign(
 		async abort(cwd: string, signal?: AbortSignal): Promise<void> {
 			await runEffect(cwd, ["cherry-pick", "--abort"], { signal });
 		},
+		/**
+		 * Skip the current commit of an in-progress cherry-pick sequence and
+		 * continue with the rest of the range. Use after {@link isEmptyError}
+		 * reports the current attempt collapsed to a no-op — the alternative,
+		 * `--abort`, throws away every remaining commit in the range.
+		 */
+		async skip(cwd: string, signal?: AbortSignal): Promise<void> {
+			await runEffect(cwd, ["cherry-pick", "--skip"], { signal });
+		},
+		/**
+		 * True when a cherry-pick failure was caused by the current commit
+		 * being empty against HEAD — either redundant with an already-applied
+		 * change, or auto-resolved to HEAD by a 3-way merge. Callers should
+		 * `--skip` in this case to advance the sequencer rather than aborting
+		 * the whole range: an empty commit is not a merge conflict, and any
+		 * later commits in the range still deserve to land.
+		 */
+		isEmptyError(err: unknown): boolean {
+			return err instanceof GitCommandError && /the previous cherry-pick is now empty/i.test(err.result.stderr);
+		},
 	},
 );
 
@@ -1250,6 +1769,69 @@ export const stash = {
 		if (options?.index) args.push("--index");
 		await runEffect(cwd, args);
 	},
+	/**
+	 * Return the working-tree patch that `stash@{0}` would apply, in a form
+	 * that `git apply --check` can consume. Empty string when no stash entry
+	 * exists or the stash contains no diffable working-tree changes.
+	 */
+	async showPatch(cwd: string): Promise<string> {
+		return (await tryText(cwd, ["stash", "show", "-p", "--binary", "stash@{0}"], { readOnly: true })) ?? "";
+	},
+	/** Return untracked paths stored in the top stash entry. */
+	async untrackedFiles(cwd: string): Promise<string[]> {
+		const output = await tryText(cwd, ["ls-tree", "-r", "-z", "--name-only", "stash@{0}^3"], { readOnly: true });
+		return output?.split("\0").filter(Boolean) ?? [];
+	},
+	/**
+	 * Attempt to restore the top stash entry. On success returns `true` and
+	 * git drops the stash entry. On conflict returns `false`, leaves the stash
+	 * entry preserved for manual resolution, and guarantees the failed restore
+	 * leaves no unmerged index entries or partially-restored untracked files.
+	 *
+	 * The historical raw `pop` catches the failure in a `finally` block and
+	 * only logs — it leaves `.git/index` with stage 1/2/3 unmerged entries
+	 * that survive indefinitely, corrupting every subsequent overlay-isolated
+	 * task that reads through this repo's `.git/`. See issue #4175.
+	 */
+	async tryPop(cwd: string, options?: { index?: boolean }): Promise<boolean> {
+		// Preflight: `git stash pop` internally does a 3-way merge, so a plain
+		// `git apply --check` is too strict — it rejects hunks whose context
+		// drifted from HEAD even when 3-way merge would resolve them cleanly.
+		// Match pop's semantics with `--3way --check`, which succeeds iff the
+		// patch either applies directly or merges without conflict against
+		// the patch's `index abc..def` base blobs.
+		const workingPatch = await stash.showPatch(cwd);
+		if (workingPatch.trim() && !(await patch.canApplyText(cwd, workingPatch, { threeWay: true }))) {
+			return false;
+		}
+		const restoredUntracked = await stash.untrackedFiles(cwd);
+		try {
+			await stash.pop(cwd, options);
+			return true;
+		} catch {
+			// Preflight can still miss mode-only or delete/modify conflicts. If
+			// the pop left unmerged entries, wipe them: HEAD holds the merged
+			// state so `reset --hard HEAD` restores a clean index and working
+			// tree without losing the cherry-picked commits. A failed pop can
+			// still restore unrelated untracked files before exiting while
+			// preserving the stash entry, so clean only the untracked paths
+			// recorded in that stash. The user's WIP remains recoverable via
+			// `git stash pop`.
+			try {
+				await reset(cwd, { hard: true });
+			} catch {
+				/* best-effort cleanup — do not mask the primary conflict */
+			}
+			if (restoredUntracked.length > 0) {
+				try {
+					await clean(cwd, { includeIgnored: true, literalPathspecs: true, paths: restoredUntracked });
+				} catch {
+					/* best-effort cleanup — do not mask the primary conflict */
+				}
+			}
+			return false;
+		}
+	},
 };
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1261,19 +1843,28 @@ export async function clone(url: string, targetDir: string, options: CloneOption
 	const absoluteTarget = path.resolve(targetDir);
 	await fs.promises.mkdir(path.dirname(absoluteTarget), { recursive: true });
 
-	const args = ["clone", "--depth", "1"];
+	// `git clone --depth 1 --single-branch` only fetches the tip of the target
+	// branch, so any subsequent `git checkout <sha>` for a non-tip commit fails
+	// with "reference is not a tree". When the caller pinned a specific SHA we
+	// fall back to a full clone so the object is guaranteed to be present.
+	const shallow = !options.sha;
+	const args = ["clone"];
+	if (shallow) args.push("--depth", "1");
 	if (options.ref) args.push("--branch", options.ref, "--single-branch");
-	else args.push("--single-branch");
+	else if (shallow) args.push("--single-branch");
 	args.push(url, absoluteTarget);
 
 	try {
-		await runEffect(path.dirname(absoluteTarget), args, { signal: options.signal });
+		await runEffect(path.dirname(absoluteTarget), args, {
+			signal: options.signal,
+			timeoutMs: resolveTimeoutMs(options.timeoutMs, GIT_NETWORK_TIMEOUT_MS),
+		});
 		if (options.sha) {
 			try {
 				await checkout(absoluteTarget, options.sha, options.signal);
 			} catch {
 				await fs.promises.rm(absoluteTarget, { force: true, recursive: true });
-				throw new Error(`Failed to checkout SHA ${options.sha} - shallow clone may not contain this commit`);
+				throw new Error(`Failed to checkout SHA ${options.sha} in cloned repository ${url}`);
 			}
 		}
 	} catch (err) {
@@ -1310,9 +1901,18 @@ export async function reset(
 
 export async function clean(
 	cwd: string,
-	options: { ignoredOnly?: boolean; paths?: readonly string[]; signal?: AbortSignal } = {},
+	options: {
+		ignoredOnly?: boolean;
+		includeIgnored?: boolean;
+		literalPathspecs?: boolean;
+		paths?: readonly string[];
+		signal?: AbortSignal;
+	} = {},
 ): Promise<void> {
-	const args = ["clean", options.ignoredOnly ? "-fdX" : "-fd"];
+	const args = [options.literalPathspecs ? "--literal-pathspecs" : undefined, "clean"].filter(
+		(arg): arg is string => arg !== undefined,
+	);
+	args.push(options.ignoredOnly ? "-fdX" : options.includeIgnored ? "-fdx" : "-fd");
 	if (options.paths?.length) args.push("--", ...options.paths);
 	await runEffect(cwd, args, { signal: options.signal });
 }
@@ -1338,9 +1938,17 @@ export const ls = {
 		return ls.files(cwd, { others: true, excludeStandard: true, signal });
 	},
 
+	/** List paths present in a ref, optionally filtered to specific paths. */
+	async tree(cwd: string, ref: string, files: readonly string[] = [], signal?: AbortSignal): Promise<string[]> {
+		const args = ["ls-tree", "--name-only", "-r", "-z", ref];
+		if (files.length > 0) args.push("--", ...files);
+		const raw = await runText(cwd, args, { readOnly: true, signal });
+		return raw.split("\0").filter(entry => entry.length > 0);
+	},
+
 	/** List submodule paths (recursive). */
 	async submodules(cwd: string, signal?: AbortSignal): Promise<string[]> {
-		const output = await runCommand(cwd, ["submodule", "--quiet", "foreach", "--recursive", "echo $sm_path"], {
+		const output = await git(cwd, ["submodule", "--quiet", "foreach", "--recursive", "echo $sm_path"], {
 			readOnly: true,
 			signal,
 		});
@@ -1354,9 +1962,12 @@ export const ls = {
 
 export const head = {
 	/** Full HEAD state (branch, commit, repo info). */
-	async resolve(cwd: string): Promise<GitHeadState | null> {
+	async resolve(cwd: string, signal?: AbortSignal): Promise<GitHeadState | null> {
 		const repository = await resolveRepository(cwd);
 		if (!repository) return null;
+		if (await isReftableRepo(repository)) {
+			return resolveHeadStateReftable(repository, signal);
+		}
 		const content = await readOptionalText(repository.headPath);
 		if (content === null) return null;
 		return parseHeadState(repository, content);
@@ -1366,6 +1977,9 @@ export const head = {
 	resolveSync(cwd: string): GitHeadState | null {
 		const repository = resolveRepositorySync(cwd);
 		if (!repository) return null;
+		if (isReftableRepoSync(repository)) {
+			return resolveHeadStateReftableSync(repository);
+		}
 		const content = readOptionalTextSync(repository.headPath);
 		if (content === null) return null;
 		return parseHeadStateSync(repository, content);
@@ -1373,16 +1987,16 @@ export const head = {
 
 	/** Current HEAD commit SHA. */
 	async sha(cwd: string, signal?: AbortSignal): Promise<string | null> {
-		const headState = await head.resolve(cwd);
+		const headState = await head.resolve(cwd, signal);
 		if (headState?.commit) return headState.commit;
-		const result = await runCommand(cwd, ["rev-parse", "HEAD"], { readOnly: true, signal });
+		const result = await git(cwd, ["rev-parse", "HEAD"], { readOnly: true, signal });
 		if (result.exitCode !== 0) return null;
 		return result.stdout.trim() || null;
 	},
 
 	/** Abbreviated HEAD commit SHA. */
 	async short(cwd: string, length = 7, signal?: AbortSignal): Promise<string | null> {
-		const result = await runCommand(cwd, ["rev-parse", `--short=${length}`, "HEAD"], { readOnly: true, signal });
+		const result = await git(cwd, ["rev-parse", `--short=${length}`, "HEAD"], { readOnly: true, signal });
 		if (result.exitCode !== 0) return null;
 		return result.stdout.trim() || null;
 	},
@@ -1397,18 +2011,15 @@ export const repo = {
 	async root(cwd: string, signal?: AbortSignal): Promise<string | null> {
 		const repository = await resolveRepository(cwd);
 		if (repository) return repository.repoRoot;
-		const result = await runCommand(cwd, ["rev-parse", "--show-toplevel"], { readOnly: true, signal });
+		const result = await git(cwd, ["rev-parse", "--show-toplevel"], { readOnly: true, signal });
 		if (result.exitCode !== 0) return null;
 		return result.stdout.trim() || null;
 	},
 
-	/** Resolve the primary repository root (not a worktree — the main checkout). */
+	/** Resolve the primary checkout root, or the shared common dir for bare-repo worktrees. */
 	async primaryRoot(cwd: string, signal?: AbortSignal): Promise<string | null> {
 		const repository = await resolveRepository(cwd);
-		if (repository) {
-			if (path.basename(repository.commonDir) === ".git") return path.dirname(repository.commonDir);
-			return repository.repoRoot;
-		}
+		if (repository) return primaryRootFromRepository(repository);
 		const repoRoot = await repo.root(cwd, signal);
 		if (!repoRoot) return null;
 		const commonDir = await runText(repoRoot, ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
@@ -1417,6 +2028,32 @@ export const repo = {
 		});
 		if (path.basename(commonDir.trim()) === ".git") return path.dirname(commonDir.trim());
 		return repoRoot;
+	},
+
+	/**
+	 * Sync sibling of {@link primaryRoot}. Resolves only via on-disk `.git`/
+	 * `commondir` walking — no subprocess fallback — so it stays usable from
+	 * paths where async I/O is impractical (e.g. `computeBankScope`). Returns
+	 * `null` when `cwd` is outside a repository. Bare-repo worktrees resolve to
+	 * the shared common dir (`foo.git`) because they have no primary checkout.
+	 */
+	primaryRootSync(cwd: string): string | null {
+		const repository = resolveRepositorySync(cwd);
+		if (!repository) return null;
+		return primaryRootFromRepositorySync(repository);
+	},
+
+	/**
+	 * Linked-worktree metadata for `cwd`, or `null` when `cwd` is the primary
+	 * checkout (or outside a repository). `root` is the worktree's own checkout
+	 * root; `primaryRoot` is the shared main checkout that names the project.
+	 * Resolves purely via on-disk `.git`/`commondir` walking — no subprocess —
+	 * so the status line may call it on every render.
+	 */
+	linkedWorktreeSync(cwd: string): { root: string; primaryRoot: string } | null {
+		const repository = resolveRepositorySync(cwd);
+		if (!repository || !isLinkedWorktree(repository)) return null;
+		return { root: repository.repoRoot, primaryRoot: primaryRootFromRepositorySync(repository) };
 	},
 
 	/** Full GitRepository metadata (sync). */
@@ -1428,11 +2065,21 @@ export const repo = {
 	resolve(cwd: string): Promise<GitRepository | null> {
 		return resolveRepository(cwd);
 	},
+
+	/** Check if the repository uses the reftable reference storage format (sync). */
+	isReftableSync(repository: GitRepository): boolean {
+		return isReftableRepoSync(repository);
+	},
+
+	/** Check if the repository uses the reftable reference storage format. */
+	isReftable(repository: GitRepository): Promise<boolean> {
+		return isReftableRepo(repository);
+	},
 };
 
 // Helper used during head resolution — defined here to reference `head` namespace.
-async function resolveHead(cwd: string): Promise<GitHeadState | null> {
-	return head.resolve(cwd);
+async function resolveHead(cwd: string, signal?: AbortSignal): Promise<GitHeadState | null> {
+	return head.resolve(cwd, signal);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1482,20 +2129,17 @@ export const github = {
 		try {
 			const child = Bun.spawn(["gh", ...args], {
 				cwd,
+				env: {
+					...process.env,
+					...GH_NON_INTERACTIVE_ENV,
+				},
 				stdin: "ignore",
 				stdout: "pipe",
 				stderr: "pipe",
 				windowsHide: true,
 				signal,
 			});
-			if (!child.stdout || !child.stderr) {
-				throw new ToolError("Failed to capture GitHub CLI output.");
-			}
-			const [stdout, stderr, exitCode] = await Promise.all([
-				new Response(child.stdout).text(),
-				new Response(child.stderr).text(),
-				child.exited,
-			]);
+			const { stdout, stderr, exitCode } = await collectSubprocessResult("gh", args, child, {});
 			throwIfAborted(signal);
 			const trim = options?.trimOutput !== false;
 			return {

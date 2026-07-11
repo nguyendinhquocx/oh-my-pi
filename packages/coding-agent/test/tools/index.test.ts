@@ -44,7 +44,7 @@ function createDiscoverySessionHooks(): Partial<ToolSession> {
 	const selected: string[] = [];
 	return {
 		isMCPDiscoveryEnabled: () => true,
-		getDiscoverableMCPTools: () => [],
+		getDiscoverableTools: () => [],
 		getSelectedMCPToolNames: () => [...selected],
 		activateDiscoveredMCPTools: async toolNames => {
 			const activated: string[] = [];
@@ -75,28 +75,29 @@ describe("createTools", () => {
 		expect(names).toContain("read");
 		expect(names).toContain("edit");
 		expect(names).toContain("write");
-		expect(names).toContain("search");
-		expect(names).toContain("find");
+		expect(names).toContain("grep");
+		expect(names).toContain("glob");
 		expect(names).toContain("lsp");
 		expect(names).toContain("task");
-		expect(names).toContain("todo_write");
+		expect(names).toContain("todo");
 		expect(names).toContain("web_search");
 		expect(names).toContain("resolve");
 		expect(names).not.toContain("fetch");
 		expect(names).not.toContain("vim");
 	});
 
-	it("keeps edit visible when vim edit mode is active", async () => {
+	it("normalizes legacy explicit tool names", async () => {
 		const session = createTestSession({
-			settings: createSettingsWithOverrides({
-				"edit.mode": "vim",
-			}),
+			settings: createSettingsWithOverrides({ "astGrep.enabled": false }),
 		});
-		const tools = await createTools(session);
+		const tools = await createTools(session, ["search", "find", "grep"]);
 		const names = tools.map(t => t.name);
 
-		expect(names).toContain("edit");
-		expect(names).not.toContain("vim");
+		expect(names.filter(name => name === "grep")).toHaveLength(1);
+		expect(names).toContain("glob");
+		expect(names).toContain("resolve");
+		expect(names).not.toContain("search");
+		expect(names).not.toContain("find");
 	});
 
 	it("includes bash and eval when both eval backends are allowed", async () => {
@@ -167,18 +168,6 @@ describe("createTools", () => {
 		expect(names).toEqual(["read", "write", "resolve"]);
 	});
 
-	it("ignores vim as an unknown requested tool even when vim edit mode is active", async () => {
-		const session = createTestSession({
-			settings: createSettingsWithOverrides({
-				"edit.mode": "vim",
-			}),
-		});
-		const tools = await createTools(session, ["read", "vim"]);
-		const names = tools.map(t => t.name);
-
-		expect(names).toEqual(["read", "resolve"]);
-	});
-
 	it("lowercases requested tool subset", async () => {
 		const session = createTestSession();
 		const tools = await createTools(session, ["Read", "Write"]);
@@ -222,29 +211,30 @@ describe("createTools", () => {
 	it("filters disabled builtin tools by settings", async () => {
 		const session = createTestSession({
 			settings: createSettingsWithOverrides({
-				"find.enabled": false,
-				"search.enabled": false,
+				"glob.enabled": false,
+				"grep.enabled": false,
 				"astGrep.enabled": false,
 				"astEdit.enabled": false,
-				"renderMermaid.enabled": false,
+				"bash.enabled": false,
 				"web_search.enabled": false,
 				"browser.enabled": false,
 				"inspect_image.enabled": false,
-				"calc.enabled": false,
 			}),
 		});
 		const tools = await createTools(session);
 		const names = tools.map(t => t.name);
 
-		expect(names).not.toContain("find");
-		expect(names).not.toContain("search");
+		expect(names).not.toContain("bash");
+		expect(names).not.toContain("glob");
+		expect(names).not.toContain("grep");
 		expect(names).not.toContain("ast_grep");
 		expect(names).not.toContain("ast_edit");
-		expect(names).not.toContain("render_mermaid");
 		expect(names).not.toContain("web_search");
 		expect(names).not.toContain("browser");
 		expect(names).not.toContain("inspect_image");
-		expect(names).not.toContain("calc");
+
+		const requestedTools = await createTools(session, ["bash", "read"]);
+		expect(requestedTools.map(t => t.name)).toEqual(["read", "resolve"]);
 	});
 
 	it("always includes resolve regardless of plan-mode setting", async () => {
@@ -272,6 +262,37 @@ describe("createTools", () => {
 		const names = tools.map(t => t.name);
 
 		expect(names).toEqual(["read", "goal", "resolve"]);
+	});
+
+	it("records active tools on the original session object", async () => {
+		const session = createTestSession();
+
+		await createTools(session, ["bash"]);
+
+		expect(session.isToolActive?.("bash")).toBe(true);
+		expect(session.isToolActive?.("read")).toBe(false);
+	});
+
+	it("renders bash guidance from the live active tool predicate", async () => {
+		const activeToolNames = new Set<string>();
+		const session = createTestSession({
+			isToolActive: name => activeToolNames.has(name),
+			setActiveToolNames: names => {
+				activeToolNames.clear();
+				for (const name of names) {
+					activeToolNames.add(name);
+				}
+			},
+		});
+
+		const tools = await createTools(session, ["bash", "grep", "read", "glob"]);
+		const bash = tools.find(tool => tool.name === "bash");
+
+		expect(bash?.description).toContain("`grep` tool");
+		session.setActiveToolNames?.(["bash"]);
+		expect(bash?.description).not.toContain("`grep` tool");
+		expect(bash?.description).not.toContain("`ls` → `read`");
+		expect(bash?.description).not.toContain("`find` → the `glob` tool");
 	});
 
 	it("includes search_tool_bm25 when MCP tool discovery is enabled and executable", async () => {

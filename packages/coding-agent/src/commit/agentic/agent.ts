@@ -1,7 +1,8 @@
-import { INTENT_FIELD, type ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
 import { Markdown } from "@oh-my-pi/pi-tui";
 import { prompt } from "@oh-my-pi/pi-utils";
+import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import chalk from "chalk";
 import typesDescriptionPrompt from "../../commit/prompts/types-description.md" with { type: "text" };
 import type { ModelRegistry } from "../../config/model-registry";
@@ -28,6 +29,7 @@ export interface CommitAgentInput {
 	requireChangelog: boolean;
 	diffText?: string;
 	existingChangelogEntries?: ExistingChangelogEntries[];
+	onComplete?: (state: CommitAgentState) => Promise<void> | void;
 }
 
 export interface ExistingChangelogEntries {
@@ -41,7 +43,7 @@ export async function runCommitAgentSession(input: CommitAgentInput): Promise<Co
 		types_description: typesDescription,
 	});
 	const state: CommitAgentState = { diffText: input.diffText };
-	const spawns = "quick_task";
+	const spawns = "sonic";
 	const tools = createCommitTools({
 		cwd: input.cwd,
 		authStorage: input.authStorage,
@@ -170,9 +172,13 @@ export async function runCommitAgentSession(input: CommitAgentInput): Promise<Co
 			await session.prompt(reminder, {
 				attribution: "agent",
 				expandPromptTemplates: false,
+				synthetic: true,
 			});
 		}
 
+		if (input.onComplete) {
+			await input.onComplete(state);
+		}
 		return state;
 	} finally {
 		unsubscribe();
@@ -212,7 +218,7 @@ function writeAssistantMessage(message: string): void {
 	}
 }
 
-function renderMarkdownLines(message: string): string[] {
+function renderMarkdownLines(message: string): readonly string[] {
 	const width = Math.max(40, process.stdout.columns ?? 100);
 	const markdown = new Markdown(message, 0, 0, getMarkdownTheme());
 	return markdown.render(width);

@@ -1,14 +1,21 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getThemeByName } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { KeybindingsManager } from "@oh-my-pi/pi-coding-agent/config/keybindings";
+import { getThemeByName, initTheme, type Theme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import {
 	dedupeParseErrors,
+	expandKeyHint,
 	formatCodeFrameLine,
 	formatDiagnostics,
+	formatErrorMessage,
+	formatExpandHint,
 	formatParseErrors,
 	formatScreenshot,
+	shortenPath,
+	truncateDiffByHunk,
 } from "@oh-my-pi/pi-coding-agent/tools/render-utils";
+import { getKeybindings, setKeybindings, type KeybindingsManager as TuiKeybindingsManager } from "@oh-my-pi/pi-tui";
 
 describe("parse error formatting", () => {
 	it("deduplicates parse errors while preserving order", () => {
@@ -50,6 +57,7 @@ describe("formatScreenshot", () => {
 			wasResized: boolean;
 			buffer: Uint8Array;
 			mimeType: string;
+			decodeFailed: boolean;
 		}>,
 	): {
 		buffer: Uint8Array;
@@ -59,6 +67,7 @@ describe("formatScreenshot", () => {
 		width: number;
 		height: number;
 		wasResized: boolean;
+		decodeFailed?: boolean;
 		get data(): string;
 	} {
 		const buf = overrides?.buffer ?? new Uint8Array(2048);
@@ -70,6 +79,7 @@ describe("formatScreenshot", () => {
 			width: overrides?.width ?? 800,
 			height: overrides?.height ?? 600,
 			wasResized: overrides?.wasResized ?? false,
+			decodeFailed: overrides?.decodeFailed,
 			get data() {
 				return Buffer.from(buf).toString("base64");
 			},
@@ -95,7 +105,19 @@ describe("formatScreenshot", () => {
 		]);
 	});
 
+	it("uses forward slashes after a shortened Windows home", () => {
+		const home = String.raw`C:\Users\me`;
+		expect(shortenPath(String.raw`C:\Users\me\projects\demo`, home)).toBe("~/projects/demo");
+	});
+
+	it("does not shorten paths outside the home boundary", () => {
+		const home = String.raw`C:\Users\me`;
+		const sibling = String.raw`C:\Users\me2\projects\demo`;
+		expect(shortenPath(sibling, home)).toBe(sibling);
+	});
+
 	it("formats non-home path without tilde", () => {
+		const filePath = path.join(path.parse(os.homedir()).root, "omp-render-utils", "capture.png");
 		const resized = fakeResized({ mimeType: "image/webp", buffer: new Uint8Array(1024) });
 
 		expect(
@@ -103,12 +125,12 @@ describe("formatScreenshot", () => {
 				saveFullRes: true,
 				savedMimeType: "image/png",
 				savedByteLength: 2048,
-				dest: "/tmp/capture.png",
+				dest: filePath,
 				resized,
 			}),
 		).toEqual([
 			"Screenshot captured",
-			"Saved: image/png (2.00 KB) to /tmp/capture.png",
+			`Saved: image/png (2.00 KB) to ${filePath}`,
 			"Model: image/webp (1.00 KB, 800x600)",
 		]);
 	});
@@ -121,10 +143,24 @@ describe("formatScreenshot", () => {
 				saveFullRes: false,
 				savedMimeType: "image/webp",
 				savedByteLength: 3072,
-				dest: "/tmp/omp-sshots-123.png",
+				dest: path.join(os.tmpdir(), "omp-sshots-123.png"),
 				resized,
 			}),
 		).toEqual(["Screenshot captured", "Format: image/webp (3.00 KB)", "Dimensions: 800x600"]);
+	});
+
+	it("surfaces screenshots that could not be resized", () => {
+		const resized = fakeResized({ decodeFailed: true, mimeType: "image/png", buffer: new Uint8Array(4096) });
+
+		expect(
+			formatScreenshot({
+				saveFullRes: false,
+				savedMimeType: "image/png",
+				savedByteLength: 4096,
+				dest: path.join(os.tmpdir(), "omp-sshots-123.png"),
+				resized,
+			}),
+		).toContain("Resize: image decoder failed; using original image bytes");
 	});
 
 	it("appends dimension note when image was resized", () => {
@@ -140,7 +176,7 @@ describe("formatScreenshot", () => {
 			saveFullRes: false,
 			savedMimeType: "image/webp",
 			savedByteLength: 2048,
-			dest: "/tmp/shot.png",
+			dest: path.join(os.tmpdir(), "shot.png"),
 			resized,
 		});
 
@@ -182,5 +218,137 @@ describe("formatCodeFrameLine", () => {
 		expect(formatCodeFrameLine("*", 448, "match", 3)).toBe("*448│match");
 		expect(formatCodeFrameLine("+", 11, "added", 3)).toBe(" +11│added");
 		expect(formatCodeFrameLine("+", 235, "added", 3)).toBe("+235│added");
+	});
+});
+
+describe("truncateDiffByHunk", () => {
+	function makeHunk(prefix: "-" | "+", line: number, count: number): string[] {
+		return Array.from({ length: count }, (_, i) => `${prefix} ${prefix === "-" ? "old" : "new"} ${line + i}`);
+	}
+
+	function buildDiff(hunkCount: number, linesPerHunk: number): string {
+		const lines: string[] = [];
+		for (let h = 0; h < hunkCount; h++) {
+			lines.push(`@@ hunk ${h} @@`);
+			lines.push(...makeHunk("-", h * 100, linesPerHunk));
+			lines.push(...makeHunk("+", h * 100, linesPerHunk));
+			lines.push(" ctx");
+		}
+		return lines.join("\n");
+	}
+
+	it("keeps trailing hunks when fromTail is set", () => {
+		// 6 hunks total, 2 +/- lines per hunk → 4 change lines per hunk plus
+		// header/context. Cap budget tight enough to force truncation.
+		const diff = buildDiff(6, 2);
+		const head = truncateDiffByHunk(diff, 2, 8);
+		const tail = truncateDiffByHunk(diff, 2, 8, { fromTail: true });
+
+		// Both modes drop the same number of hunks/lines.
+		expect(tail.hiddenHunks).toBe(head.hiddenHunks);
+		expect(tail.hiddenLines).toBe(head.hiddenLines);
+
+		// Head shows the first hunk markers; tail shows the last hunk markers.
+		expect(head.text).toContain("- old 0");
+		expect(head.text).not.toContain("- old 500");
+		expect(tail.text).toContain("- old 500");
+		expect(tail.text).not.toContain("- old 0");
+	});
+
+	it("returns the full diff unchanged when within budget regardless of fromTail", () => {
+		const diff = buildDiff(1, 1);
+		const head = truncateDiffByHunk(diff, 4, 32);
+		const tail = truncateDiffByHunk(diff, 4, 32, { fromTail: true });
+		expect(head.text).toBe(diff);
+		expect(tail.text).toBe(diff);
+		expect(tail.hiddenHunks).toBe(0);
+		expect(tail.hiddenLines).toBe(0);
+	});
+
+	it("preserves change/context line order within a kept hunk under fromTail", () => {
+		// Single hunk with intra-segment context: leading context, change, trailing context.
+		const diff = [
+			"@@ only @@",
+			" leading-ctx-a",
+			" leading-ctx-b",
+			"- old line",
+			"+ new line",
+			" trailing-ctx-a",
+			" trailing-ctx-b",
+		].join("\n");
+		const { text } = truncateDiffByHunk(diff, 4, 32, { fromTail: true });
+		const idxOld = text.indexOf("- old line");
+		const idxNew = text.indexOf("+ new line");
+		const idxLeading = text.indexOf("leading-ctx-a");
+		const idxTrailing = text.indexOf("trailing-ctx-b");
+		// In-order: leading context appears before change which appears before trailing context.
+		expect(idxLeading).toBeLessThan(idxOld);
+		expect(idxOld).toBeLessThan(idxNew);
+		expect(idxNew).toBeLessThan(idxTrailing);
+	});
+});
+
+describe("formatErrorMessage (F4 sanitization)", () => {
+	beforeAll(async () => {
+		await initTheme();
+	});
+	it("replaces tabs in error content with spaces", () => {
+		const out = formatErrorMessage("apply_patch failed:\n@@\n-old\tindented\n+new", theme);
+		expect(out).not.toContain("\t");
+	});
+
+	it("truncates very long error messages to keep TUI from overflowing", () => {
+		const longTail = "x".repeat(500);
+		const out = formatErrorMessage(`crash: ${longTail}`, theme);
+		// Strip ANSI escape sequences so we can measure the user-visible length.
+		const ESC = String.fromCharCode(0x1b);
+		const visible = out
+			.split(ESC)
+			.map((s, i) => (i === 0 ? s : s.replace(/^\[[0-9;]*m/, "")))
+			.join("");
+		// LINE truncation cap is 110 chars; account for the "Error: " prefix and
+		// the leading symbol+space.
+		expect(visible.length).toBeLessThan(180);
+	});
+
+	it("falls back to 'Unknown error' for empty/missing input", () => {
+		const out = formatErrorMessage(undefined, theme);
+		expect(out).toContain("Unknown error");
+	});
+});
+
+describe("formatExpandHint / expandKeyHint", () => {
+	// Plain stub: `fg` is a passthrough and brackets are literal `[`/`]`, so the
+	// rendered hint is deterministic regardless of the active theme's bracket glyphs.
+	const plainTheme = {
+		fg: (_color: unknown, text: string) => text,
+		format: { bracketLeft: "[", bracketRight: "]" },
+	} as unknown as Theme;
+
+	let previous: TuiKeybindingsManager;
+	beforeEach(() => {
+		previous = getKeybindings();
+	});
+	afterEach(() => {
+		setKeybindings(previous);
+	});
+
+	it("reports the default tool-output expand key", () => {
+		setKeybindings(KeybindingsManager.inMemory());
+		expect(expandKeyHint()).toBe("Ctrl+O");
+		// Single bracket pair from the theme, no double-wrapping around the key.
+		expect(formatExpandHint(plainTheme, false, true)).toBe("[Ctrl+O: Expand]");
+	});
+
+	it("tracks a user remap of the expand binding", () => {
+		setKeybindings(KeybindingsManager.inMemory({ "app.tools.expand": "alt+e" }));
+		expect(expandKeyHint()).toBe("Alt+E");
+		expect(formatExpandHint(plainTheme, false, true)).toBe("[Alt+E: Expand]");
+	});
+
+	it("renders nothing when expanded or there is no more content", () => {
+		setKeybindings(KeybindingsManager.inMemory());
+		expect(formatExpandHint(plainTheme, true, true)).toBe("");
+		expect(formatExpandHint(plainTheme, false, false)).toBe("");
 	});
 });

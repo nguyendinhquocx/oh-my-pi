@@ -31,6 +31,15 @@ function baseResult(overrides: Record<string, unknown> = {}) {
 	};
 }
 
+const RED_1X1_PNG_BASE64 =
+	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+
+async function makeRedPng(width: number, height: number): Promise<string> {
+	const seed = Buffer.from(RED_1X1_PNG_BASE64, "base64");
+	const upscaled = await new Bun.Image(seed).resize(width, height, { filter: "nearest" }).png().bytes();
+	return Buffer.from(upscaled).toString("base64");
+}
+
 describe("EvalTool display() text surfacing", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
@@ -46,7 +55,8 @@ describe("EvalTool display() text surfacing", () => {
 
 		const tool = new EvalTool(makeSession());
 		const result = await tool.execute("call-display-json", {
-			cells: [{ language: "js", code: "```js\ndisplay({ stdout: 'hi', exit_code: 0 });\n```\n" }],
+			language: "js",
+			code: "```js\ndisplay({ stdout: 'hi', exit_code: 0 });\n```\n",
 		});
 
 		const text = result.content.map(c => (c.type === "text" ? c.text : "")).join("\n");
@@ -67,7 +77,8 @@ describe("EvalTool display() text surfacing", () => {
 
 		const tool = new EvalTool(makeSession());
 		const result = await tool.execute("call-mixed", {
-			cells: [{ language: "js", code: "```js\nprint('before'); display([1,2,3]);\n```\n" }],
+			language: "js",
+			code: "```js\nprint('before'); display([1,2,3]);\n```\n",
 		});
 
 		const text = result.content.map(c => (c.type === "text" ? c.text : "")).join("\n");
@@ -87,9 +98,8 @@ describe("EvalTool display() text surfacing", () => {
 
 		const tool = new EvalTool(makeSession());
 		const result = await tool.execute("call-image", {
-			cells: [
-				{ language: "js", code: "```js\ndisplay({ type: 'image', data: '...', mimeType: 'image/png' });\n```\n" },
-			],
+			language: "js",
+			code: "```js\ndisplay({ type: 'image', data: '...', mimeType: 'image/png' });\n```\n",
 		});
 
 		const imageBlocks = result.content.filter(c => c.type === "image");
@@ -105,13 +115,44 @@ describe("EvalTool display() text surfacing", () => {
 		expect(result.details?.images).toBeUndefined();
 	});
 
+	it("downscales displayed images before returning ImageContent", async () => {
+		vi.spyOn(pyKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
+		const base64 = await makeRedPng(2400, 1200);
+		vi.spyOn(evalIndex.jsBackend, "execute").mockResolvedValue(
+			baseResult({
+				displayOutputs: [{ type: "image", data: base64, mimeType: "image/png" }],
+			}) as never,
+		);
+
+		const tool = new EvalTool(makeSession());
+		const result = await tool.execute("call-large-image", {
+			language: "js",
+			code: "```js\ndisplay({ type: 'image', data: largePng, mimeType: 'image/png' });\n```\n",
+		});
+
+		const image = result.content.find(c => c.type === "image");
+		expect(image).toBeDefined();
+		if (image?.type !== "image") throw new Error("Expected image content");
+		expect(image.data).not.toBe(base64);
+
+		const { width, height } = await new Bun.Image(Buffer.from(image.data, "base64")).metadata();
+		expect(width).toBeLessThanOrEqual(1568);
+		expect(height).toBeLessThanOrEqual(1568);
+
+		const text = result.content.map(c => (c.type === "text" ? c.text : "")).join("\n");
+		expect(text).toContain("display image 1:");
+		expect(text).toContain("original 2400x1200");
+		expect(text).not.toContain(base64);
+	});
+
 	it("still reports (no text output) when nothing was printed or displayed", async () => {
 		vi.spyOn(pyKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
 		vi.spyOn(evalIndex.jsBackend, "execute").mockResolvedValue(baseResult() as never);
 
 		const tool = new EvalTool(makeSession());
 		const result = await tool.execute("call-empty", {
-			cells: [{ language: "js", code: "```js\nconst x = 1;\n```\n" }],
+			language: "js",
+			code: "```js\nconst x = 1;\n```\n",
 		});
 
 		const text = result.content.map(c => (c.type === "text" ? c.text : "")).join("\n");
@@ -129,11 +170,12 @@ describe("EvalTool display() text surfacing", () => {
 
 		const tool = new EvalTool(makeSession());
 		const result = await tool.execute("call-huge", {
-			cells: [{ language: "js", code: "```js\ndisplay({ payload: 'x'.repeat(20000) });\n```\n" }],
+			language: "js",
+			code: "```js\ndisplay({ payload: 'x'.repeat(20000) });\n```\n",
 		});
 
 		const text = result.content.map(c => (c.type === "text" ? c.text : "")).join("\n");
-		expect(text).toContain("chars truncated");
+		expect(text).toContain("ch elided");
 		expect(text.length).toBeLessThan(20000);
 	});
 });
