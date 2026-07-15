@@ -2,14 +2,32 @@
 
 ## [Unreleased]
 
-### Added
-
-- Added OpenAI Codex rate-limit response-header ingestion (`x-codex-{primary,secondary}-*`): every successful response now refreshes the account's usage snapshot, so credential selection blocks an exhausted account and rotates to a sibling before the next request burns a wire 429.
+## [17.0.0] - 2026-07-15
 
 ### Changed
 
-- Reworked multi-account credential ranking from lowest-consumption-pace to maximum required drain: accounts are now ordered by `headroom / hoursToReset` (descending) on their binding usage window, so quota that would expire unused at the next reset is burned first and staggered resets land at ~100% utilization. Accounts whose short (5h) window is ≥85% used are demoted behind cooler siblings to avoid imminent mid-session blocks, usage-backed accounts always outrank siblings whose usage fetch failed, and the weighted-random session spread was replaced by deterministic top-ranked selection.
-- Usage header ingestion now bypasses its 60-second throttle when any window reads exhausted, so the credential block lands immediately instead of after one more wire 429.
+- Improved Ollama streaming performance by parsing NDJSON response bytes directly instead of decoding and buffering network chunks as text.
+
+### Fixed
+
+- Fixed Cursor TLS connection resets causing process-fatal uncaught exceptions, allowing the active turn to fail or retry gracefully without terminating the session.
+- Fixed Amazon Bedrock stream error handling to correctly handle non-Error values that cannot be serialized by JSON.stringify.
+
+## [16.5.2] - 2026-07-14
+
+### Added
+
+- Added OpenAI Codex rate-limit response-header ingestion to proactively refresh account usage snapshots and rotate credentials before hitting 429 errors.
+
+### Changed
+
+- Optimized multi-account credential ranking to maximize quota utilization and prevent mid-session blocks by prioritizing expiring quota and demoting heavily used accounts.
+- Improved responsiveness of credential blocking by bypassing the usage-ingestion throttle immediately when an account is detected as exhausted.
+
+### Fixed
+
+- Fixed empty provider responses (such as from Cloud Code Assist API) being treated as non-retryable, allowing session retries and model-fallback chains to engage.
+- Fixed OpenAI Codex watchdog timeouts bypassing transport and session retries by ensuring each request attempt has an independent timeout signal.
 
 ## [16.5.1] - 2026-07-14
 
