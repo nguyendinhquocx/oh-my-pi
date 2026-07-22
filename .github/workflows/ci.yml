@@ -237,16 +237,6 @@ jobs:
                     arch: x64,
                     target_id: linux-x64,
                     binary_path: packages/coding-agent/binaries/omp-linux-x64,
-                    native_artifact_pattern: pi-natives-linux-x64-*,
-                 }
-               - {
-                    os: ubuntu-22.04,
-                    platform: linux,
-                    libc: musl,
-                    arch: x64,
-                    target_id: linux-musl-x64,
-                    binary_path: packages/coding-agent/binaries/omp-linux-musl-x64,
-                    native_artifact_pattern: pi-natives-linux-musl-x64-*,
                  }
                - {
                     os: ubuntu-24.04-arm,
@@ -254,16 +244,6 @@ jobs:
                     arch: arm64,
                     target_id: linux-arm64,
                     binary_path: packages/coding-agent/binaries/omp-linux-arm64,
-                    native_artifact_pattern: pi-natives-linux-arm64*,
-                 }
-               - {
-                    os: ubuntu-24.04-arm,
-                    platform: linux,
-                    libc: musl,
-                    arch: arm64,
-                    target_id: linux-musl-arm64,
-                    binary_path: packages/coding-agent/binaries/omp-linux-musl-arm64,
-                    native_artifact_pattern: pi-natives-linux-musl-arm64*,
                  }
                - {
                     os: macos-15-intel,
@@ -271,7 +251,6 @@ jobs:
                     arch: x64,
                     target_id: darwin-x64,
                     binary_path: packages/coding-agent/binaries/omp-darwin-x64,
-                    native_artifact_pattern: pi-natives-darwin-x64*,
                  }
                - {
                     os: macos-14,
@@ -279,7 +258,6 @@ jobs:
                     arch: arm64,
                     target_id: darwin-arm64,
                     binary_path: packages/coding-agent/binaries/omp-darwin-arm64,
-                    native_artifact_pattern: pi-natives-darwin-arm64*,
                  }
                - {
                     os: windows-latest,
@@ -287,7 +265,6 @@ jobs:
                     arch: x64,
                     target_id: win32-x64,
                     binary_path: packages/coding-agent/binaries/omp-windows-x64.exe,
-                    native_artifact_pattern: pi-natives-win32-x64*,
                  }
       runs-on: ${{ matrix.os }}
       permissions:
