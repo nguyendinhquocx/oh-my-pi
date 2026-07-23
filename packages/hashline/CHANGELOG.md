@@ -2,9 +2,16 @@
 
 ## [Unreleased]
 
+## [17.0.8] - 2026-07-22
+
 ### Changed
 
-- Snapshot recovery line remapping now uses the native line diff ([#6279](https://github.com/can1357/oh-my-pi/pull/6279) by [@wolfiesch](https://github.com/wolfiesch)).
+- Improved snapshot recovery line remapping by utilizing native line diffing.
+- Switched line anchor recovery diffs to native `diffLineRuns`, processing UTF-16 code units directly and removing JS diff fallback.
+
+### Removed
+
+- Removed npm `diff` dependency.
 
 ## [17.0.4] - 2026-07-18
 

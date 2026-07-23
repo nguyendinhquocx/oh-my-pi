@@ -134,6 +134,7 @@ async function checkForNewVersion(currentVersion: string): Promise<string | unde
 // embedders need project-level opt-outs for reminder/prelude prompt injection.
 const HOST_DEFAULTED_SETTING_PATHS: SettingPath[] = [
 	"task.isolation.mode",
+	"task.isolation.apply",
 	"task.isolation.merge",
 	"task.isolation.commits",
 	"task.eager",
@@ -833,6 +834,11 @@ export async function buildSessionOptions(
 		cwd: parsed.cwd ?? getProjectDir(),
 		autoApprove: parsed.autoApprove ?? false,
 	};
+	const cliDirs = parsed.addDir ?? [];
+	const settingsDirs = activeSettings.get("workspace.additionalDirectories");
+	if (cliDirs.length > 0 || settingsDirs.length > 0) {
+		options.additionalDirectories = [...new Set([...cliDirs, ...settingsDirs])];
+	}
 	if (parsed.maxTime !== undefined) {
 		options.deadline = Date.now() + parsed.maxTime * 1000;
 	}

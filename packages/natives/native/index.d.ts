@@ -178,7 +178,7 @@ export declare function __ompInstallTokioRuntime(): void
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV17_0_7(): void
+export declare function __piNativesV17_0_9(): void
 
 /**
  * Apply ast-grep rewrite rules to matching files; honors `dryRun` and returns
@@ -518,7 +518,7 @@ export interface DiffChange {
  * Diff `oldText.split("
 ")` against `newText.split("
 ")` with jsdiff
- * `diffArrays` semantics (exact string equality, empty lines preserved),
+ * `diffArrays` semantics (exact code-unit equality, empty lines preserved),
  * returning only run lengths.
  *
  * Callers that map line numbers — like hashline recovery — need the counts,

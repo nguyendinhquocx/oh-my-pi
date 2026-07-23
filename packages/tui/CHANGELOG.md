@@ -2,11 +2,27 @@
 
 ## [Unreleased]
 
+### Added
+
+- `Text.setStyleFn()` applies a foreground styler at render time, so a component re-resolves its color after `invalidate()` instead of baking the palette that was active when it was constructed.
+
 ### Fixed
 
-- Fixed ST-terminated OSC 8 hyperlinks corrupting Markdown table column widths when linked text started with inline markup.
-- Prevented canonical slash commands and their matching aliases from appearing as duplicate autocomplete rows ([#6131](https://github.com/can1357/oh-my-pi/issues/6131)).
-- Fixed Ctrl+L appearance refreshes inside tmux reading tmux's stale OSC 11 background cache instead of querying the outer terminal when passthrough is enabled ([#6066](https://github.com/can1357/oh-my-pi/issues/6066)).
+- Fixed teardown leaving the terminal in cursor-key/keypad application mode (DECCKM), which broke arrow keys in the parent shell after exit; `stop()` and `emergencyTerminalRestore()` now emit the standard `rmkx` resets ([#6374](https://github.com/can1357/oh-my-pi/issues/6374)).
+
+## [17.0.9] - 2026-07-23
+
+### Added
+
+- Added `SelectList.setMaxVisible()` so hosts can refit the visible row budget to available height after construction.
+
+## [17.0.8] - 2026-07-22
+
+### Fixed
+
+- Fixed an issue where OSC 8 hyperlinks with inline markup corrupted Markdown table column widths.
+- Prevented duplicate autocomplete suggestions for slash commands and their matching aliases.
+- Fixed terminal background color detection during screen refreshes (Ctrl+L) inside tmux when passthrough is enabled.
 
 ## [17.0.6] - 2026-07-20
 

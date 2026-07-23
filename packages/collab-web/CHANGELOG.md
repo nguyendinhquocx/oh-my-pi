@@ -4,7 +4,13 @@
 
 ### Fixed
 
-- Prevented IME composition (Korean/Japanese/Chinese) from duplicating the last character when pressing Enter to commit in the collab web composer. ([#6163](https://github.com/can1357/oh-my-pi/issues/6163))
+- Fixed `xd://resolve`/`xd://reject`/`xd://propose` cards losing action metadata after the xdev unwrap (badge rendered `?`/warn instead of apply/discard/propose semantics), and registered the missing `reject`/`propose` renderers plus the hub-family aliases (`irc`, `job`, `await`, `poll`, `cancel_job`) so those transcript names no longer fall back to generic JSON. ([#5640](https://github.com/can1357/oh-my-pi/issues/5640))
+
+## [17.0.8] - 2026-07-22
+
+### Fixed
+
+- Fixed an issue where IME composition (Korean, Japanese, and Chinese) duplicated the last character when pressing Enter to commit in the composer.
 
 ## [17.0.1] - 2026-07-16
 

@@ -68,28 +68,6 @@ export interface StructuredSubagentIsolationControls {
 	apply?: boolean;
 }
 
-/** Model-facing isolation controls accepted by task and eval adapters. */
-export interface StructuredSubagentIsolationInput {
-	isolated?: boolean;
-	apply?: boolean;
-	merge?: boolean;
-}
-
-/** Translate model-facing isolation flags into the shared executor policy. */
-export function toStructuredSubagentIsolationControls(
-	input: StructuredSubagentIsolationInput,
-): StructuredSubagentIsolationControls | undefined {
-	const requested = input.isolated !== undefined ? input.isolated : undefined;
-	const apply = input.apply !== undefined ? input.apply : undefined;
-	const merge = input.merge === false ? "patch" : undefined;
-	if (requested === undefined && apply === undefined && merge === undefined) return undefined;
-	return {
-		...(requested !== undefined ? { requested } : {}),
-		...(merge !== undefined ? { merge } : {}),
-		...(apply !== undefined ? { apply } : {}),
-	};
-}
-
 /** Identity and presentation metadata supplied by the calling surface. */
 export interface StructuredSubagentIdentity {
 	/** A previously reserved output/registry id. */
@@ -265,9 +243,6 @@ export async function resolveEffectiveSubagentPolicy(
 	const agentName = request.agent?.trim() || spawnPolicy.defaultAgent;
 	const planMode = request.session.getPlanModeState?.()?.enabled === true;
 	assertPlanControlsAllowed(request, planMode);
-	if (request.isolation?.apply !== undefined && request.isolation.requested !== true) {
-		throw new StructuredSubagentError("preflight", "Subagent `apply` control requires `isolated: true`.");
-	}
 	assertDepthAndSpawnAllowed(request, agentName);
 
 	const discovery = await discoverAgents(request.session.cwd);
@@ -325,7 +300,9 @@ export async function resolveEffectiveSubagentPolicy(
 		planMode,
 		isIsolated,
 		mergeMode: request.isolation?.merge ?? request.session.settings.get("task.isolation.merge"),
-		applyChanges: request.isolation?.apply !== false,
+		applyChanges:
+			request.isolation?.apply ??
+			(request.invocationKind === "task" ? request.session.settings.get("task.isolation.apply") : true),
 		enableLsp:
 			!planMode &&
 			(request.enableLsp ?? ((request.session.enableLsp ?? true) && request.session.settings.get("task.enableLsp"))),
@@ -396,6 +373,7 @@ function buildExecutorOptions(
 	const enableMCP = !policy.planMode && (session.enableMCP ?? true);
 	return {
 		cwd: session.cwd,
+		additionalDirectories: session.additionalDirectories,
 		agent: policy.effectiveAgent,
 		task: renderSubagentPrompt(request.assignment),
 		assignment: request.assignment.trim(),
