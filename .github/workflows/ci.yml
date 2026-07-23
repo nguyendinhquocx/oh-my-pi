@@ -6,8 +6,6 @@ on:
       tags: ["v*"]
    pull_request:
       branches: [main]
-      paths:
-         - "packages/**"
    workflow_dispatch:
       inputs:
          skip_npm:
