@@ -81,9 +81,9 @@ function makeResult(id: string, overrides: Partial<SingleResult> = {}): SingleRe
 	};
 }
 
-function mockDiscovery(agent: AgentDefinition = taskAgent): void {
+function mockDiscovery(agent: AgentDefinition | AgentDefinition[] = taskAgent): void {
 	vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
-		agents: [agent],
+		agents: Array.isArray(agent) ? agent : [agent],
 		projectAgentsDir: null,
 	});
 }
@@ -101,7 +101,6 @@ describe("task.batch schema gating", () => {
 		expect(offProperties.context).toBeUndefined();
 		expect(offProperties.task).toBeDefined();
 		expect(offProperties.name).toBeDefined();
-		expect(offProperties.model).toBeDefined();
 		expect(offProperties.outputSchema).toBeDefined();
 		expect(typeof offProperties.outputSchema).toBe("object");
 		expect(offProperties.schemaMode).toBeDefined();
@@ -115,14 +114,12 @@ describe("task.batch schema gating", () => {
 		expect(onProperties.task).toBeUndefined();
 		expect(onProperties.name).toBeUndefined();
 		expect(onProperties.agent).toBeUndefined();
-		expect(onProperties.model).toBeUndefined();
 		expect(onProperties.outputSchema).toBeUndefined();
 		expect(onProperties.schemaMode).toBeUndefined();
 		const items = (onProperties.tasks as { items?: { properties?: Record<string, unknown> } }).items;
 		expect(items?.properties?.task).toBeDefined();
 		expect(items?.properties?.name).toBeDefined();
 		expect(items?.properties?.agent).toBeDefined();
-		expect(items?.properties?.model).toBeDefined();
 		expect(items?.properties?.outputSchema).toBeDefined();
 		expect(typeof items?.properties?.outputSchema).toBe("object");
 		expect(items?.properties?.schemaMode).toBeDefined();
@@ -232,21 +229,6 @@ describe("task.batch validation", () => {
 		expect(text).toContain("Missing `context`");
 	});
 
-	it.each([{ model: [","] }, { model: Array<string>(1) }])(
-		"rejects an empty per-item model selector",
-		async ({ model }) => {
-			const text = await executeText(
-				{
-					context: "Background.",
-					tasks: [{ name: "Alpha", task: "Work.", model }],
-				},
-				{ "task.batch": true },
-			);
-			expect(text).toContain("Task 1 (`Alpha`) has an invalid `model`");
-			expect(text).toContain("non-empty array");
-		},
-	);
-
 	it("rejects duplicate provided names case-insensitively", async () => {
 		const text = await executeText(
 			{
@@ -347,14 +329,12 @@ describe("task.batch spawning", () => {
 				{
 					name: "Alpha",
 					task: "Do A.",
-					model: "openai-codex/gpt-5.6-sol:high",
 					outputSchema: alphaSchema,
 					schemaMode: "strict",
 				},
 				{
 					name: "Beta",
 					task: "Do B.",
-					model: ["anthropic/claude-sonnet-4-6:medium", "openai-codex/gpt-5.6-sol:low"],
 					outputSchema: betaSchema,
 					schemaMode: "permissive",
 				},
@@ -382,17 +362,93 @@ describe("task.batch spawning", () => {
 			expect(spawn.outputSchemaOverridesAgent).toBe(true);
 		}
 		const byId = new Map(seen.map(spawn => [spawn.id, spawn]));
-		expect(byId.get("Alpha")?.modelOverride).toEqual(["openai-codex/gpt-5.6-sol:high"]);
 		expect(byId.get("Alpha")?.outputSchema).toEqual(alphaSchema);
 		expect(byId.get("Alpha")?.outputSchemaMode).toBe("strict");
 		expect(byId.get("Beta")?.outputSchema).toEqual(betaSchema);
 		expect(byId.get("Beta")?.outputSchemaMode).toBe("permissive");
-		expect(byId.get("Beta")?.modelOverride).toEqual([
-			"anthropic/claude-sonnet-4-6:medium",
-			"openai-codex/gpt-5.6-sol:low",
-		]);
 		expect(seen.map(spawn => spawn.assignment).sort()).toEqual(["Do A.", "Do B."]);
 		for (const spawn of seen) expect(spawn.parentAgentId).toBe("ParentA");
+	});
+
+	it("routes each mixed-agent item through its selected definition while preserving caller overrides", async () => {
+		const scoutSchema = { type: "object", properties: { findings: { type: "array" } } };
+		const reviewerSchema = { type: "object", properties: { verdict: { type: "string" } } };
+		const callerSchema = { type: "object", properties: { approved: { type: "boolean" } } };
+		const scoutAgent: AgentDefinition = {
+			...taskAgent,
+			name: "scout",
+			description: "Read-only scout",
+			systemPrompt: "Investigate the assigned target.",
+			tools: ["read"],
+			model: ["anthropic/claude-haiku-4-5:low"],
+			output: scoutSchema,
+		};
+		const reviewerAgent: AgentDefinition = {
+			...taskAgent,
+			name: "reviewer",
+			description: "Code review specialist",
+			systemPrompt: "Review the assigned target.",
+			tools: ["read", "bash"],
+			model: ["anthropic/claude-sonnet-4-6:medium"],
+			output: reviewerSchema,
+		};
+		mockDiscovery([scoutAgent, reviewerAgent]);
+
+		const seen: Array<{
+			id?: string;
+			agent: AgentDefinition;
+			modelOverride?: string | string[];
+			outputSchema?: unknown;
+			outputSchemaSource?: "caller" | "agent" | "session" | "none";
+			outputSchemaOverridesAgent?: boolean;
+		}> = [];
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			seen.push({
+				id: options.id,
+				agent: options.agent,
+				modelOverride: options.modelOverride,
+				outputSchema: options.outputSchema,
+				outputSchemaSource: options.outputSchemaSource,
+				outputSchemaOverridesAgent: options.outputSchemaOverridesAgent,
+			});
+			return makeResult(options.id ?? "?", { agent: options.agent.name });
+		});
+
+		const manager = createManager();
+		const tool = await TaskTool.create(
+			createSession({ manager, settings: { "async.enabled": true, "task.batch": true } }),
+		);
+		const result = await tool.execute("tc-mixed-agents", {
+			context: "Shared routing context.",
+			tasks: [
+				{ name: "Scout", agent: "scout", task: "Investigate." },
+				{
+					name: "Review",
+					agent: "reviewer",
+					task: "Review.",
+					outputSchema: callerSchema,
+				},
+			],
+		} as TaskParams);
+
+		expect(getFirstText(result)).toContain("Spawned 2 background agents");
+		await Promise.all([manager.getJob("Scout")!.promise, manager.getJob("Review")!.promise]);
+
+		const byId = new Map(seen.map(spawn => [spawn.id, spawn]));
+		const scoutSpawn = byId.get("Scout");
+		const reviewerSpawn = byId.get("Review");
+		expect(scoutSpawn?.agent).toBe(scoutAgent);
+		expect(scoutSpawn?.agent.tools).toEqual(["read"]);
+		expect(scoutSpawn?.modelOverride).toEqual(["anthropic/claude-haiku-4-5:low"]);
+		expect(scoutSpawn?.outputSchema).toBe(scoutSchema);
+		expect(scoutSpawn?.outputSchemaSource).toBe("agent");
+		expect(scoutSpawn?.outputSchemaOverridesAgent).toBe(false);
+		expect(reviewerSpawn?.agent).toBe(reviewerAgent);
+		expect(reviewerSpawn?.agent.tools).toEqual(["read", "bash"]);
+		expect(reviewerSpawn?.modelOverride).toEqual(["anthropic/claude-sonnet-4-6:medium"]);
+		expect(reviewerSpawn?.outputSchema).toBe(callerSchema);
+		expect(reviewerSpawn?.outputSchemaSource).toBe("caller");
+		expect(reviewerSpawn?.outputSchemaOverridesAgent).toBe(true);
 	});
 
 	it("treats a one-item batch as a single spawn and forwards context", async () => {
@@ -465,7 +521,6 @@ describe("task.batch spawning", () => {
 			agent: "task",
 			name: "Flat",
 			task: "Do the thing.",
-			model: ["openai-codex/gpt-5.6-sol:high", "anthropic/claude-sonnet-4:low"],
 			outputSchema: callerSchema,
 			schemaMode: "strict",
 		} as TaskParams);
@@ -474,7 +529,7 @@ describe("task.batch spawning", () => {
 		const job = manager.getJob(result.details!.async!.jobId)!;
 		await job.promise;
 		expect(job.status).toBe("completed");
-		expect(captured?.modelOverride).toEqual(["openai-codex/gpt-5.6-sol:high", "anthropic/claude-sonnet-4:low"]);
+		expect(captured?.modelOverride).toEqual(["openai/gpt-4.1-mini"]);
 		expect(captured?.outputSchema).toEqual(callerSchema);
 		expect(captured?.outputSchemaMode).toBe("strict");
 		expect(captured?.outputSchemaSource).toBe("caller");

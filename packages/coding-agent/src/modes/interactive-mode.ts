@@ -39,6 +39,7 @@ import {
 } from "@oh-my-pi/pi-tui";
 import { isInsideTerminalMultiplexer } from "@oh-my-pi/pi-tui/terminal-capabilities";
 import {
+	$env,
 	APP_NAME,
 	adjustHsv,
 	formatNumber,
@@ -113,6 +114,7 @@ import { STTController, type SttState } from "../stt";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "../system-prompt";
 import { formatTaskId } from "../task/render";
 import type { ConfiguredThinkingLevel } from "../thinking";
+import { tinyTitleClient } from "../tiny/title-client";
 import type { LspStartupServerInfo } from "../tools";
 import { normalizeLocalScheme } from "../tools/path-utils";
 import { replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "../tools/render-utils";
@@ -153,7 +155,7 @@ import type { EvalExecutionComponent } from "./components/eval-execution";
 import type { HookEditorComponent } from "./components/hook-editor";
 import type { HookInputComponent } from "./components/hook-input";
 import type { HookSelectorComponent, HookSelectorSlider } from "./components/hook-selector";
-import { PlanReviewOverlay } from "./components/plan-review-overlay";
+import { type PlanReviewAnnotationState, PlanReviewOverlay } from "./components/plan-review-overlay";
 import { StatusLineComponent } from "./components/status-line";
 import type { ToolExecutionHandle } from "./components/tool-execution";
 import { TranscriptContainer } from "./components/transcript-container";
@@ -163,6 +165,7 @@ import { CommandController } from "./controllers/command-controller";
 import { EventController } from "./controllers/event-controller";
 import { ExtensionUiController } from "./controllers/extension-ui-controller";
 import { InputController } from "./controllers/input-controller";
+import { LiveCommandController } from "./controllers/live-command-controller";
 import { MCPCommandController } from "./controllers/mcp-command-controller";
 import { OmfgController } from "./controllers/omfg-controller";
 import { SelectorController } from "./controllers/selector-controller";
@@ -206,6 +209,7 @@ import type {
 	InteractiveModeContext,
 	InteractiveModeInitOptions,
 	InteractiveSelectorDialogOptions,
+	RenderSessionContextOptions,
 	SubmittedUserInput,
 	TodoItem,
 	TodoPhase,
@@ -568,6 +572,10 @@ export class InteractiveMode implements InteractiveModeContext {
 	#planReviewOverlay: PlanReviewOverlay | undefined;
 	#planReviewOverlayHandle: OverlayHandle | undefined;
 	#planReviewCancel: (() => void) | undefined;
+	/** Serializable review annotations keyed by the resolved plan file path. */
+	#planReviewAnnotationState = new Map<string, PlanReviewAnnotationState>();
+	/** Annotation state held until the associated queued refinement actually starts. */
+	#planReviewAnnotationStateBySubmission = new WeakMap<SubmittedUserInput, string>();
 	readonly lspServers: LspStartupServerInfo[] | undefined = undefined;
 	mcpManager?: MCPManager;
 	readonly #toolUiContextSetter: (uiContext: ExtensionUIContext, hasUI: boolean) => void;
@@ -577,6 +585,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	readonly #omfgController: OmfgController;
 	readonly #commandController: CommandController;
 	readonly #todoCommandController: TodoCommandController;
+	readonly #liveCommandController: LiveCommandController;
 	readonly #eventController: EventController;
 	get eventController(): EventController {
 		return this.#eventController;
@@ -786,6 +795,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#eventController = new EventController(this);
 		this.#commandController = new CommandController(this);
 		this.#todoCommandController = new TodoCommandController(this);
+		this.#liveCommandController = new LiveCommandController(this);
 		this.#selectorController = new SelectorController(this);
 		this.#focusController = new SessionFocusController(this);
 		this.#inputController = new InputController(this);
@@ -1007,11 +1017,27 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.isInitialized = true;
 		this.ui.requestRender(true);
 
+		// Prewarm the local tiny-title worker off the submit hot path: spawn it
+		// now, idle and unref'd, so the first submit reuses a live subprocess
+		// instead of paying spawn latency ahead of the first frame (issue #6462).
+		// No-ops for the online default and for already-named sessions that will
+		// not be titled. Deferred via setImmediate so it runs AFTER the render
+		// callback requestRender(true) queued above (immediates are FIFO) — the
+		// spawn syscall never lands in the same loop turn ahead of the first paint.
+		setImmediate(() => {
+			if (!$env.PI_NO_TITLE && !this.sessionManager.getSessionName()) {
+				tinyTitleClient.prewarm(this.settings.get("providers.tinyModel"));
+			}
+		});
+
 		// Initialize hooks with TUI-based UI context
 		await this.initHooksAndCustomTools();
 
 		// Restore mode from session (e.g. plan mode on resume)
-		this.session.setSessionBeforeSwitchReconciler?.(() => this.#quiesceVibeForSessionSwitch());
+		this.session.setSessionBeforeSwitchReconciler?.(async () => {
+			await this.#liveCommandController.stop();
+			await this.#quiesceVibeForSessionSwitch();
+		});
 		this.session.setSessionSwitchReconciler?.(() => this.#reconcileModeFromSession({ preserveActiveGoal: true }));
 		await this.#reconcileModeFromSession();
 
@@ -1581,6 +1607,11 @@ export class InteractiveMode implements InteractiveModeContext {
 			return false;
 		}
 		input.started = true;
+		const annotationStateKey = this.#planReviewAnnotationStateBySubmission.get(input);
+		if (annotationStateKey) {
+			this.#planReviewAnnotationStateBySubmission.delete(input);
+			this.#planReviewAnnotationState.delete(annotationStateKey);
+		}
 		return true;
 	}
 
@@ -1710,6 +1741,60 @@ export class InteractiveMode implements InteractiveModeContext {
 		const context = this.viewSession.buildTranscriptSessionContext({
 			collapseCompactedHistory: settings.get("display.collapseCompacted"),
 		});
+		const preservedLiveToolCallIds = new Set<string>();
+		// A preserved pending-tool component whose result has already landed in
+		// the replayed transcript is re-rendered by `renderSessionContext` itself
+		// (the toolResult message reconstructs the block with its output). Keeping
+		// it in the live set too re-appends a second identical block below the
+		// replayed one — the tool call renders twice (#6516). The preservation
+		// above assumes every pending-tool component is still dangling (its result
+		// lives outside `state.messages`), which stops holding the instant the
+		// result is persisted while the component lingers in `pendingTools` (a
+		// rebuild racing tool-completion, a background/displaceable snapshot).
+		// Drop the already-resolved ones and let the replay own them; only
+		// genuinely in-flight (dangling, replay-stripped) calls still need
+		// preserving.
+		for (const message of context.messages) {
+			if (message.role !== "toolResult") continue;
+			const resolved = livePendingTools.get(message.toolCallId);
+			if (!resolved) continue;
+			// A background task's initial `async.state === "running"` result is
+			// persisted while `EventController#handleToolExecutionEnd` deliberately
+			// keeps its component in `pendingTools` so a later
+			// `tool_execution_update`/`_end` settles it. Such a handle is still
+			// live — dropping it would strand those updates on the running snapshot
+			// — so keep it and let the live component retain ownership; only
+			// terminal results are owned by the replay. (Cast mirrors the async
+			// detail reads in tool-execution.ts / event-controller.ts.)
+			const details = message.details as { async?: { state?: string } } | undefined;
+			if (details?.async?.state === "running") {
+				preservedLiveToolCallIds.add(message.toolCallId);
+				continue;
+			}
+			livePendingTools.delete(message.toolCallId);
+			// A `ReadToolGroupComponent` is shared by every read id it renders
+			// (ui-helpers sets the same group for each collapsed read call). While a
+			// sibling read id still points at it the component must stay on screen
+			// and preserved — splicing it here would detach the pending read's
+			// display and strand its future result on an off-screen component.
+			// Splice only once no remaining pending id shares it.
+			let stillShared = false;
+			for (const other of livePendingTools.values()) {
+				if (other === resolved) {
+					stillShared = true;
+					break;
+				}
+			}
+			if (stillShared) {
+				// The shared component still owns this completed member as well as
+				// its pending sibling. Suppress the replay copy so the group remains
+				// a single on-screen block while future results keep routing to it.
+				preservedLiveToolCallIds.add(message.toolCallId);
+				continue;
+			}
+			const index = liveComponents.indexOf(resolved as unknown as Component);
+			if (index >= 0) liveComponents.splice(index, 1);
+		}
 		// Prune the settled-component cache to the messages this rebuild will
 		// actually render. Message objects stay strongly reachable through
 		// session entries for the whole session, so entries for compacted-away
@@ -1721,7 +1806,10 @@ export class InteractiveMode implements InteractiveModeContext {
 			if (component) retained.set(message, component);
 		}
 		this.transcriptMessageComponents = retained;
-		this.renderSessionContext(context, { reuseSettledComponents: options.reuseSettledComponents });
+		this.renderSessionContext(context, {
+			reuseSettledComponents: options.reuseSettledComponents,
+			preservedLiveToolCallIds,
+		});
 		for (const child of liveComponents) {
 			this.chatContainer.addChild(child);
 		}
@@ -2713,6 +2801,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			onExternalEditor?: () => void;
 			onPlanEdited?: (content: string) => void;
 			onFeedbackChange?: (feedback: string) => void;
+			annotationState?: PlanReviewAnnotationState;
+			onAnnotationStateChange?: (state: PlanReviewAnnotationState) => void;
 			initialIndex?: number;
 		},
 		extra?: { slider?: HookSelectorSlider },
@@ -2736,6 +2826,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				initialIndex: dialogOptions?.initialIndex,
 				slider: extra?.slider,
 				externalEditorLabel: this.keybindings.getDisplayString("app.editor.external") || undefined,
+				annotationState: dialogOptions?.annotationState,
 			},
 			{
 				onPick: choice => finish(choice),
@@ -2745,6 +2836,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				onAnnotationExternalEditor: (draft, commit) => void this.#openPlanAnnotationInExternalEditor(draft, commit),
 				onPlanEdited: dialogOptions?.onPlanEdited,
 				onFeedbackChange: dialogOptions?.onFeedbackChange,
+				onAnnotationStateChange: dialogOptions?.onAnnotationStateChange,
 			},
 		);
 		this.#planReviewOverlay = overlay;
@@ -2974,7 +3066,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			compactBeforeExecute?: boolean;
 			executionModel?: ResolvedRoleModel;
 		},
-	): Promise<void> {
+	): Promise<boolean> {
 		const previousTools = this.#planModePreviousTools ?? this.session.getEnabledToolNames();
 
 		// Mark the pending abort caused by the plan-mode → compaction transition as
@@ -3073,7 +3165,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.showWarning(
 				"Plan approved, but compaction was cancelled — execution not dispatched. Submit a turn to continue.",
 			);
-			return;
+			return false;
 		}
 
 		// Approved plans land in a fresh (or compacted) session whose first user-visible
@@ -3115,14 +3207,15 @@ export class InteractiveMode implements InteractiveModeContext {
 		// noted below), catch `AgentBusyError` and fall back to the same queue.
 		if (this.session.isStreaming) {
 			await this.session.followUp(planModePrompt, undefined, { synthetic: true });
-			return;
+		} else {
+			try {
+				await this.session.prompt(planModePrompt, { synthetic: true });
+			} catch (error) {
+				if (!(error instanceof AgentBusyError)) throw error;
+				await this.session.followUp(planModePrompt, undefined, { synthetic: true });
+			}
 		}
-		try {
-			await this.session.prompt(planModePrompt, { synthetic: true });
-		} catch (error) {
-			if (!(error instanceof AgentBusyError)) throw error;
-			await this.session.followUp(planModePrompt, undefined, { synthetic: true });
-		}
+		return true;
 	}
 	async #abortPlanApprovalTurnSilently(): Promise<void> {
 		this.session.markPlanInternalAbortPending();
@@ -3651,6 +3744,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// that the Refine branch re-prompts the model with.
 		let editedContent: string | undefined;
 		let feedback = "";
+		const annotationStateKey = this.#resolvePlanFilePath(planFilePath);
 
 		const choice = await this.showPlanReview(
 			planContent,
@@ -3665,6 +3759,11 @@ export class InteractiveMode implements InteractiveModeContext {
 				},
 				onFeedbackChange: value => {
 					feedback = value;
+				},
+				annotationState: this.#planReviewAnnotationState.get(annotationStateKey),
+				onAnnotationStateChange: state => {
+					if (state.annotations.length > 0) this.#planReviewAnnotationState.set(annotationStateKey, state);
+					else this.#planReviewAnnotationState.delete(annotationStateKey);
 				},
 				disabledIndices: keepContextDisabled ? [PLAN_KEEP_CONTEXT_OPTION_INDEX] : undefined,
 			},
@@ -3717,13 +3816,14 @@ export class InteractiveMode implements InteractiveModeContext {
 						: -1;
 				const executionModel =
 					slider && cycle && selectedTierIndex !== restoredIndex ? cycle.models[selectedTierIndex] : undefined;
-				await this.#approvePlan(latestPlanContent, {
+				const executionDispatched = await this.#approvePlan(latestPlanContent, {
 					planFilePath,
 					title: details.title,
 					preserveContext: choice !== "Approve and execute",
 					compactBeforeExecute: choice === "Approve and compact context",
 					executionModel,
 				});
+				if (executionDispatched) this.#planReviewAnnotationState.delete(annotationStateKey);
 			} catch (error) {
 				this.showError(
 					`Failed to finalize approved plan: ${error instanceof Error ? error.message : String(error)}`,
@@ -3738,9 +3838,12 @@ export class InteractiveMode implements InteractiveModeContext {
 			try {
 				if (refinement) {
 					if (this.onInputCallback) {
-						this.onInputCallback(this.startPendingSubmission({ text: feedback }));
+						const input = this.startPendingSubmission({ text: feedback });
+						this.#planReviewAnnotationStateBySubmission.set(input, annotationStateKey);
+						this.onInputCallback(input);
 					} else {
 						await this.session.prompt(feedback);
+						this.#planReviewAnnotationState.delete(annotationStateKey);
 					}
 				} else {
 					this.showStatus("Refine plan: enter a follow-up prompt.");
@@ -3815,6 +3918,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#stopLoadingAnimation(false);
 		}
 		this.#cleanupMicAnimation();
+		this.#liveCommandController.dispose();
 		this.#cancelTodoAutoClearTimer();
 		this.#cancelObserverUiSyncTimer();
 		this.#cancelGoalContinuation();
@@ -3856,6 +3960,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	async shutdown(): Promise<void> {
 		if (this.#isShuttingDown) return;
 		this.#isShuttingDown = true;
+
+		await this.#liveCommandController.stop();
 
 		this.#btwController.dispose();
 		this.#omfgController.dispose();
@@ -4246,10 +4352,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#uiHelpers.addMessageToChat(message, options);
 	}
 
-	renderSessionContext(
-		sessionContext: SessionContext,
-		options?: { updateFooter?: boolean; populateHistory?: boolean; reuseSettledComponents?: boolean },
-	): void {
+	renderSessionContext(sessionContext: SessionContext, options?: RenderSessionContextOptions): void {
 		for (const message of sessionContext.messages) {
 			this.noteDisplayableThinkingContent(message);
 		}
@@ -4370,6 +4473,10 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	async handleSTTToggle(): Promise<void> {
+		if (this.#liveCommandController.active) {
+			this.showWarning("End live mode before using push-to-talk speech input.");
+			return;
+		}
 		if (!settings.get("stt.enabled")) {
 			this.showWarning("Speech-to-text is disabled. Enable it in settings: stt.enabled");
 			return;
@@ -4400,6 +4507,15 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.ui.requestRender();
 			},
 		});
+	}
+
+	/** Start or stop the Codex-backed realtime voice surface. */
+	async handleLiveCommand(): Promise<void> {
+		if (this.#sttController && this.#sttController.state !== "idle") {
+			this.showWarning("Finish the current speech-to-text capture before starting live mode.");
+			return;
+		}
+		await this.#liveCommandController.handleCommand();
 	}
 
 	#setMicCursor(color: { r: number; g: number; b: number }): void {
@@ -4576,6 +4692,10 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	showOAuthSelector(mode: "login" | "logout", providerId?: string): Promise<void> {
 		return this.#selectorController.showOAuthSelector(mode, providerId);
+	}
+
+	showSessionPinSelector(): Promise<void> {
+		return this.#selectorController.showSessionPinSelector();
 	}
 
 	showResetUsageSelector(): Promise<void> {
