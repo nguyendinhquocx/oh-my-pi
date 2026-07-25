@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### Added
+
+- `omp usage` now surfaces auto-disabled credentials as red `✗` tombstone rows (identity, how long ago, the shortened upstream cause — e.g. `Refresh token expired` — and a re-login hint), including a provider section when no active credential remains. User-driven tombstones (`replaced by newer credential`, `deleted by user`) and API-key rows stay hidden. Requires a broker with `GET /v1/credentials/disabled`; older brokers degrade to no tombstone rows.
+- `omp usage` warns about Anthropic's ~30-day OAuth grant lifetime: accounts whose interactive login (`authorizedAt`) is within a week of the deadline get a yellow `⚠ re-login within <time>` line, and past-deadline accounts a red one. Grants die server-side exactly ~30 days after login regardless of refresh rotation, so this is the only warning before the broker auto-disables the row.
+
+### Fixed
+
+- Fixed the Docker `natives-builder` stage failing to build releases ≥ 17.1.1: the native audio stack added bindgen (miniaudio needs libclang) and a bundled-opus CMake build (needs cmake + make), none of which were installed in the slim builder image.
+- Fixed `omp usage` duplicating org-less legacy accounts as "no usage data" rows whenever any sibling report carried an organization (mixed pools of pre-org-capture rows and fresh org-scoped logins): an org-less account is now covered by its own org-less report, while org-attributed sibling reports still never count as its coverage.
+- `omp usage` revalidates the broker credential snapshot before rendering: live usage reports were previously paired with a disk-cached account list up to an hour old, so a just-completed re-login (org-less row upserted to org-scoped) rendered as a phantom duplicate until the cache expired.
+
+## [17.1.3] - 2026-07-24
+
+### Fixed
+
+- Fixed the in-process `find` builtin's `-exec`/`-execdir` children inheriting the omp process's real stdout/stderr, so commands like `find … -exec ls -ld {} \;` spammed their output straight into the terminal (corrupting the TUI) instead of the tool's captured output, and bypassed shell redirects. Exec children now stream stdout/stderr back through the shell's scope streams (matching `xargs`/`ifne`) and run with the shell's exported environment (`env_clear` + scope snapshot) instead of the host process environment.
+- Fixed `ast_edit` erroring with "`lang` is required" — an argument that no longer exists in the tool schema — when `paths` resolved to files of multiple languages (e.g. a crate directory with `.rs` + `.toml`). Mixed-language paths now rewrite per file: each file is parsed in its own inferred language, patterns are compiled per language, and a pattern that doesn't parse in some matched language simply skips those files.
+- Fixed the `retain` tool's TUI renderer crashing when streaming arguments temporarily expose a non-array `items` value ([#6528](https://github.com/can1357/oh-my-pi/issues/6528)).
+- Fixed Edit and Write tools failing with `Settings not initialized` in isolated sessions by using each tool session's settings for generated-file guards, with safe schema defaults for standalone guards and inline-image rendering ([#6549](https://github.com/can1357/oh-my-pi/issues/6549)).
+
 ## [17.1.2] - 2026-07-24
 
 ### Added

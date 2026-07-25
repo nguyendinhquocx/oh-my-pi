@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Added
+
+- OAuth logins now stamp `authorizedAt` (epoch ms of the interactive login) on the stored credential, and every refresh-persist path preserves it. Anthropic expires the whole OAuth grant family ~30 days after authorization regardless of refresh-token rotation (observed as `invalid_grant: "Refresh token expired"` on the latest rotated token, exactly 30 days after login, across four production accounts), so the login anchor is what makes re-login deadlines computable. Exported `ANTHROPIC_OAUTH_GRANT_TTL_MS` alongside the anthropic OAuth flow.
+- Added `GET /v1/credentials/disabled` to the auth broker and `AuthBrokerClient.listDisabledCredentials`: disabled-credential tombstones (`DisabledCredentialSummary` — identity, verbatim disable cause, disable timestamp; never token material) so auto-disabled accounts stay visible to clients instead of silently vanishing from the snapshot. `AuthStorage.listDisabledCredentials` serves the same data locally from SQLite; clients of brokers predating the endpoint get an empty list (404 mapped, no error).
+- Added `AuthStorage.revalidateCredentials()` and the optional `AuthCredentialStore.refreshSnapshot` hook: remote broker stores re-fetch `GET /v1/snapshot` on demand so callers pairing live per-credential data with stored identities (`omp usage`) never render against the up-to-an-hour-stale disk-cached snapshot; local SQLite stores are always current and only reload.
+
+## [17.1.3] - 2026-07-24
+
+### Fixed
+
+- Fixed Cursor sessions exposing `ast_edit` (and other staged-preview `xd://` devices) without a reachable resolver: the built-in `write` tool — which carries the `xd://resolve` / `xd://reject` transport that finalizes a staged preview — was filtered out of Cursor's forwarded catalog, so previews could never be resolved and the session aborted after three forced `write` turns. `write` is now re-included in the forwarded catalog whenever pi-agent devices are advertised ([#6536](https://github.com/can1357/oh-my-pi/issues/6536)).
+- Fixed OpenAI Responses and chat-completions streams honoring per-model first-event watchdog policy, allowing local llama.cpp-style backends to process arbitrarily large prompts without a premature client cancellation ([#6524](https://github.com/can1357/oh-my-pi/issues/6524)).
+
 ## [17.1.2] - 2026-07-24
 
 ### Added
