@@ -10,7 +10,8 @@ import { CustomToolAdapter } from "../extensibility/custom-tools/wrapper";
 import type { ExtensionRunner } from "../extensibility/extensions";
 import { ExtensionToolWrapper } from "../extensibility/extensions/wrapper";
 import { loadSkills, type Skill, type SkillWarning, setActiveSkills } from "../extensibility/skills";
-import type { LocalProtocolOptions } from "../internal-urls";
+import { type LocalProtocolOptions, XD_URL_PREFIX } from "../internal-urls";
+import { deduplicateMCPToolsByName } from "../mcp/tool-bridge";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
 import { MEMORY_BACKEND_TOOL_NAMES } from "../memory-backend/tool-names";
 import type { MemoryBackendStartOptions } from "../memory-backend/types";
@@ -22,6 +23,7 @@ import { wrapToolWithMetaNotice } from "../tools/output-meta";
 import { ToolAbortError, ToolError } from "../tools/tool-errors";
 import { isMountableUnderXdev, type XdevRegistry } from "../tools/xdev";
 import { type EditMode, resolveEditMode } from "../utils/edit-mode";
+import { type InspectImageMode, isInspectImageToolActive } from "../utils/inspect-image-mode";
 import { formatLocalCalendarDate } from "../utils/local-date";
 import {
 	extractPermissionLocations,
@@ -55,6 +57,9 @@ export interface SessionToolsHost {
 	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void;
 	notifyCommandMetadataChanged(): void;
 	localProtocolOptions(): LocalProtocolOptions;
+	/** Session-scoped `/vision` override; undefined means "follow the persisted setting". */
+	getInspectImageModeOverride(): InspectImageMode | undefined;
+	setInspectImageModeOverride(mode: InspectImageMode | undefined): void;
 }
 
 interface SessionToolsOptions {
@@ -62,6 +67,8 @@ interface SessionToolsOptions {
 	toolRegistry?: Map<string, AgentTool>;
 	createVibeTools?: () => AgentTool[];
 	createComputerTool?: () => Promise<AgentTool | null>;
+	/** Creates the built-in `inspect_image` tool for session-scoped runtime enablement (see {@link SessionTools.setInspectImageMode}). */
+	createInspectImageTool?: () => Promise<AgentTool | null>;
 	builtInToolNames?: Iterable<string>;
 	presentationPinnedToolNames?: ReadonlySet<string>;
 	ensureWriteRegistered?: () => Promise<boolean>;
@@ -78,6 +85,79 @@ interface SessionToolsOptions {
 	skillsReloadable?: boolean;
 }
 
+export interface MountedMCPToolRouteSource {
+	readonly name: string;
+	readonly mcpServerName?: unknown;
+	readonly mcpToolName?: unknown;
+}
+
+export interface MountedMCPToolRoute {
+	readonly mcpServerName: string;
+	readonly mcpToolName: string;
+	readonly name: string;
+}
+
+export interface MCPXdevGuidanceMapping extends MountedMCPToolRoute {
+	readonly label: string;
+	readonly path: string;
+}
+
+export interface MCPXdevGuidanceProjection {
+	readonly mappings: readonly MCPXdevGuidanceMapping[];
+	readonly hasOmittedMappings: boolean;
+}
+
+const MAX_MCP_XDEV_GUIDANCE_MAPPING_DATA_LENGTH = 4000;
+const MAX_MCP_XDEV_GUIDANCE_MAPPINGS = 64;
+
+/** Yield exact mounted MCP ownership and route metadata. */
+export function* collectMountedMCPToolRoutes(
+	tools: Iterable<MountedMCPToolRouteSource>,
+): Generator<MountedMCPToolRoute> {
+	for (const tool of tools) {
+		if (typeof tool.mcpServerName !== "string" || typeof tool.mcpToolName !== "string") continue;
+		yield {
+			mcpServerName: tool.mcpServerName,
+			mcpToolName: tool.mcpToolName,
+			name: tool.name,
+		};
+	}
+}
+
+function formatMCPXdevGuidanceLabel(label: string): string {
+	return (JSON.stringify(label) ?? '""')
+		.replaceAll("`", "\\u0060")
+		.replaceAll("\u2028", "\\u2028")
+		.replaceAll("\u2029", "\\u2029");
+}
+
+/**
+ * Project exact live MCP routes into the bounded, Markdown-safe mapping data
+ * rendered by the static MCP guidance prompt.
+ */
+export function projectMountedMCPXdevGuidance(routes: Iterable<MountedMCPToolRoute>): MCPXdevGuidanceProjection {
+	const mappings: MCPXdevGuidanceMapping[] = [];
+	let remainingMappingDataLength = MAX_MCP_XDEV_GUIDANCE_MAPPING_DATA_LENGTH;
+	let hasOmittedMappings = false;
+	for (const route of routes) {
+		const rawMappingDataLength = route.mcpToolName.length + XD_URL_PREFIX.length + route.name.length;
+		if (mappings.length >= MAX_MCP_XDEV_GUIDANCE_MAPPINGS || rawMappingDataLength > remainingMappingDataLength) {
+			hasOmittedMappings = true;
+			continue;
+		}
+		const label = formatMCPXdevGuidanceLabel(route.mcpToolName);
+		const path = `${XD_URL_PREFIX}${route.name}`;
+		const mappingDataLength = label.length + path.length;
+		if (mappingDataLength > remainingMappingDataLength) {
+			hasOmittedMappings = true;
+			continue;
+		}
+		mappings.push({ ...route, label, path });
+		remainingMappingDataLength -= mappingDataLength;
+	}
+	return { mappings, hasOmittedMappings };
+}
+
 const XDEV_MOUNT_NOTICE_MESSAGE_TYPE = "xdev-mount-notice";
 
 /** Owns tool registration, presentation, prompt rebuilding, skills, and permissions. */
@@ -87,6 +167,7 @@ export class SessionTools {
 	#toolRegistry: Map<string, AgentTool>;
 	#createVibeTools: (() => AgentTool[]) | undefined;
 	#createComputerTool: SessionToolsOptions["createComputerTool"];
+	#createInspectImageTool: SessionToolsOptions["createInspectImageTool"];
 	#installedVibeToolNames = new Set<string>();
 	#builtInToolNames: Set<string>;
 	#rpcHostToolNames = new Set<string>();
@@ -97,6 +178,7 @@ export class SessionTools {
 	#runtimeSelectedToolNames: ReadonlySet<string> | undefined;
 	#baseSystemPrompt: string[];
 	#lastAppliedToolSignature: string | undefined;
+	#mcpRefreshTail: Promise<void> = Promise.resolve();
 	#promptModelKey: string | undefined;
 	#rebuildSystemPrompt: SessionToolsOptions["rebuildSystemPrompt"];
 	#getLocalCalendarDate: () => string;
@@ -115,6 +197,7 @@ export class SessionTools {
 		this.#toolRegistry = options.toolRegistry ?? new Map();
 		this.#createVibeTools = options.createVibeTools;
 		this.#createComputerTool = options.createComputerTool;
+		this.#createInspectImageTool = options.createInspectImageTool;
 		this.#builtInToolNames = new Set(options.builtInToolNames ?? []);
 		this.#presentationPinnedToolNames = options.presentationPinnedToolNames;
 		this.#ensureWriteRegistered = options.ensureWriteRegistered;
@@ -328,6 +411,10 @@ export class SessionTools {
 		} else if (computerExpected) {
 			this.#logComputerState("Computer tool retained after model change", true);
 		}
+
+		// inspect_image auto mode keys off model image capability, so a model
+		// switch can flip the tool either way.
+		await this.reconcileInspectImageAfterModelChange();
 	}
 
 	/** Enabled MCP tools in their current presentation partition. */
@@ -543,6 +630,13 @@ export class SessionTools {
 			throw error;
 		}
 
+		if (this.#host.isDisposed()) {
+			this.#mountedXdevToolNames = previousMounted;
+			this.#xdevRegistry?.reconcile(previousMountedTools);
+			this.#setActiveToolNames?.(previousActiveToolNames);
+			return;
+		}
+
 		this.#notifyXdevMountDelta(previousMounted);
 		this.#host.agent.setTools(tools);
 		if (rebuiltSystemPrompt && rebuiltSignature) {
@@ -556,15 +650,15 @@ export class SessionTools {
 	}
 
 	/**
-	 * Record a mid-session `xd://` mount delta for the model without rewriting
-	 * the system prompt: the prompt (and its provider cache prefix) stays
-	 * byte-stable across MCP connects and disconnects. The delta is NOT steered
-	 * immediately — a steered notice landing at a run's stop boundary (or while
-	 * the session is idle) forces an unsolicited extra assistant turn — it is
-	 * coalesced into {@link #pendingXdevMountDelta} and rides along with the
-	 * next prompt (docs + schema stay one `read xd://<tool>` away). The full
-	 * docs join the system prompt opportunistically on the next unrelated
-	 * rebuild.
+	 * Record a mid-session `xd://` mount delta for the model. Non-MCP mount
+	 * churn remains notice-only, leaving the system prompt and provider cache
+	 * prefix byte-stable; mounted MCP route changes additionally rebuild the
+	 * global route guidance through the applied-tool signature. The delta is NOT
+	 * steered immediately — a steered notice landing at a run's stop boundary
+	 * (or while the session is idle) forces an unsolicited extra assistant turn
+	 * — so it is coalesced into {@link #pendingXdevMountDelta} and rides along
+	 * with the next prompt (docs + schema stay one `read xd://<tool>` away).
+	 * Full docs join the system prompt opportunistically on a rebuild.
 	 */
 	#notifyXdevMountDelta(previousMounted: ReadonlySet<string>): void {
 		const registry = this.#xdevRegistry;
@@ -767,6 +861,108 @@ export class SessionTools {
 		return true;
 	}
 
+	/** Current effective inspect_image state for `/vision status`. */
+	inspectImageState(): { mode: InspectImageMode; active: boolean; model: string | undefined } {
+		const model = this.#host.model();
+		return {
+			mode: this.#host.getInspectImageModeOverride() ?? this.#host.settings.get("inspect_image.mode"),
+			active: this.getEnabledToolNames().includes("inspect_image"),
+			model: model ? formatModelString(model) : undefined,
+		};
+	}
+
+	/**
+	 * Brings the active tool set in line with the effective inspect_image state
+	 * (mode setting, `/vision` override, active-model image capability).
+	 * Mirrors {@link setComputerToolEnabled}: enabling builds the tool through
+	 * the config factory on first use and reuses the registry entry afterwards.
+	 * Idempotent — safe to call from every model/settings change path.
+	 *
+	 * @returns false when the tool should be active but this session cannot
+	 *   build it (e.g. restricted child sessions have no factory).
+	 */
+	async reconcileInspectImageTool(): Promise<boolean> {
+		const expected = isInspectImageToolActive({
+			settings: this.#host.settings,
+			getActiveModel: () => this.#host.model(),
+			getInspectImageModeOverride: () => this.#host.getInspectImageModeOverride(),
+		});
+		// Keep the read tool's advertised description in sync BEFORE any prompt
+		// rebuild below, passing the post-change availability so the prompt never
+		// lags a flip in either direction. Per-read lazy sync is the backstop.
+		const syncReadDescription = (available: boolean): void => {
+			const readTool = this.#toolRegistry.get("read") as
+				| { syncInspectImageState?: (available?: boolean) => boolean }
+				| undefined;
+			readTool?.syncInspectImageState?.(available);
+		};
+		const active = this.getEnabledToolNames();
+		const isActive = active.includes("inspect_image");
+		if (expected === isActive) {
+			syncReadDescription(isActive);
+			return true;
+		}
+		if (!expected) {
+			syncReadDescription(false);
+			await this.applyActiveToolsByName(active.filter(name => name !== "inspect_image"));
+			return true;
+		}
+		if (!this.#toolRegistry.has("inspect_image")) {
+			const tool = await this.#createInspectImageTool?.();
+			if (tool?.name !== "inspect_image") {
+				logger.warn("inspect_image tool could not be created", {
+					model: this.#host.model()?.id,
+				});
+				syncReadDescription(false);
+				return false;
+			}
+			const wrapped = this.#wrapRuntimeTool(tool);
+			this.#toolRegistry.set(wrapped.name, wrapped);
+			this.#builtInToolNames.add(wrapped.name);
+		}
+		syncReadDescription(true);
+		await this.applyActiveToolsByName([...active, "inspect_image"]);
+		return true;
+	}
+
+	/**
+	 * Reconciles inspect_image after a model change and surfaces a notice when
+	 * the visible tool set actually flipped. Called from every model-change
+	 * path — including retry-fallback switches that bypass
+	 * {@link syncAfterModelChange}.
+	 */
+	async reconcileInspectImageAfterModelChange(): Promise<void> {
+		const before = this.getEnabledToolNames().includes("inspect_image");
+		const reconciled = await this.reconcileInspectImageTool();
+		const after = this.getEnabledToolNames().includes("inspect_image");
+		if (!reconciled || before === after) return;
+		const model = this.#host.model();
+		const modelName = model ? formatModelString(model) : "the current model";
+		this.#host.emitNotice(
+			"info",
+			after
+				? `inspect_image is now available: ${modelName} has no native image input.`
+				: `inspect_image is now hidden: ${modelName} supports image input natively. Override with /vision on.`,
+			"vision",
+		);
+	}
+
+	/**
+	 * Session-scoped `/vision` override. `auto` clears the override so the
+	 * persisted `inspect_image.mode` setting (itself possibly `auto`) decides;
+	 * `on`/`off` force the tool for this session only. Takes effect before the
+	 * next model call.
+	 *
+	 * @returns false when `on` was requested but the tool cannot be built here.
+	 */
+	async setInspectImageMode(mode: InspectImageMode): Promise<boolean> {
+		this.#host.setInspectImageModeOverride(mode === "auto" ? undefined : mode);
+		const applied = await this.reconcileInspectImageTool();
+		const { active, model } = this.inspectImageState();
+		logger.debug("inspect_image mode changed", { mode, active, model });
+		return applied;
+	}
+
 	/** Rebuilds the stable base prompt for the current tools and model. */
 	async refreshBaseSystemPrompt(): Promise<void> {
 		if (this.#host.isDisposed() || !this.#rebuildSystemPrompt) return;
@@ -847,9 +1043,10 @@ export class SessionTools {
 	 *      `tool.customWireName` and overrides the internal name on the model wire
 	 *      (e.g. `edit` exposes itself as `apply_patch` to GPT-5 in apply_patch mode);
 	 *      a stale wire name would desync prompt guidance from actual tool routing.
-	 *   3. When MCP discovery is on, every registry tool's name+label+description+
-	 *      customWireName, since `rebuildSystemPrompt` summarizes discoverable MCP
-	 *      tools that are not in the active set.
+	 *   3. The bounded mounted-MCP projection: escaped original-name labels,
+	 *      actual `xd://` paths, and the omission flag in catalog order. These are
+	 *      the exact values rendered by the global transport guidance; catalog
+	 *      churn wholly behind the fallback does not change the prompt.
 	 *   4. MCP server instructions text (per server), since `rebuildSystemPrompt`
 	 *      embeds these in the appended prompt under "## MCP Server Instructions".
 	 *      A server upgrade can change instructions while keeping tools identical.
@@ -880,8 +1077,16 @@ export class SessionTools {
 		const describeTool = (tool: AgentTool): string =>
 			`${tool.name}=${tool.label ?? ""}|${tool.description ?? ""}|${tool.customWireName ?? ""}`;
 		const descriptionSegment = tools.map(describeTool).join("\u0002");
-		let instructionsSegment = "";
+		const mountedMCPProjection = projectMountedMCPXdevGuidance(
+			collectMountedMCPToolRoutes(this.#xdevRegistry?.list() ?? []),
+		);
+		const mountedMCPRouteSegment =
+			JSON.stringify({
+				mappings: mountedMCPProjection.mappings.map(mapping => [mapping.label, mapping.path] as const),
+				hasOmittedMappings: mountedMCPProjection.hasOmittedMappings,
+			}) ?? "{}";
 		const serverInstructions = this.#getMcpServerInstructions?.();
+		let instructionsSegment = "";
 		if (serverInstructions && serverInstructions.size > 0) {
 			// Sort by server name so transport flap order does not perturb the signature.
 			const entries: string[] = [];
@@ -891,22 +1096,32 @@ export class SessionTools {
 			entries.sort();
 			instructionsSegment = entries.join("\u0006");
 		}
-		// The xd:// device inventory is deliberately NOT part of the signature:
-		// a mount/unmount announces itself via `#notifyXdevMountDelta` instead of
-		// rewriting the system prompt, so MCP connects/disconnects keep the
-		// prompt (and its provider cache prefix) byte-stable. Rebuilds triggered
-		// by other inputs pick up the current device docs opportunistically.
+		// The non-MCP remainder of the xd:// inventory is deliberately NOT part
+		// of the signature: its mount/unmount announces itself through
+		// `#notifyXdevMountDelta` rather than rewriting the system prompt, keeping
+		// the provider cache prefix byte-stable. Mounted MCP routes are the narrow
+		// exception above, bounded to the exact projection rendered in the global
+		// route guidance so churn wholly behind its fallback does not rebuild.
 		const date = this.#getLocalCalendarDate();
-		return `${nameSegment}\u0003${descriptionSegment}\u0007${instructionsSegment}|${date}`;
+		return `${nameSegment}\u0003${descriptionSegment}\u0007${instructionsSegment}\u0008${mountedMCPRouteSegment}|${date}`;
 	}
 
 	/**
-	 * Replace MCP tools in the registry and enable them immediately. Every
-	 * connected MCP tool becomes available (mounted under `xd://` when that
-	 * transport is active, else top-level). Lets `/mcp add/remove/reauth` take
-	 * effect without restarting the session.
+	 * Replace MCP tools in the registry and enable them immediately. Refreshes
+	 * are serialized so an older asynchronous prompt rebuild cannot commit
+	 * after a newer catalog snapshot. Every connected MCP tool becomes available
+	 * (mounted under `xd://` when that transport is active, else top-level).
 	 */
-	async refreshMCPTools(mcpTools: CustomTool[]): Promise<void> {
+	refreshMCPTools(mcpTools: CustomTool[]): Promise<void> {
+		const snapshot = [...mcpTools];
+		const refresh = this.#mcpRefreshTail.then(() =>
+			this.#host.isDisposed() ? undefined : this.#applyMCPToolRefresh(snapshot),
+		);
+		this.#mcpRefreshTail = refresh.catch(() => {});
+		return refresh;
+	}
+
+	async #applyMCPToolRefresh(mcpTools: CustomTool[]): Promise<void> {
 		const existingNames = Array.from(this.#toolRegistry.keys());
 		const previousMcpTools = new Map(
 			existingNames.flatMap(name => {
@@ -914,6 +1129,12 @@ export class SessionTools {
 				return isMCPToolName(name) && tool ? [[name, tool] as const] : [];
 			}),
 		);
+		const restorePreviousMcpTools = () => {
+			for (const name of this.#toolRegistry.keys()) {
+				if (isMCPToolName(name)) this.#toolRegistry.delete(name);
+			}
+			for (const [name, tool] of previousMcpTools) this.#toolRegistry.set(name, tool);
+		};
 		for (const name of existingNames) {
 			if (isMCPToolName(name)) {
 				this.#toolRegistry.delete(name);
@@ -934,7 +1155,8 @@ export class SessionTools {
 		});
 
 		const extensionRunner = this.#host.extensionRunner();
-		for (const customTool of mcpTools) {
+		const uniqueMcpTools = deduplicateMCPToolsByName(mcpTools);
+		for (const customTool of uniqueMcpTools) {
 			const wrapped = wrapToolWithMetaNotice(CustomToolAdapter.wrap(customTool, getCustomToolContext) as AgentTool);
 			const finalTool = (
 				extensionRunner ? new ExtensionToolWrapper(wrapped, extensionRunner) : wrapped
@@ -944,14 +1166,12 @@ export class SessionTools {
 
 		// Every connected MCP tool is selected; centralized repartitioning owns
 		// presentation pins and write-transport activation/removal.
-		const nextActive = [...new Set([...this.#getActiveNonMCPToolNames(), ...mcpTools.map(tool => tool.name)])];
+		const nextActive = [...new Set([...this.#getActiveNonMCPToolNames(), ...uniqueMcpTools.map(tool => tool.name)])];
 		try {
 			await this.applyActiveToolsByName(nextActive);
+			if (this.#host.isDisposed()) restorePreviousMcpTools();
 		} catch (error) {
-			for (const name of this.#toolRegistry.keys()) {
-				if (isMCPToolName(name)) this.#toolRegistry.delete(name);
-			}
-			for (const [name, tool] of previousMcpTools) this.#toolRegistry.set(name, tool);
+			restorePreviousMcpTools();
 			throw error;
 		}
 	}
