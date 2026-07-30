@@ -356,9 +356,7 @@ jobs:
    release-npm:
       if: ${{ startsWith(github.ref, 'refs/tags/v') && !cancelled() &&
          needs.release_binary.result == 'success' &&
-         needs.release_binary_darwin.result == 'success' &&
          needs.release_github_verify.result == 'success' &&
-         needs.release_native_leaves.result == 'success' &&
          !inputs.skip_npm }}
       needs: [release_binary, release_github_verify, rust-hash]
       runs-on: ubuntu-22.04
