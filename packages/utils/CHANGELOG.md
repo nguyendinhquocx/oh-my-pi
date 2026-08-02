@@ -4,6 +4,16 @@
 
 ### Added
 
+- Added `parseFlag()` (boolean-ish env value parsing backing `$flag()`), `getBrowserRelayDir()` (~/.omp/browser-relay, XDG data category), and `getGlobalDaemonRuntimeDir()` (profile-independent broker state) for the browser relay mode.
+
+### Changed
+
+- Added static command metadata support to the lightweight CLI runner so root help can render without importing command implementations.
+
+## [17.2.4] - 2026-08-01
+
+### Added
+
 - Added `getSecretPlaceholderKeyPath()`, `getDaemonRuntimeDir()`, `getProviderInFlightRoot()`, and `getMarketplacesRegistryPath()` to resolve secret key, daemon runtime, provider in-flight, and marketplace registry paths under their respective XDG categories (state, data) instead of the config root.
 - Existing installs enabling XDG keep their data: a legacy `~/.omp/agent/secret-placeholder.key` or `~/.omp/marketplaces.json` is copied to its XDG location on first resolution, so persisted transcripts still deobfuscate and added marketplaces survive the move.
 
