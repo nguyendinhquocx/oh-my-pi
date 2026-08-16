@@ -391,11 +391,11 @@ describe("generated model policies", () => {
 		expect(models[0]?.compat?.supportsToolChoice).toBe(false);
 	});
 
-	it("sets OpenCode Go DeepSeek V4 tool-call request compat", () => {
-		const models: ModelSpec<"openai-completions">[] = [
+	it("sets OpenCode Go DeepSeek V4 tool-call request compat for both OpenAI APIs", () => {
+		const models: ModelSpec<Api>[] = [
 			createSpec({
 				id: "deepseek-v4-flash",
-				api: "openai-completions",
+				api: "openai-responses",
 				provider: "opencode-go",
 			}),
 			createSpec({
@@ -500,6 +500,43 @@ describe("generated model policies", () => {
 		expect(models[1]?.applyPatchToolType).toBe("freeform");
 		expect(models[2]?.applyPatchToolType).toBeUndefined();
 		expect(models[3]?.applyPatchToolType).toBeUndefined();
+	});
+
+	it("strips paid xAI Responses effort dials for off-allowlist reasoners", () => {
+		const models: ModelSpec<"openai-responses">[] = [
+			createSpec({
+				id: "grok-code-fast-1",
+				api: "openai-responses",
+				provider: "xai",
+				thinking: { mode: "effort", efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High] },
+			}),
+			createSpec({
+				id: "grok-4.5",
+				api: "openai-responses",
+				provider: "xai",
+				thinking: { mode: "effort", efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High] },
+			}),
+			createSpec({
+				id: "grok-code-fast-1",
+				api: "openai-responses",
+				provider: "openrouter",
+				thinking: { mode: "effort", efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High] },
+			}),
+		];
+
+		applyGeneratedModelPolicies(models);
+
+		expect(models[0]?.thinking).toBeUndefined();
+		expect(models[0]?.compat).toMatchObject({
+			supportsReasoningEffort: false,
+			omitReasoningEffort: true,
+		});
+		expect(models[0]?.compat).not.toHaveProperty("reasoningEffortMap");
+		expect(models[1]?.thinking?.efforts).toEqual([Effort.Minimal, Effort.Low, Effort.Medium, Effort.High]);
+		expect(models[1]?.compat?.supportsReasoningEffort).toBe(true);
+		// Non-xAI hosts are outside this policy — no baked no-dial compat.
+		expect(models[2]?.thinking).toBeDefined();
+		expect(models[2]?.compat?.supportsReasoningEffort).toBeUndefined();
 	});
 });
 
