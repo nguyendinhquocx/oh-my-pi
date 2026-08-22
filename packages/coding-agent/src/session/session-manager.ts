@@ -75,6 +75,7 @@ import {
 	writeTerminalBreadcrumb,
 } from "./session-paths";
 import { prepareEntryForPersistence } from "./session-persistence";
+import { loadPinnedSessionIds, sortPinnedFirst } from "./session-pins";
 import {
 	FileSessionStorage,
 	MemorySessionStorage,
@@ -2246,6 +2247,7 @@ export class SessionManager {
 			fromExtension?: boolean;
 			preserveData?: Record<string, unknown>;
 			method?: CompactionMethod;
+			providerReplayThroughEntryId?: string;
 			tokensAfter?: number;
 		} = {},
 	): string {
@@ -2258,6 +2260,7 @@ export class SessionManager {
 			tokensBefore,
 			tokensAfter: options.tokensAfter,
 			method: options.method,
+			providerReplayThroughEntryId: options.providerReplayThroughEntryId,
 			details: options.details,
 			fromExtension: options.fromExtension,
 			preserveData: options.preserveData,
@@ -2915,12 +2918,14 @@ export class SessionManager {
 		storage: SessionStorage = new FileSessionStorage(),
 	): Promise<SessionInfo[]> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
-		return listSessions(dir, storage);
+		const sessions = await listSessions(dir, storage);
+		return sortPinnedFirst(sessions, await loadPinnedSessionIds());
 	}
 
-	/** List all sessions across all project directories. */
-	static listAll(storage: SessionStorage = new FileSessionStorage()): Promise<SessionInfo[]> {
-		return listAllSessions(storage);
+	/** List all sessions across all project directories, pinned sessions first. */
+	static async listAll(storage: SessionStorage = new FileSessionStorage()): Promise<SessionInfo[]> {
+		const sessions = await listAllSessions(storage);
+		return sortPinnedFirst(sessions, await loadPinnedSessionIds());
 	}
 }
 
