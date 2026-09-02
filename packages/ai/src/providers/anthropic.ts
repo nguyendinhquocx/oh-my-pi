@@ -435,12 +435,11 @@ type AnthropicProviderSessionState = ProviderSessionState & {
 	strictToolsDisabled: boolean;
 	fastModeDisabled: boolean;
 	/**
-	 * Runtime-learned: this endpoint returned `400 Invalid signature in
-	 * thinking block` for a replayed unsigned thinking block, so it must be
-	 * treated as a signing proxy from now on. All subsequent requests demote
-	 * unsigned thinking to text for this (baseUrl, modelId), same behavior as
-	 * an explicit `compat.replayUnsignedThinking: false`. Cleared on session
-	 * close.
+	 * Runtime-learned: this endpoint rejected a replayed unsigned thinking
+	 * block, so it must be treated as a signing proxy from now on. All
+	 * subsequent requests demote unsigned thinking to text for this (baseUrl,
+	 * modelId), same behavior as an explicit
+	 * `compat.replayUnsignedThinking: false`. Cleared on session close.
 	 */
 	replayUnsignedThinkingDisabled: boolean;
 	/** Thinking blocks the API permanently dropped after a prefix mismatch. */
@@ -1629,13 +1628,6 @@ async function* observeDecodedAnthropicSdkEvents(
 const PROVIDER_MAX_RETRIES = 10;
 
 /**
- * Flat delay between attempts when Copilot 400s a model its own `/models`
- * catalog advertises. Part of the fleet carries the model and part doesn't, so
- * the retry is a reroll rather than a wait for capacity to free up.
- */
-const COPILOT_MODEL_FLAP_RETRY_DELAY_MS = 400;
-
-/**
  * How long `ping` keepalives may keep extending the idle deadline without any
  * semantic stream progress, as a multiple of the idle timeout. Anthropic pings
  * across legitimate generation gaps, so pings count as liveness — but a wedged
@@ -1660,20 +1652,6 @@ function shouldIgnoreAnthropicPreambleEvent(eventType: unknown): boolean {
 	if (typeof eventType !== "string") return false;
 	if (eventType === "ping") return true;
 	return !ANTHROPIC_MESSAGE_EVENTS.has(eventType);
-}
-
-/**
- * Whether an Anthropic (or Copilot-over-Anthropic) stream error should be
- * retried. The classification lives in {@link AIError.isProviderRetryableError};
- * this wrapper injects the Copilot-specific model-availability transient check,
- * which the error module must not import directly.
- */
-export function isProviderRetryableError(error: unknown, provider?: string): boolean {
-	return AIError.isProviderRetryableError(error, {
-		provider,
-		isProviderTransient:
-			provider === "github-copilot" ? (err): boolean => AIError.isCopilotTransientModelError(err) : undefined,
-	});
 }
 
 const THINKING_ENVELOPE_OPEN = "<thinking>";
@@ -1868,11 +1846,20 @@ function calculateFallbackTurnCost(
 }
 
 /**
- * Detects the Anthropic `400 Invalid `signature` in `thinking` block` failure
- * a signing proxy returns when a stripped/unsigned prior thinking block is
- * replayed as `signature: ""`. Exported for the compat tests.
+ * Detects the two shapes a signature-enforcing endpoint uses to reject a
+ * replayed unsigned thinking block (sent as `signature: ""`):
+ *
+ * - Anthropic and Anthropic-fronting proxies: `400 Invalid `signature` in
+ *   `thinking` block`.
+ * - Bedrock-backed proxies: the empty string fails schema validation before
+ *   signature checking, so it comes back as `ValidationException: The model
+ *   returned the following errors: messages.N.content.M.thinking.signature:
+ *   Field required`.
+ *
+ * Exported for the compat tests.
  */
 const INVALID_THINKING_SIGNATURE_PATTERN = /invalid\s+`?signature`?\s+in\s+`?thinking`?(?:\s+block)?/i;
+const MISSING_THINKING_SIGNATURE_PATTERN = /thinking\.signature\b[^"\n]{0,32}\brequired\b/i;
 const THINKING_PREFIX_BINDING_PATTERN =
 	/(?:bound to a different conversation|block_binding\.prefix_mismatch_behavior|prefix_mismatch_behavior)/i;
 
@@ -1882,7 +1869,7 @@ export function isThinkingPrefixBindingError(message: string): boolean {
 }
 
 export function isInvalidThinkingSignatureError(message: string): boolean {
-	return INVALID_THINKING_SIGNATURE_PATTERN.test(message);
+	return INVALID_THINKING_SIGNATURE_PATTERN.test(message) || MISSING_THINKING_SIGNATURE_PATTERN.test(message);
 }
 
 const INPUT_TRANSFORMATION_PATH_PATTERN = /^messages\.(\d+)\.content\.(\d+)$/;
@@ -1987,8 +1974,8 @@ function applyReportedInputTransformations(
 }
 
 /**
- * Prepend a pointed remediation to Anthropic's `Invalid signature in thinking
- * block` 400 when the model looks like an unmarked custom signing proxy
+ * Prepend a pointed remediation to a thinking-signature rejection 400 when the
+ * model looks like an unmarked custom signing proxy
  * (opaque baseUrl, `spec.reasoning: true`, no explicit
  * `compat.replayUnsignedThinking` override). The default is native replay for
  * the 3p reasoning majority (#2005); this hint turns the misconfigured-proxy
@@ -3002,7 +2989,7 @@ const streamAnthropicOnce = (
 						isInvalidThinkingSignatureError(streamFailureMessage)
 					) {
 						logger.warn(
-							"anthropic: signing proxy detected (Invalid signature in thinking block), demoting unsigned thinking and retrying",
+							"anthropic: signing proxy detected (thinking signature rejected), demoting unsigned thinking and retrying",
 							{
 								provider: model.provider,
 								model: model.id,
@@ -3063,7 +3050,7 @@ const streamAnthropicOnce = (
 						!isLocalIdleTimeout &&
 						firstTokenTime === undefined &&
 						!streamedReplayUnsafeContent &&
-						isProviderRetryableError(streamFailure, model.provider);
+						AIError.isProviderRetryableError(streamFailure);
 					if (
 						activeAbortTracker.wasCallerAbort() ||
 						providerRetryAttempt >= PROVIDER_MAX_RETRIES ||
@@ -3072,12 +3059,7 @@ const streamAnthropicOnce = (
 						throw streamFailure;
 					}
 					providerRetryAttempt++;
-					// Copilot's model-availability 400 is a per-request replica reroll, not
-					// upstream backpressure — the exponential curve would just add dead
-					// time to a coin flip that the next attempt is as likely to win.
-					const backoffDelayMs = AIError.isCopilotTransientModelError(streamFailure)
-						? COPILOT_MODEL_FLAP_RETRY_DELAY_MS
-						: calculateAnthropicRetryDelayMs(providerRetryAttempt - 1);
+					const backoffDelayMs = calculateAnthropicRetryDelayMs(providerRetryAttempt - 1);
 					// Honor the server's retry hint (`retry-after-ms`/`retry-after`) on
 					// 429/529-style failures: retrying sooner than the server asked is a
 					// guaranteed failure that just burns the retry budget.
