@@ -414,7 +414,9 @@ tool.read({ path: selected });
 		// Pristine realm: array templates, snapshot templates, and plus-concat
 		// all project from identical host/authoritative conversions.
 		for (const code of [
+			// oxlint-disable-next-line no-template-curly-in-string -- literal template source fed to the shadow planner
 			'await tool.read({ path: `${["secret.txt"]}` })',
+			// oxlint-disable-next-line no-template-curly-in-string -- literal template source fed to the shadow planner
 			"await tool.read({ path: `${name}.txt` })",
 			'await tool.read({ path: ["secret"] + ".txt" })',
 		]) {
@@ -427,6 +429,7 @@ tool.read({ path: selected });
 		}
 		// A replaced join changes what array coercions produce.
 		for (const code of [
+			// oxlint-disable-next-line no-template-curly-in-string -- literal template source fed to the shadow planner
 			'await tool.read({ path: `${["secret.txt"]}` })',
 			'await tool.read({ path: ["secret"] + ".txt" })',
 		]) {
@@ -439,11 +442,44 @@ tool.read({ path: selected });
 		}
 		// Opaque snapshot values may reach `toString` (directly, or through
 		// array elements), so they refuse without its flag too.
+		// oxlint-disable-next-line no-template-curly-in-string -- literal template source fed to the shadow planner
 		const spoofed = await projectJavaScriptShadowPlan("await tool.read({ path: `${name}.txt` })", {
 			snapshot: { name: "secret" },
 			initialGlobals: { ...intact, "Object.prototype.toString": false },
 		});
 		expect(spoofed.operations).toEqual([]);
 		expect(spoofed.barrier).toBeDefined();
+	});
+	it("rejects transform inputs that coerce through replaced intrinsics", async () => {
+		const intact = {
+			String: true,
+			JSON: true,
+			"JSON.stringify": true,
+			"Array.prototype.join": true,
+			"Object.prototype.toString": true,
+			__omp_call_tool__: true,
+		};
+		// Pristine realm: explicit transforms over any input project.
+		for (const code of [
+			'await tool.read({ path: String(["secret.txt"]) })',
+			"await tool.read({ path: [{ x: 1 }].join() })",
+		]) {
+			const plan = await projectJavaScriptShadowPlan(code, { snapshot: {}, initialGlobals: intact });
+			expect(plan.barrier).toBeUndefined();
+			expect(plan.operations).toHaveLength(1);
+		}
+		// `String(array)` dispatches join; object elements and separators
+		// reach toString.
+		for (const [code, overridden] of [
+			['await tool.read({ path: String(["secret.txt"]) })', "Array.prototype.join"],
+			["await tool.read({ path: [{ x: 1 }].join() })", "Object.prototype.toString"],
+		] as Array<[string, keyof typeof intact]>) {
+			const plan = await projectJavaScriptShadowPlan(code, {
+				snapshot: {},
+				initialGlobals: { ...intact, [overridden]: false },
+			});
+			expect(plan.operations).toEqual([]);
+			expect(plan.barrier).toBeDefined();
+		}
 	});
 });
