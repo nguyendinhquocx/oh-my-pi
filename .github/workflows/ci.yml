@@ -279,8 +279,6 @@ jobs:
            with:
               path: ~/.bun/install/cache
               key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
-              restore-keys: |
-                 bun-${{ runner.os }}-
          - run: bun install --frozen-lockfile
          - name: Download native addon(s)
            uses: actions/download-artifact@v4
@@ -376,8 +374,6 @@ jobs:
            with:
               path: ~/.bun/install/cache
               key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
-              restore-keys: |
-                 bun-${{ runner.os }}-
          - run: bun install --frozen-lockfile
          - name: Download native addons
            uses: actions/download-artifact@v4
