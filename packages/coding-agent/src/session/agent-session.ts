@@ -78,9 +78,10 @@ import type {
 	UsageReport,
 	UserMessage,
 } from "@oh-my-pi/pi-ai";
-import { type Effort, streamSimple } from "@oh-my-pi/pi-ai";
+import { type Effort, serviceTierFamily, streamSimple } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { resetOpenAICodexHistoryAfterCompaction } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import { withCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { supportsOutputTokenLimit } from "@oh-my-pi/pi-catalog/compat/output-limits";
 import { requiresNativeTools, requiresToolFreeHistoryForToolOptOut } from "@oh-my-pi/pi-catalog/compat/tools";
@@ -117,7 +118,7 @@ import {
 	resolveCliModel,
 } from "../config/model-resolver";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
-import { buildServiceTierByFamily, serviceTierSettingToTier } from "../config/service-tier";
+import { buildServiceTierByFamily, isServiceTierForFamily, serviceTierSettingToTier } from "../config/service-tier";
 import { combine, type SettingsScope } from "../config/registry";
 import type { Settings } from "../config/settings";
 import { RawSseDebugBuffer } from "@oh-my-pi/pi-tui/apps/debug/raw-sse-buffer";
@@ -152,7 +153,7 @@ import type {
 	TurnEndEvent,
 	TurnStartEvent,
 } from "../extensibility/extensions";
-import { emitSessionShutdownEvent } from "../extensibility/extensions";
+import { emitSessionShutdownEvent, TOP_LEVEL_AGENT } from "../extensibility/extensions";
 import { ManagedTimers } from "../extensibility/extensions/managed-timers";
 import { createExtensionModelQuery } from "../extensibility/extensions/model-api";
 import type { CompactOptions, ContextUsage } from "../extensibility/extensions/types";
@@ -181,6 +182,7 @@ import { loadOverallPlanReference } from "../plan-mode/plan-handoff";
 import type { PlanModeState } from "../plan-mode/state";
 import goalModeContextPrompt from "../prompts/goals/goal-mode-context.md" with { type: "text" };
 import goalTodoContextPrompt from "../prompts/goals/goal-todo-context.md" with { type: "text" };
+import anthropicUsageWrapUpPrompt from "../prompts/system/anthropic-usage-wrap-up.md" with { type: "text" };
 import autoContinuePrompt from "../prompts/system/auto-continue.md" with { type: "text" };
 import checkpointActiveNoticeTemplate from "../prompts/system/checkpoint-active-notice.md" with { type: "text" };
 import imageAttachmentPrompt from "../prompts/system/image-attachment.md" with { type: "text" };
@@ -201,6 +203,7 @@ import {
 	obfuscateProviderContext,
 } from "../secrets/message-transform";
 import type { SecretObfuscator } from "../secrets/obfuscator";
+import { cfgSecretsEnabled } from "../secrets/settings";
 import { releaseSharpshooterSession } from "../sharpshooter/backend";
 import { flushSharpshooterExtraction } from "../sharpshooter/extract";
 import { toolReadsSkillUris } from "../system-prompt";
@@ -283,9 +286,11 @@ import type {
 } from "./agent-session-types";
 import { writeArtifact } from "./artifacts";
 import { formatArtifactErrorNotice, type OutputMeta, stripOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
+import { truncateMiddle } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import {
 	ASYNC_INLINE_RESULT_MAX_CHARS,
 	ASYNC_PREVIEW_MAX_CHARS,
+	ASYNC_PREVIEW_TAIL_CHARS,
 	ASYNC_RESULT_MESSAGE_TYPE,
 	type AsyncResultEntry,
 	buildAsyncResultBatchMessage,
@@ -437,7 +442,9 @@ import {
 	cfgTierAnthropic,
 	cfgTierGoogle,
 	cfgTierOpenai,
+	cfgProvidersAnthropicSlowMode,
 } from "./settings";
+import { type AnthropicSlowModeController, anthropicSlowModeLanes } from "./anthropic-slow-mode";
 import { cfgInterruptMode } from "../modes/settings";
 import { cfgFollowUpMode } from "../modes/settings";
 import { cfgSteeringMode } from "../modes/settings";
@@ -856,6 +863,10 @@ export class AgentSession implements SettingsScope {
 	#usagePreflightReadyModel: Model | undefined;
 	#detachUsageBeforeQueueDequeue: (() => void) | undefined;
 	#detachUsageBeforeModelCall: (() => void) | undefined;
+	/** Claude account lane (`cred:<id>`/`key:<hash>`) that served the latest Anthropic request. */
+	#anthropicSlowModeLane: string | undefined;
+	/** `<lane>#<window>` of the wrap-up window this session already told the model about. */
+	#anthropicWrapUpHinted: string | undefined;
 
 	#transformContext: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
 	#onPayload: SimpleStreamOptions["onPayload"] | undefined;
@@ -1672,6 +1683,7 @@ export class AgentSession implements SettingsScope {
 			}
 			this.#loopGuards.recordTurn(messages, context);
 			await this.#prewalk.advanceAtTurnEnd(messages, context);
+			if (context?.willContinue) this.#steerAnthropicWrapUp();
 			await this.#advisors.onPrimaryTurnEnd(messages, context?.willContinue, signal);
 			await this.#maintenance.maintainContextMidRun(messages, signal, context);
 		});
@@ -2714,6 +2726,18 @@ export class AgentSession implements SettingsScope {
 		const body = meta?.artifactError ? stripOutputNotice(result, meta).trimEnd() : result;
 		const preview = `${body.slice(0, ASYNC_PREVIEW_MAX_CHARS)}\n\n[Output truncated. Showing first ${ASYNC_PREVIEW_MAX_CHARS.toLocaleString()} characters.]`;
 		if (meta?.artifactError) return `${preview}\n[${formatArtifactErrorNotice(meta.artifactError)}]`;
+		// The producing tool's output sink already mirrored the raw stream to an
+		// artifact; `result` is its elided inline body, so link the raw capture.
+		// The capture lacks notices the tool appended after the stream (exit code,
+		// wall time, timeout), so the preview keeps `result`'s tail as well.
+		const rawArtifactId = meta?.truncation?.artifactId ?? meta?.limits?.columnTruncated?.artifactId;
+		if (rawArtifactId) {
+			const headTail = truncateMiddle(result, {
+				maxBytes: ASYNC_PREVIEW_MAX_CHARS,
+				maxHeadBytes: ASYNC_PREVIEW_MAX_CHARS - ASYNC_PREVIEW_TAIL_CHARS,
+			}).content;
+			return `${headTail}\nFull output: artifact://${rawArtifactId}`;
+		}
 		try {
 			const { path: artifactPath, id: artifactId } = await this.sessionManager.allocateArtifactPath("async");
 			if (artifactPath && artifactId) {
@@ -5863,6 +5887,11 @@ export class AgentSession implements SettingsScope {
 		return this.#memory.applyMemoryBackend(options);
 	}
 
+	/** Resolves once every memory-setting edit so far, and the backend transitions it started, has settled. */
+	settleMemoryBackend(): Promise<void> {
+		return this.#memory.settle();
+	}
+
 	/** Rebuilds the stable base prompt, optionally discarding a stale asynchronous rebuild. */
 	refreshBaseSystemPrompt(commitIf?: () => boolean): Promise<void> {
 		return this.#tools.refreshBaseSystemPrompt(commitIf);
@@ -7356,6 +7385,9 @@ export class AgentSession implements SettingsScope {
 			sessionManager: this.sessionManager,
 			modelRegistry: this.#modelRegistry,
 			isProjectTrusted: () => true,
+			// Used only when the session has no extension runner. `createAgentSession` always builds
+			// one (carrying the real identity), so only hand-constructed sessions land here.
+			agent: TOP_LEVEL_AGENT,
 
 			model: this.model ?? undefined,
 			models: createExtensionModelQuery(this.#modelRegistry, this.settings, () => this.model ?? undefined),
@@ -8497,16 +8529,20 @@ export class AgentSession implements SettingsScope {
 			? AbortSignal.any([signal, this.#titleGenerationAbortController.signal])
 			: this.#titleGenerationAbortController.signal;
 		if (titleSignal.aborted) return null;
-		const title = await generateSessionTitle(
-			firstMessage,
-			this.#modelRegistry,
-			this.settings,
-			sessionId,
-			this.model,
-			provider => buildSessionMetadata(sessionId, provider, this.#modelRegistry.authStorage),
-			customSystemPrompt ?? this.#titleSystemPrompt,
-			titleSignal,
-			parentSessionId,
+		// The title request carries user text, so it follows this session's own credential
+		// redaction policy like its conversation requests (see `settingsAwareStreamFn`).
+		const title = await withCredentialRedaction(cfgSecretsEnabled.get(this.settings), () =>
+			generateSessionTitle(
+				firstMessage,
+				this.#modelRegistry,
+				this.settings,
+				sessionId,
+				this.model,
+				provider => buildSessionMetadata(sessionId, provider, this.#modelRegistry.authStorage),
+				customSystemPrompt ?? this.#titleSystemPrompt,
+				titleSignal,
+				parentSessionId,
+			),
 		);
 		if (await this.#sessionGenerationChanged(sessionGeneration)) return null;
 		return !titleSignal.aborted && this.sessionId === parentSessionId ? title : null;
@@ -8960,6 +8996,59 @@ export class AgentSession implements SettingsScope {
 		return this.#models.isFastModeActive();
 	}
 
+	/** Record the Claude account lane that served this session's latest Anthropic request. */
+	noteAnthropicSlowModeLane(lane: string): void {
+		this.#anthropicSlowModeLane = lane;
+	}
+
+	/**
+	 * Slow-mode lane of the Claude account this session last used, or
+	 * undefined before its first Anthropic subscription request.
+	 */
+	getAnthropicSlowModeLane(): AnthropicSlowModeController | undefined {
+		const lane = this.#anthropicSlowModeLane;
+		return lane === undefined ? undefined : anthropicSlowModeLanes.lane(lane);
+	}
+
+	/**
+	 * Status-line label for the Claude account's usage-limit stage, e.g.
+	 * `limit reached · wrapping up · resets 14:30` or (with `/slow on`)
+	 * `low priority until 14:30 · 62% left`; undefined outside both stages or
+	 * off an Anthropic model.
+	 */
+	getAnthropicSlowModeLabel(): string | undefined {
+		if (this.model?.provider !== "anthropic") return undefined;
+		return this.getAnthropicSlowModeLane()?.statusLabel(
+			undefined,
+			cfgProvidersAnthropicSlowMode.get(this.settings) === "auto",
+		);
+	}
+
+	/**
+	 * Mid-run, once per wrap-up window: tell the model to checkpoint when its
+	 * Claude account runs on the wrap-up allowance and nothing (low priority,
+	 * extra usage) will carry the work past it.
+	 */
+	#steerAnthropicWrapUp(): void {
+		const lane = this.#anthropicSlowModeLane;
+		if (lane === undefined || this.model?.provider !== "anthropic") return;
+		const window = anthropicSlowModeLanes
+			.lane(lane)
+			.wrapUpHintKey(cfgProvidersAnthropicSlowMode.get(this.settings) === "auto");
+		if (window === undefined) return;
+		const key = `${lane}#${window}`;
+		if (this.#anthropicWrapUpHinted === key) return;
+		this.#anthropicWrapUpHinted = key;
+		this.agent.steer({
+			role: "custom",
+			customType: "anthropic-usage-wrap-up",
+			content: anthropicUsageWrapUpPrompt,
+			attribution: "agent",
+			display: false,
+			timestamp: Date.now(),
+		});
+	}
+
 	/** Sets or clears one model family's live service tier. */
 	setServiceTierFamily(family: ServiceTierFamily, tier: ServiceTier | undefined): void {
 		this.#models.setServiceTierFamily(family, tier);
@@ -8973,6 +9062,50 @@ export class AgentSession implements SettingsScope {
 	/** Toggles priority service for the active model family. */
 	toggleFastMode(): boolean {
 		return this.#models.toggleFastMode();
+	}
+
+	/**
+	 * What `/slow` controls for the active model: the `flex` service tier on the
+	 * OpenAI/Google families, or subscription slow mode on direct Anthropic.
+	 */
+	#slowModeTarget(): { kind: "flex"; family: ServiceTierFamily } | { kind: "anthropic" } | undefined {
+		const model = this.model;
+		if (!model) return undefined;
+		if (model.provider === "anthropic") return { kind: "anthropic" };
+		const family = serviceTierFamily(model);
+		return family && isServiceTierForFamily(family, "flex") ? { kind: "flex", family } : undefined;
+	}
+
+	/** Reports whether `/slow` is on for the active model. */
+	isSlowModeEnabled(): boolean {
+		const target = this.#slowModeTarget();
+		if (!target) return false;
+		if (target.kind === "anthropic") return cfgProvidersAnthropicSlowMode.get(this.settings) === "auto";
+		return this.serviceTierByFamily[target.family] === "flex";
+	}
+
+	/**
+	 * `/slow on|off` for the active model. OpenAI/Google: sets or clears this
+	 * session's `flex` tier. Anthropic: sets `providers.anthropic.slowMode` to
+	 * `auto`/`off`; on also enters an already-offered (or user-stopped) slow
+	 * window right away, off stops the active one. Returns false when the model
+	 * has no slow mode.
+	 */
+	setSlowMode(enabled: boolean): boolean {
+		const target = this.#slowModeTarget();
+		if (!target) return false;
+		if (target.kind === "flex") {
+			if (enabled) this.setServiceTierFamily(target.family, "flex");
+			else if (this.serviceTierByFamily[target.family] === "flex") {
+				this.setServiceTierFamily(target.family, undefined);
+			}
+			return true;
+		}
+		cfgProvidersAnthropicSlowMode.set(this.settings, enabled ? "auto" : "off");
+		const lane = this.getAnthropicSlowModeLane();
+		if (enabled) lane?.accept();
+		else lane?.stop("user");
+		return true;
 	}
 
 	/** Flips the `skillful` setting for this session only. See {@link setSkillful}. */
@@ -11499,8 +11632,8 @@ export class AgentSession implements SettingsScope {
 			palette: useUserThemes ? "theme" : "web",
 			themeNames: useUserThemes
 				? {
-						dark: cfgThemeDark.get(this.settings) ?? "titanium",
-						light: cfgThemeLight.get(this.settings) ?? "light",
+						dark: cfgThemeDark.get(this.settings),
+						light: cfgThemeLight.get(this.settings),
 					}
 				: undefined,
 		});
