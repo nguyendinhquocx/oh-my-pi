@@ -231,17 +231,27 @@ jobs:
          fail-fast: false
          matrix:
             include:
+               # Addons cross-built by Bazel (clang + ld64.lld against the
+               # Command Line Tools SDK) in native_addons_cross.
                - {
-                    os: ubuntu-22.04,
+                    platform: darwin,
+                    target_id: darwin-x64,
+                    binary_path: packages/coding-agent/binaries/omp-darwin-x64,
+                    native_targets: darwin-x64-baseline,
+                 }
+               - {
+                    platform: darwin,
+                    target_id: darwin-arm64,
+                    binary_path: packages/coding-agent/binaries/omp-darwin-arm64,
+                    native_targets: darwin-arm64,
+                 }
+               - {
                     platform: linux,
-                    arch: x64,
                     target_id: linux-x64,
                     binary_path: packages/coding-agent/binaries/omp-linux-x64,
                  }
                - {
-                    os: ubuntu-24.04-arm,
                     platform: linux,
-                    arch: arm64,
                     target_id: linux-arm64,
                     binary_path: packages/coding-agent/binaries/omp-linux-arm64,
                  }
@@ -262,11 +272,10 @@ jobs:
                - {
                     os: windows-latest,
                     platform: win32,
-                    arch: x64,
                     target_id: win32-x64,
                     binary_path: packages/coding-agent/binaries/omp-windows-x64.exe,
                  }
-      runs-on: ${{ matrix.os }}
+      runs-on: ubuntu-22.04
       permissions:
          contents: read
       steps:
