@@ -269,6 +269,8 @@ jobs:
       runs-on: ${{ matrix.os }}
       permissions:
          contents: read
+      env:
+         MACOS_SIGNING: ${{ secrets.APPLE_CERTIFICATE_P12 != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.APPLE_API_KEY_ID != '' && secrets.APPLE_API_ISSUER_ID != '' && secrets.APPLE_API_KEY != '' }}
       steps:
          - uses: actions/checkout@v4
          - uses: oven-sh/setup-bun@v2
