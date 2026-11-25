@@ -2,17 +2,28 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Removed `watch` and `HEAD_WATCH_INTERVAL_MS` from `@oh-my-pi/pi-natives/vcs`; read the repository again when its state matters instead
+
 ### Fixed
 
+- Fixed open PTY sessions and `reapChild()` waits each holding a native blocking-pool thread, which stalled new PTY starts and other native blocking work once 8 terminals were open on Windows (512 elsewhere) ([#20283](https://github.com/can1357/oh-my-pi/pull/20283) by [@iliaal](https://github.com/iliaal))
+- Fixed the shell's `open` command on Linux starting a private D-Bus thread pool, one thread per CPU, the first time it reached the session bus ([#20278](https://github.com/can1357/oh-my-pi/pull/20278) by [@iliaal](https://github.com/iliaal))
 - Fixed Windows captures and accessibility trees of a fully covered Chromium or Electron window passing as current when the cover is a popup, tool or click-through window, under which a paused page can stay paused; they now report `covered` there too ([#19849](https://github.com/can1357/oh-my-pi/pull/19849) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed standalone binaries failing to start when the natives directory is read-only (or owned by another user) even though it already holds this build's extracted addon ([#20266](https://github.com/can1357/oh-my-pi/issues/20266))
 ### Added
 
+- Added `@oh-my-pi/pi-natives/file-poll` with `pollFile(file, onChange, intervalMs)`: stat-polls one file and reports mtime, size or inode changes, so atomic saves and symlink retargets are not missed
+- Added `truncateToTokens(input, maxTokens)`: the UTF-16 length of the longest prefix of `input` within `maxTokens` `Jev` tokens, never ending on half a surrogate pair; pieces after the one that crosses the budget are not merged ([#20384](https://github.com/can1357/oh-my-pi/pull/20384) by [@iliaal](https://github.com/iliaal))
 - Added `repairHeredocContinuations(script)`: drops the `\` after `<<EOF &&` (or `||`, `|`, `|&`) so the here-document body starts on the next line, or returns `null`
 - Added `commitReconciled()` to publish private-index commits without leaving staged reversals when the shared index is locked ([#20252](https://github.com/can1357/oh-my-pi/issues/20252)).
 - Added `transcriptCalls()`, `transcriptGrep()`, `transcriptStats()`, and `transcriptMessages()`: parallel scans of session transcript files for tool calls with their results and reasoning, regex matches over message text, thinking, arguments, and results, call counts, and one transcript's records.
 
 ### Changed
 
+- The OAuth callback wait polls for the callback every 200ms instead of watching the transaction directory
+- `tail -f` checks every followed file once per `--sleep-interval`, and at once when the file-system watcher reports a change, so a file moved to another directory, a symlink target or a file on a network drive no longer stalls; if the watcher fails, `tail` falls back to polling instead of exiting
 - A persistent `Shell` session no longer carries `set -e` into later commands: errexit stops only the command that turned it on, while other options (`set -u`, `pipefail`, `shopt`) still persist
 - `ShellRunResult` now reports `movedCwd` (the command ended in another directory than it started in) and `errexit` (it ended with `set -e` on)
 
