@@ -3,12 +3,17 @@
  * snapshot, recomputed when the viewed session emits an event, when the app
  * moves a mode or a badge, when a background read (git, usage quota, pull
  * request) lands, and on the wall clock while a segment shows time.
+ * Streaming deltas sample context usage and token rate; only changes propagate
+ * to the bar. Foreground tool progress samples the job badge, account status,
+ * speculation and rate without invalidating the transcript or compaction policy.
  *
  * Git/jj facts are read again when a run starts (edits made while idle) and
  * when a turn ends (what its tools did), and after a user `!`/`$` command
  * ({@link SessionStatusLine.refreshVcs}); nothing polls the repository. Those
  * reads start at most {@link VCS_READ_INTERVAL_MS} apart: one skipped as too
  * soon runs on a timer once the run yields, so the bar never stays stale.
+ * None of it happens while the terminal reads and shows the checkout itself
+ * ({@link SessionStatusLine.setCheckoutHomed}: Tern's `checkout` event).
  *
  * Session state is not reactive, so the session's events bump a revision the
  * snapshot reads; {@link SessionStatusLine.refresh} does the same for changes
@@ -72,6 +77,11 @@ interface StatusSessionExtras {
 
 type StatusSession = AgentViewSession & StatusSessionExtras;
 
+type SessionFacts = Omit<
+	StatusFacts,
+	"context" | "compaction" | "tokensPerSecond" | "promptCache" | "jobs" | "jobGlance" | "speculation" | "slowModeLabel"
+>;
+
 /** One viewed session's active-processing meter. */
 interface ActiveMeter {
 	/** Completed active windows since the last reset. */
@@ -108,6 +118,8 @@ interface VcsSnapshot {
 /** See the module docs. */
 export class SessionStatusLine implements StatusLineModel {
 	readonly #revision = signal(0);
+	readonly #streamRevision = signal(0);
+	readonly #toolRevision = signal(0);
 	/** Wall clock, advanced once a second while a segment shows time. */
 	readonly #clock = signal(Date.now());
 	readonly #saved: Signal<StatusLineSettings>;
@@ -125,7 +137,7 @@ export class SessionStatusLine implements StatusLineModel {
 	#session: StatusSession;
 	#focusedAgentId: string | undefined;
 	#unsubscribe: (() => void) | undefined;
-	#bumpQueued = false;
+	#bumpQueued: "session" | "tool" | undefined;
 	#streamBump: NodeJS.Timeout | undefined;
 	#clockTimer: NodeJS.Timeout | undefined;
 	/**
@@ -151,6 +163,8 @@ export class SessionStatusLine implements StatusLineModel {
 	#vcsTimer: NodeJS.Timeout | undefined;
 	#vcsInFlight = false;
 	#vcsGeneration = 0;
+	/** The terminal reads and shows this session's checkout itself (Tern): no git/jj read and no `gh` here. */
+	#checkoutHomed = false;
 	readonly #defaultBranches = new Map<string, string>();
 	/** Pull request lookups by `cwd\0branch`, each kept for {@link PR_TTL_MS}. */
 	readonly #prs = new Map<string, { at: number; pr: { number: number; url: string } | null }>();
@@ -172,7 +186,81 @@ export class SessionStatusLine implements StatusLineModel {
 
 	readonly settings: Accessor<StatusLineSettings> = computed(() => ({ ...this.#saved(), ...this.#preview() }));
 
-	readonly facts: Accessor<StatusFacts> = computed(() => this.#build());
+	readonly #sessionFacts = computed(() => this.#buildSessionFacts());
+	readonly #context = computed((previous: StatusFacts["context"] | undefined) => this.#readContext(previous));
+	readonly #jobs = computed((previous: Pick<StatusFacts, "jobs" | "jobGlance"> | undefined) => {
+		this.#revision();
+		this.#toolRevision();
+		const subagents = this.#subagents();
+		let jobs = 0;
+		for (const job of this.#session.getAsyncJobSnapshot({ recentLimit: 0 })?.running ?? []) {
+			if (job.type !== "task" || job.agentId === undefined || !subagents.has(job.agentId)) jobs++;
+		}
+		const jobGlance = jobs > 0 ? latestJobWidget(this.#session.getRunningJobWidgets?.() ?? [])?.view : undefined;
+		return previous?.jobs === jobs && previous.jobGlance === jobGlance
+			? previous
+			: { jobs, ...(jobGlance ? { jobGlance } : {}) };
+	});
+	// A long tool wait can cross a quota TTL or the active account's usage-limit reset.
+	readonly #accountLabel = computed(() => {
+		this.#sessionFacts();
+		this.#toolRevision();
+		const session = this.#session;
+		const model = session.state.model ?? session.model;
+		this.#syncUsage(model?.provider, model?.id);
+		return session.getAnthropicSlowModeLabel();
+	});
+	readonly #speculation = computed(() => {
+		this.#revision();
+		this.#toolRevision();
+		return this.#session.compactionSpeculation;
+	});
+	readonly #rate = computed(() => {
+		this.#revision();
+		this.#streamRevision();
+		this.#toolRevision();
+		this.#clock();
+		return this.#tokensPerSecond(this.#modes());
+	});
+
+	/** The composer's live meter, independent of whether any status-bar segment changed. */
+	readonly composerRate = computed(() => {
+		this.#revision();
+		this.#streamRevision();
+		this.#clock();
+		const rate = this.#session.tokenRate.rate();
+		return rate === null ? undefined : Math.round(rate * 10) / 10;
+	});
+	// Compaction boundaries depend on capacity, not on the growing token count.
+	readonly #contextWindow = computed(() => this.#context().window);
+	readonly #boundaries = computed(() => {
+		if (!this.#sessionFacts().autoCompact) return null;
+		const contextWindow = this.#contextWindow();
+		const session = this.#session;
+		return contextWindow > 0
+			? statusLineHost.computeCompactionBoundaries(session, contextWindow, session.state.model ?? session.model)
+			: null;
+	});
+
+	readonly facts: Accessor<StatusFacts> = computed(() => {
+		const sessionFacts = this.#sessionFacts();
+		const context = this.#context();
+		const boundaries = this.#boundaries();
+		const settings = this.settings();
+		const slowModeLabel = this.#accountLabel();
+		return {
+			...sessionFacts,
+			context,
+			...(boundaries ? { compaction: boundaries } : {}),
+			...this.#jobs(),
+			...(slowModeLabel ? { slowModeLabel } : {}),
+			speculation: this.#speculation(),
+			tokensPerSecond: this.#rate(),
+			...(settings.leftSegments?.includes("cache") || settings.rightSegments?.includes("cache")
+				? { promptCache: this.#session.getPromptCacheStatus?.(sessionFacts.now, context.tokens) }
+				: {}),
+		};
+	});
 
 	constructor(session: AgentViewSession) {
 		this.#session = session;
@@ -196,13 +284,36 @@ export class SessionStatusLine implements StatusLineModel {
 	}
 
 	refresh(): void {
+		clearTimeout(this.#streamBump);
+		this.#streamBump = undefined;
 		this.#revision.set(this.#revision.peek() + 1);
+	}
+
+	/** A job widget or the running job roster changed independently of the conversation. */
+	refreshJobs(): void {
+		this.#queueBump("tool");
 	}
 
 	refreshVcs(): void {
 		this.#markVcsStale();
 		// No run follows a user command to yield: settle now.
 		this.#settleVcs();
+		this.refresh();
+	}
+
+	/**
+	 * Follow whether the terminal reads and shows this session's checkout
+	 * itself (Tern's `checkout` event). While it does, git/jj and the branch's
+	 * pull request are read from it, so none is read here and the title's pull
+	 * request is released; turning it off reads again.
+	 */
+	setCheckoutHomed(homed: boolean): void {
+		if (homed === this.#checkoutHomed) return;
+		this.#checkoutHomed = homed;
+		this.#vcsGeneration++;
+		this.#vcs.set(undefined);
+		this.#lastPr = undefined;
+		this.#onPullRequest?.(undefined);
 		this.refresh();
 	}
 
@@ -386,21 +497,31 @@ export class SessionStatusLine implements StatusLineModel {
 				this.#queueStreamBump();
 				return;
 			}
+			if (event.type === "tool_execution_update" || event.type === "tool_stream_update") {
+				this.#queueBump("tool");
+				return;
+			}
 			if (event.type === "agent_start" || event.type === "turn_end") this.#markVcsStale();
 			else if (event.type === "agent_end") this.#settleVcs();
-			this.#queueBump();
+			this.#queueBump("session");
 		});
 		this.#quota.set(undefined);
 		this.#usageKey = "";
 	}
 
-	/** Coalesce a burst of session events (streaming deltas) into one recompute. */
-	#queueBump(): void {
-		if (this.#bumpQueued) return;
-		this.#bumpQueued = true;
+	/** A full session refresh also covers tool progress in the same event burst. */
+	#queueBump(kind: "session" | "tool"): void {
+		if (this.#bumpQueued) {
+			if (kind === "session") this.#bumpQueued = kind;
+			return;
+		}
+		this.#bumpQueued = kind;
 		queueMicrotask(() => {
-			this.#bumpQueued = false;
-			if (!this.#disposed) this.refresh();
+			const queued = this.#bumpQueued;
+			this.#bumpQueued = undefined;
+			if (this.#disposed) return;
+			if (queued === "tool") this.#toolRevision.set(this.#toolRevision.peek() + 1);
+			else this.refresh();
 		});
 	}
 
@@ -409,7 +530,7 @@ export class SessionStatusLine implements StatusLineModel {
 		if (this.#streamBump) return;
 		this.#streamBump = setTimeout(() => {
 			this.#streamBump = undefined;
-			this.#queueBump();
+			this.#streamRevision.set(this.#streamRevision.peek() + 1);
 		}, STREAM_REFRESH_MS);
 		this.#streamBump.unref?.();
 	}
@@ -431,16 +552,12 @@ export class SessionStatusLine implements StatusLineModel {
 		}
 	}
 
-	#build(): StatusFacts {
-		this.#revision();
-		const now = this.#clock();
+	#readContext(previous: StatusFacts["context"] | undefined): StatusFacts["context"] {
+		// Also re-read on full refreshes: a settings edit may change live tool metadata.
+		this.#sessionFacts();
+		this.#streamRevision();
 		const session = this.#session;
-		const settings = this.settings();
-		const modes = this.#modes();
 		const model = session.state.model ?? session.model;
-		const segments = [...(settings.leftSegments ?? []), ...(settings.rightSegments ?? [])];
-		const stats = session.sessionManager.getUsageStatistics();
-
 		const usage = session.getContextUsage();
 		let contextWindow = usage?.contextWindow ?? model?.contextWindow ?? 0;
 		let tokens = usage?.tokens ?? 0;
@@ -453,11 +570,22 @@ export class SessionStatusLine implements StatusLineModel {
 			tokens = override.tokens ?? tokens;
 			percent = override.percent ?? percent;
 		}
+		return previous?.tokens === tokens && previous.window === contextWindow && previous.percent === percent
+			? previous
+			: { tokens, window: contextWindow, percent };
+	}
+
+	#buildSessionFacts(): SessionFacts {
+		this.#revision();
+		const now = this.#clock();
+		const session = this.#session;
+		const settings = this.settings();
+		const modes = this.#modes();
+		const model = session.state.model ?? session.model;
+		const segments = [...(settings.leftSegments ?? []), ...(settings.rightSegments ?? [])];
+		const stats = session.sessionManager.getUsageStatistics();
+		const collab = this.#collab();
 		const autoCompact = this.#autoCompact();
-		const boundaries =
-			autoCompact && contextWindow > 0
-				? statusLineHost.computeCompactionBoundaries(session, contextWindow, model)
-				: null;
 
 		const advisorOverview = session.getAdvisorStatusOverview?.();
 		const advisorStatuses = advisorOverview?.configured ? advisorOverview.advisors.map(a => a.status) : [];
@@ -466,17 +594,10 @@ export class SessionStatusLine implements StatusLineModel {
 		const goal = modes.goal ? session.getGoalModeState()?.goal : undefined;
 		const thinkingLevel = session.state.thinkingLevel;
 		const sessionManager = session.sessionManager;
-		// A task job whose subagent the agents badge already shows is not counted again.
 		const subagents = this.#subagents();
-		const jobs =
-			session
-				.getAsyncJobSnapshot()
-				?.running.filter(job => job.type !== "task" || job.agentId === undefined || !subagents.has(job.agentId))
-				.length ?? 0;
 		const turnStartedAt = this.#meter().since;
 		const activeMs = this.activeMs(now);
 		this.#syncPricingTimer(segments.includes("cost") ? model?.cost : undefined, now);
-		this.#syncUsage(model?.provider, model?.id);
 
 		return {
 			...(model
@@ -484,6 +605,7 @@ export class SessionStatusLine implements StatusLineModel {
 						model: {
 							id: model.id,
 							...(model.name ? { name: model.name } : {}),
+							...(model.provider ? { provider: model.provider } : {}),
 							thinking: model.thinking !== undefined,
 							...(model.contextWindow ? { contextWindow: model.contextWindow } : {}),
 						},
@@ -495,7 +617,6 @@ export class SessionStatusLine implements StatusLineModel {
 				? { autoResolvedLevel: session.autoResolvedThinkingLevel() }
 				: {}),
 			...(session.isFastModeActive() ? { fastMode: true } : {}),
-			...(session.getAnthropicSlowModeLabel() ? { slowModeLabel: session.getAnthropicSlowModeLabel() } : {}),
 			...(advisorStatuses.length > 0
 				? {
 						advisor: {
@@ -534,11 +655,7 @@ export class SessionStatusLine implements StatusLineModel {
 				? { advisorCost: { cost: advisorCost, usingSubscription: session.isAdvisorUsingSubscription() } }
 				: {}),
 			...(model?.cost ? { pricingPeriod: getTimeBasedPricingPeriod(model.cost, now) } : {}),
-			tokensPerSecond: this.#tokensPerSecond(modes),
-			context: { tokens, window: contextWindow, percent },
 			autoCompact,
-			...(boundaries ? { compaction: boundaries } : {}),
-			speculation: session.compactionSpeculation,
 			cwd: getProjectDir(),
 			home: os.homedir(),
 			...vcsFacts,
@@ -563,15 +680,12 @@ export class SessionStatusLine implements StatusLineModel {
 			...(modes.stream ? { stream: modes.stream } : {}),
 			...(modes.recording ? { recording: true } : {}),
 			subagents: subagents.size,
-			jobs,
-			...(jobs > 0 ? withJobGlance(session) : {}),
 			activeMs,
 			...(turnStartedAt !== undefined ? { turnStartedAt } : {}),
 			...(this.#brandEdgeAt !== undefined ? { brandEdgeAt: this.#brandEdgeAt } : {}),
 			...(this.#awaiting() ? { awaitingAnswer: true } : {}),
 			...(this.#focusedAgentId === undefined ? { treePosition: this.#treePosition() } : {}),
 			...(this.#quota() ? { quota: this.#quota() } : {}),
-			...(segments.includes("cache") ? { promptCache: session.getPromptCacheStatus?.(now, tokens) } : {}),
 			hooks: [...this.#hooks()].sort(([a], [b]) => a.localeCompare(b)).map(([, text]) => text),
 		};
 	}
@@ -592,6 +706,8 @@ export class SessionStatusLine implements StatusLineModel {
 
 	/** Git facts for the bar when a git segment shows; starts a refresh when the cached ones are stale. */
 	#vcsFacts(segments: readonly string[]): Pick<StatusFacts, "git" | "worktree" | "activeRepoRoot"> {
+		// Tern reads and shows the checkout itself: nothing to read here.
+		if (this.#checkoutHomed) return {};
 		const wantsGit = segments.includes("git") || segments.includes("pr");
 		const wantsPath = segments.includes("path");
 		if (!statusLineHost.gitEnabled() || (!wantsGit && !wantsPath)) return {};
@@ -789,10 +905,4 @@ export class SessionStatusLine implements StatusLineModel {
 			release();
 		}
 	}
-}
-
-/** The freshest live job widget among the running jobs, which the jobs badge glances at. */
-function withJobGlance(session: StatusSession): Pick<StatusFacts, "jobGlance"> {
-	const view = latestJobWidget(session.getRunningJobWidgets?.() ?? [])?.view;
-	return view ? { jobGlance: view } : {};
 }

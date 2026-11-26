@@ -113,6 +113,8 @@ export type YieldCompaction = ConversationPosition & {
 
 export type SubmittedUserInput = {
 	text: string;
+	/** Submission time shared by the optimistic prompt bubble and its persisted turn. */
+	submittedAt?: number;
 	images?: ImageContent[];
 	imageLinks?: (string | undefined)[];
 	customType?: string;
@@ -724,7 +726,6 @@ export interface InteractiveModeContext {
 
 	// Extension UI integration
 	setToolUIContext(uiContext: ExtensionUIContext, hasUI: boolean): void;
-	initializeHookRunner(uiContext: ExtensionUIContext, hasUI: boolean): void;
 	/** Stack extension autocomplete behavior on top of the built-in editor provider. */
 	addAutocompleteProvider(factory: AutocompleteProviderFactory): void;
 

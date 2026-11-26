@@ -10,7 +10,8 @@
  * Segments shown elsewhere stay out of the extras: the model chip, the
  * context meter and usage (context, cost), Tern's pane header (path), the
  * tab title (session name, PR), the HUD (subagents), the editor (vim) and
- * the brand (pi).
+ * the brand (pi). The branch and changes (git) come from Tern's own
+ * composer-bar chip while it shows the checkout, when the facts carry none.
  */
 import { type Accessor, computed, For, type JSXNode, Show } from "@oh-my-pi/pi-tui";
 import { formatNumber } from "@oh-my-pi/pi-utils";
@@ -224,12 +225,17 @@ export function composerFacts(props: {
 				.join("") ?? "",
 	);
 
-	const modelView = computed(() =>
-		segmentView("model", props.facts(), {
-			...effective(),
-			segmentOptions: { ...effective().segmentOptions, model: { showThinkingLevel: false } },
-		}),
-	);
+	// The composer shows effort in its own chip; keep the user's other model options (`showProvider`, `display`).
+	const modelView = computed(() => {
+		const options = effective();
+		return segmentView("model", props.facts(), {
+			...options,
+			segmentOptions: {
+				...options.segmentOptions,
+				model: { ...options.segmentOptions.model, showThinkingLevel: false },
+			},
+		});
+	});
 
 	return {
 		context: (
